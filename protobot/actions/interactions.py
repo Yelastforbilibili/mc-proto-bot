@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from ..physics import Vec3
 from ..protocol.codec import PacketWriter
 from ..protocol.entities import DEFAULT_HEIGHT, DEFAULT_WIDTH
+from ..protocol.tools import best_tool
 from .errors import ActionError, UnsupportedAction
 from .profiles import InteractionProfile, profile_for
 from .raycast import (
@@ -52,6 +53,10 @@ INTERACT_AT = 2
 TICK_SECONDS = 0.05
 
 _HANDS = {"main_hand": 0, "main": 0, "off_hand": 1, "off": 1}
+
+#: Sentinel for "the caller did not say which tool", so ``tool=None`` can mean
+#: "a bare hand" instead of "use whatever is held".
+_UNSET = object()
 
 
 def _hand(value: str | int) -> int:
@@ -709,17 +714,36 @@ class Actions:
             )
         )
 
-    async def release_use_item(
-        self, position: tuple[int, int, int], *, face: BlockFace = BlockFace.UP
-    ) -> ActionResult:
-        """Stop using the held item (bow, food, shield) with ``PlayerAction``."""
+    def _action_position(self) -> tuple[int, int, int]:
+        """The block position a ``PlayerAction`` has to name.
 
+        Every ``PlayerAction`` carries a block position even when the action has
+        nothing to do with blocks (dropping an item, swapping hands).  Vanilla
+        sends whatever is being looked at, so this does the same and falls back
+        to the block under the eyes.
+        """
+
+        hit = self.raycast()
+        if hit is not None:
+            return hit.position
+        position = self.client.physics_state.position
+        return (math.floor(position.x), math.floor(position.y), math.floor(position.z))
+
+    async def _player_action(
+        self,
+        action: str,
+        code: int,
+        *,
+        position: tuple[int, int, int] | None = None,
+        face: BlockFace = BlockFace.UP,
+    ) -> ActionResult:
         started = time.monotonic()
+        position = self._action_position() if position is None else position
         packet_id = await self._send(
             "serverbound_player_action",
-            "release_use_item",
+            action,
             PacketWriter()
-            .write_varint(self.profile.codes.release_use_item)
+            .write_varint(code)
             .write_position(*position)
             .write_unsigned_byte(int(face))
             .write_varint(self._sequence())
@@ -727,12 +751,66 @@ class Actions:
         )
         return await self._emit(
             ActionResult(
-                action="release_use_item",
+                action=action,
                 status=ActionStatus.SENT,
                 position=position,
                 packets=(packet_id,),
                 elapsed=time.monotonic() - started,
             )
+        )
+
+    async def release_use_item(
+        self,
+        position: tuple[int, int, int] | None = None,
+        *,
+        face: BlockFace = BlockFace.UP,
+    ) -> ActionResult:
+        """Stop using the held item (bow, food, shield) with ``PlayerAction``."""
+
+        return await self._player_action(
+            "release_use_item",
+            self.profile.codes.release_use_item,
+            position=position,
+            face=face,
+        )
+
+    async def drop_item(
+        self,
+        position: tuple[int, int, int] | None = None,
+        *,
+        whole_stack: bool = False,
+        face: BlockFace = BlockFace.UP,
+    ) -> ActionResult:
+        """Throw one item -- or the whole held stack -- on the ground.
+
+        Vanilla has two codes for this (``DROP_ITEM`` and ``DROP_ALL_ITEMS``) and
+        acts on the *held* slot, so select the slot first.  The drop itself is
+        confirmed by the inventory, not by the action: there is no echo, so the
+        result is ``SENT`` and the caller watches ``bot.player.inventory``.
+        """
+
+        return await self._player_action(
+            "drop_stack" if whole_stack else "drop_item",
+            self.profile.codes.drop_stack
+            if whole_stack
+            else self.profile.codes.drop_item,
+            position=position,
+            face=face,
+        )
+
+    async def swap_with_offhand(
+        self,
+        position: tuple[int, int, int] | None = None,
+        *,
+        face: BlockFace = BlockFace.UP,
+    ) -> ActionResult:
+        """Swap the held item with the off hand (the ``F`` key)."""
+
+        return await self._player_action(
+            "swap_offhand",
+            self.profile.codes.swap_offhand,
+            position=position,
+            face=face,
         )
 
     # ------------------------------------------------------------------
@@ -765,8 +843,106 @@ class Actions:
 
         Deliberately an estimate: the exact vanilla formula depends on tool
         tier, enchantments, water and haste.  It exists so a caller can size
-        ``dig``'s ``hold`` instead of guessing.
+        ``dig``'s ``hold`` instead of guessing.  :meth:`break_time` is the
+        table-driven sibling that knows the real numbers for this release.
         """
 
         ticks = math.ceil(1.0 / (hardness * tool_factor / 30.0)) if hardness else 0
         return max(ticks, 1) * TICK_SECONDS
+
+    # -- hardness and tools -------------------------------------------------
+
+    def block_name(self, block: int | str) -> str:
+        """Resolve a block state id (or a name) to a ``minecraft:`` identifier."""
+
+        if isinstance(block, str):
+            return block if ":" in block else f"minecraft:{block}"
+        states = getattr(self.client.world, "block_states", None)
+        state = None if states is None else states.get(int(block))
+        name = getattr(state, "name", None)
+        if not name:
+            raise ActionError(
+                f"block state {block} is not in this release's block table, so its "
+                "hardness is unknown"
+            )
+        return name
+
+    def break_time(
+        self, block: int | str, *, tool: str | None | object = _UNSET
+    ) -> float | None:
+        """Seconds needed to break ``block`` with ``tool``, or ``None`` if unknown.
+
+        ``tool`` defaults to whatever the player is holding (so the number
+        answers "how long will *this* take"), and ``tool=None`` asks about a
+        bare hand on purpose.
+        """
+
+        table = self.version.breaking
+        if table is None:
+            return None
+        name = self.block_name(block)
+        if tool is _UNSET:
+            held = getattr(self.client, "held_item", None)
+            tool = None if held is None or held.empty else held.identifier
+        return table.seconds(name, tool=tool)  # type: ignore[arg-type]
+
+    def best_tool_for(self, block: int | str) -> tuple[int, str] | None:
+        """Best hotbar tool for ``block`` as ``(inventory slot, identifier)``.
+
+        Only the hotbar (slots 36..44) is considered, because switching to
+        anything else would cost a container move first.
+        """
+
+        table = self.version.breaking
+        if table is None:
+            return None
+        name = self.block_name(block)
+        row = table.row(name)
+        if row is None:
+            return None
+        kind = row.get("tool")
+        if not kind:
+            return None
+        tier = int(row.get("tier", 0)) if row.get("requires") else 0
+        slots: list[tuple[int, str]] = []
+        for slot in range(36, 45):
+            stack = self.client.get_inventory_item(slot)
+            if stack is not None and not stack.empty and stack.identifier:
+                slots.append((slot, stack.identifier))
+        found = best_tool(slots, kind=kind, tier=tier)
+        return None if found is None else (found[0], found[1])
+
+    async def equip_tool(self, block: int | str) -> ActionResult:
+        """Select the best hotbar tool for ``block`` (no-op when already held)."""
+
+        name = self.block_name(block)
+        best = self.best_tool_for(name)
+        if best is None:
+            return await self._emit(
+                ActionResult(
+                    action="equip_tool",
+                    status=ActionStatus.REJECTED,
+                    elapsed=0.0,
+                    evidence=f"no tool in the hotbar is good enough for {name}",
+                )
+            )
+        slot, identifier = best
+        index = slot - 36
+        if getattr(self.client, "selected_hotbar_slot", None) == index:
+            return await self._emit(
+                ActionResult(
+                    action="equip_tool",
+                    status=ActionStatus.SENT,
+                    elapsed=0.0,
+                    evidence=f"already holding {identifier}",
+                )
+            )
+        await self.client.select_hotbar_slot(index)
+        return await self._emit(
+            ActionResult(
+                action="equip_tool",
+                status=ActionStatus.SENT,
+                elapsed=0.0,
+                evidence=f"selected {identifier} in hotbar slot {index}",
+            )
+        )

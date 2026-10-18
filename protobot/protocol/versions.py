@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from protobot.errors import UnsupportedVersion
+from protobot.protocol.breaking import BreakTable
+from protobot.protocol.breaking import table_for as breaking_table_for
 from protobot.protocol.entities import EntityTable, table_for as entity_table_for
 from protobot.protocol.items import ItemTable, table_for
 from protobot.protocol.menus import MenuTable, table_for as menu_table_for
@@ -238,6 +240,23 @@ class VersionSpec:
 
         table = self.entities
         return None if table is None else table.size(registry_id)
+
+    def hardness(self, identifier: str) -> float | None:
+        """Vanilla block hardness, or ``None`` when the block is not in the table.
+
+        Hardness is what turns "dig this" into "hold the button this long", and
+        it is the one block property neither Mojang's reports nor the protocol
+        carries, so it ships in its own per-release data file.
+        """
+
+        table = self.breaking
+        return None if table is None else table.hardness(identifier)
+
+    @property
+    def breaking(self) -> BreakTable | None:
+        """The bundled hardness table for this release, if one ships."""
+
+        return breaking_table_for(self.protocol)
 
     def hard_collision_dimensions(self, registry_id: int) -> tuple[float, float] | None:
         for entity_id, width, height in self.hard_collision_entities:

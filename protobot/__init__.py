@@ -80,7 +80,9 @@ from .plugin import (
     PluginManager,
     PluginWatcher,
 )
+from .protocol.breaking import BreakTable
 from .protocol.versions import SUPPORTED_VERSIONS, VersionSpec, get_version
+from .protocol.tools import ToolSpec, best_tool, break_seconds, tool_spec
 from .session import BotContainer, BotSession, SessionConfig
 from .settings import PluginSettings, deep_merge
 from .srv import resolve_minecraft_srv
@@ -121,6 +123,7 @@ __all__ = [
     "Bot",
     "BotContainer",
     "BotSession",
+    "BreakTable",
     "ChannelFlow",
     "ChannelSpec",
     "ClickRejected",
@@ -178,12 +181,15 @@ __all__ = [
     "TaskError",
     "TaskReport",
     "TaskRunner",
+    "ToolSpec",
     "UnsupportedAction",
     "UnsupportedVersion",
     "__version__",
     "Vec3",
     "VersionSpec",
     "World",
+    "best_tool",
+    "break_seconds",
     "classify_submission",
     "connect",
     "deep_merge",
@@ -206,5 +212,6 @@ __all__ = [
     "join_session_server",
     "log",
     "refresh_login",
+    "tool_spec",
     "tui_enabled",
 ]
