@@ -48,9 +48,15 @@ class ItemStack:
 class ContainerState:
     """Latest server snapshot for one open container.
 
-    Item data is kept as the exact protocol bytes after the slot header. This
-    makes custom GUI components observable without pretending to understand
-    application-specific component registries.
+    Both views are kept.  ``slots`` holds the exact protocol bytes after the
+    slot header -- which makes custom GUI components observable without
+    pretending to understand application-specific component registries -- while
+    ``items`` holds the decoded stacks the container layer works with.  A stack
+    carrying added data components cannot be decoded (their length is only
+    known to the codec that wrote them), so ``unreadable`` records the slots
+    that stayed byte-only.  The container layer never writes to or reasons
+    about those slots -- it steers around them instead of pretending they are
+    empty.
     """
 
     container_id: int
@@ -58,9 +64,28 @@ class ContainerState:
     state_id: int = 0
     title_data: bytes = b""
     slots: dict[int, bytes] = field(default_factory=dict)
+    items: dict[int, ItemStack] = field(default_factory=dict)
+    data: dict[int, int] = field(default_factory=dict)
+    slot_count: int = 0
+    unreadable: set[int] = field(default_factory=set)
     carried_item_data: bytes = b""
+    carried_item: ItemStack = field(default_factory=ItemStack)
+    carried_unknown: bool = False
     content_data: bytes = b""
     is_open: bool = True
+    #: Bumped on every server update for this window; a click is confirmed by
+    #: observing a change, not by assuming the click worked.
+    revision: int = 0
+    #: Bumped only when the *contents* change (slots or the cursor), never by a
+    #: progress update.  A furnace sends ``container_set_data`` several times a
+    #: second, so confirming a click on ``revision`` alone would report success
+    #: before the slot update it was actually waiting for had arrived.
+    slot_revision: int = 0
+    #: Bumped only when the server announces the cursor.  The server stays
+    #: quiet when the click packet already claimed the resulting cursor, so a
+    #: click that produces no announcement may be predicted locally instead of
+    #: left stale.
+    cursor_revision: int = 0
 
 
 @dataclass(frozen=True, slots=True)

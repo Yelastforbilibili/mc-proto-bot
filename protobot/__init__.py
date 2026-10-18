@@ -24,6 +24,15 @@ from .errors import (
     UnsupportedVersion,
 )
 from .goals import Goal, GoalError, GoalReport, GoalRunner, GoalStatus
+from .containers import (
+    ClickRejected,
+    ContainerError,
+    Menu,
+    MenuLayout,
+    MenuLayoutError,
+    MenuNotOpen,
+)
+from .crafting import Recipe, recipe_for
 from .tasks import Step, StepReport, Task, TaskError, TaskReport, TaskRunner
 from . import log
 from .modlist import (
@@ -106,7 +115,9 @@ __all__ = [
     "BotSession",
     "ChannelFlow",
     "ChannelSpec",
+    "ClickRejected",
     "ConnectionClosed",
+    "ContainerError",
     "ContainerState",
     "EntityMetadataValue",
     "EntityState",
@@ -121,6 +132,10 @@ __all__ = [
     "ItemStack",
     "Loader",
     "LoginRejected",
+    "Menu",
+    "MenuLayout",
+    "MenuLayoutError",
+    "MenuNotOpen",
     "ModListAdapter",
     "MovementInput",
     "NavigationPath",
@@ -129,6 +144,7 @@ __all__ = [
     "PathNotFound",
     "PathNode",
     "PathWaypoint",
+    "Recipe",
     "Pathfinder",
     "PayloadResponse",
     "PhysicsAttributes",
@@ -170,6 +186,7 @@ __all__ = [
     "plain_text",
     "register_translations",
     "resolve_minecraft_srv",
+    "recipe_for",
     "minecraft_sha1_digest",
     "MinecraftProfile",
     "PlayerCertificate",

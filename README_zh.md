@@ -21,6 +21,8 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **交互动作层**——`bot.actions` 发送真实客户端使用的数据包：`dig`、`place_block`、`use_item_on`、`attack`、`interact`、`swing`，带射线瞄准，每个动作返回已确认/未确认的结果而不是发完就不管；各发布版的字段差异（26.3 的动作序号位移、26.3 无字段的 punch、26.1 之前的 Interact 布局）集中在一张 profile 表里。
 - **行为目标层**——`bot.goals` 用目标而不是数据包描述意图：`BreakBlockGoal`、`PlaceBlockGoal`、`ReachGoal`、`AttackEntityGoal`、`WaitGoal`，可 `SequenceGoal`/`AnyOfGoal` 组合；`GoalRunner` 负责轮询、"超距先走过去"、超时与中断，成功以服务端回报的世界状态为准（自己说完成但目标没达成算失败）。
 - **任务脚本层**——`bot.tasks` 把目标串成可重试的脚本：`Task` + `GoalStep`/`CallStep`/`WaitStep`，内置 `BreakBlocks`/`PlaceBlocks`；每步失败会写明是哪一步、第几次尝试，整条任务超时也记在报告里。
+- **容器交互层**——`bot.menu` 能打开服务端能开的任何界面（全部菜单类型，槽位布局由该版本的菜单注册表生成），并用真实点击搬东西：`deposit`、`withdraw`、`move`、`quick_move`、`swap_with_hotbar`、`throw`；每次点击都靠观察服务端的槽位更新来确认，而不是本地预测，进度条可按名字读（`data_value("cook_progress")`）。
+- **合成**——`bot.menu.craft(recipe)` 一格一格点满合成网格（背包里的 2×2，或目标自己走过去、右键打开工作台后的 3×3），取走产物再放回背包，所以 `CraftGoal` 可以直接说"八根木棍"，而服务端自己的背包就是证据；配方是显式描述（`Recipe`、`recipe_for`），不是爬来的配方库。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
 - **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡、玩家加入/退出与原始数据包事件。
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。

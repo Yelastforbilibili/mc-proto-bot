@@ -39,6 +39,7 @@
     "clientbound_remove_mob_effect": 78,
     "clientbound_respawn": 82,
     "clientbound_section_blocks_update": 84,
+    "clientbound_set_cursor_item": 96,
     "clientbound_set_entity_data": 99,
     "clientbound_set_entity_motion": 101,
     "clientbound_set_equipment": 102,
@@ -91,5 +92,5 @@
   },
   "protocol": 775,
   "source": "reports:packets.json",
-  "version": "26.1"
+  "version": "generated"
 }

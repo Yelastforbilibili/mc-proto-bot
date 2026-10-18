@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from protobot.errors import UnsupportedVersion
 from protobot.protocol.items import ItemTable, table_for
+from protobot.protocol.menus import MenuTable, table_for as menu_table_for
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +117,9 @@ class PlayPacketIds:
     clientbound_set_held_slot: int = 0
     #: Furnace/brewing/enchanting progress bars.
     clientbound_container_set_data: int = 0
+    #: The item held on the cursor.  Releases that have this packet carry the
+    #: cursor here instead of in a ``container_set_slot`` with slot ``-1``.
+    clientbound_set_cursor_item: int = 0
     #: Hit feedback for the entity in view.
     clientbound_hurt_animation: int = 0
     clientbound_damage_event: int = 0
@@ -192,6 +196,23 @@ class VersionSpec:
         """The bundled item registry for this release, if one ships."""
 
         return table_for(self.protocol)
+
+    def menu_identifier(self, registry_id: int) -> str | None:
+        """Resolve a ``clientbound_open_screen`` menu type ID to its name.
+
+        The wire identifies a window by registry ID (26.3 sends ``2`` for a
+        chest), so the container layer needs this release's own
+        ``minecraft:menu`` table to know which slots mean what.
+        """
+
+        table = self.menus
+        return None if table is None else table.identifier(registry_id)
+
+    @property
+    def menus(self) -> MenuTable | None:
+        """The bundled menu registry for this release, if one ships."""
+
+        return menu_table_for(self.protocol)
 
     def hard_collision_dimensions(self, registry_id: int) -> tuple[float, float] | None:
         for entity_id, width, height in self.hard_collision_entities:
@@ -380,6 +401,7 @@ _PLAY_772 = PlayPacketIds(
     clientbound_open_screen=0x34,
     clientbound_set_player_inventory=0x65,
     clientbound_set_held_slot=0x62,
+    clientbound_set_cursor_item=0x59,
     # 1.21.8 still bundles every entity animation (arm swing, hurt, crit) into
     # the generic ``animate`` packet, which is 1.21.x's "animation".
     clientbound_swing_animation=0x02,
@@ -497,6 +519,7 @@ _PLAY_774 = PlayPacketIds(
     clientbound_block_destruction=0x05,
     clientbound_swing_animation=0x02,
     clientbound_set_held_slot=0x67,
+    clientbound_set_cursor_item=0x5E,
     clientbound_container_set_data=0x13,
     clientbound_hurt_animation=0x29,
     clientbound_damage_event=0x19,
@@ -528,6 +551,7 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_block_destruction=0x05,
     clientbound_swing_animation=0x02,
     clientbound_set_held_slot=0x69,
+    clientbound_set_cursor_item=0x60,
     clientbound_container_set_data=0x13,
     clientbound_hurt_animation=0x2A,
     clientbound_damage_event=0x19,
@@ -619,6 +643,7 @@ _PLAY_777 = PlayPacketIds(
     clientbound_block_destruction=0x05,
     clientbound_swing_animation=0x7B,
     clientbound_set_held_slot=0x6B,
+    clientbound_set_cursor_item=0x62,
     clientbound_container_set_data=0x13,
     clientbound_hurt_animation=0x2B,
     clientbound_damage_event=0x19,

@@ -19,6 +19,7 @@ from .base import Goal, GoalError, GoalReport, GoalStatus, block_center
 from .builtin import (
     AttackEntityGoal,
     BreakBlockGoal,
+    CraftGoal,
     PlaceBlockGoal,
     ReachGoal,
     WaitGoal,
@@ -30,6 +31,7 @@ __all__ = [
     "AnyOfGoal",
     "AttackEntityGoal",
     "BreakBlockGoal",
+    "CraftGoal",
     "DEFAULT_TICK_INTERVAL",
     "Goal",
     "GoalError",

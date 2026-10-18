@@ -111,6 +111,9 @@ CLIENTBOUND_FIELDS: dict[str, tuple[str | tuple[str, ...] | None, str | None]] =
     "clientbound_container_set_content": ("container_set_content", "window_items"),
     "clientbound_container_set_slot": ("container_set_slot", "set_slot"),
     "clientbound_container_set_data": ("container_set_data", "craft_progress_bar"),
+    #: The stack on the cursor; 26.x and 1.21.x both send it as its own packet
+    #: rather than as a ``container_set_slot`` for slot ``-1``.
+    "clientbound_set_cursor_item": ("set_cursor_item", "set_cursor_item"),
     "clientbound_open_screen": ("open_screen", "open_window"),
     "clientbound_set_player_inventory": (
         "set_player_inventory",

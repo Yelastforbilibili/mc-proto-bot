@@ -21,6 +21,8 @@ import time
 from typing import TYPE_CHECKING
 
 from ..actions import ActionStatus, BlockFace
+from ..containers.errors import ContainerError
+from ..crafting.recipes import Recipe
 from ..navigation import NavigationTimeout
 from ..physics import Vec3
 from .base import Goal, GoalError, GoalStatus, block_center
@@ -254,6 +256,117 @@ class WaitGoal(Goal):
 
     def describe(self) -> str:
         return f"wait {self.seconds:g}s"
+
+
+class CraftGoal(Goal):
+    """Craft copies of a recipe, using the player grid or a crafting table.
+
+    Progress is what the *server* handed over: every craft goes through the
+    result slot and the goal only counts items the server actually put in the
+    inventory, so a rejected or dropped click cannot look like success.
+    """
+
+    name = "craft"
+
+    def __init__(
+        self,
+        recipe: Recipe,
+        *,
+        times: int = 1,
+        table: tuple[int, int, int] | None = None,
+        reach: float = 4.5,
+        timeout: float = 2.0,
+    ) -> None:
+        super().__init__()
+        if times <= 0:
+            raise ValueError("times must be positive")
+        self.recipe = recipe
+        self.times = times
+        self.table = (
+            None
+            if table is None
+            else (int(table[0]), int(table[1]), int(table[2]))
+        )
+        self.reach = reach
+        self.timeout = timeout
+        self._crafted_up_to_now = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self._crafted_up_to_now = 0
+
+    @property
+    def target(self) -> int:
+        return self.recipe.count * self.times
+
+    def is_reached(self, bot: Bot) -> bool:
+        return self._crafted_up_to_now >= self.target
+
+    async def tick(self, bot: Bot) -> GoalStatus:
+        made = self._crafted_up_to_now
+        remaining = self.target - made
+        if remaining <= 0:
+            return GoalStatus.DONE
+        crafts = -(-remaining // self.recipe.count)
+        menu = await self._open(bot)
+        if menu is None:
+            return GoalStatus.RUNNING
+        missing = menu.missing_ingredients(self.recipe)
+        if missing:
+            raise GoalError(
+                f"missing {', '.join(f'{count}x {item}' for item, count in missing.items())} "
+                f"for {self.recipe.describe()}"
+            )
+        closes = self.table is not None
+        try:
+            crafted = await menu.craft(self.recipe, crafts, timeout=self.timeout)
+        finally:
+            if closes:
+                await menu.close()
+                await asyncio.sleep(0.05)
+        self._crafted_up_to_now += crafted
+        self.last_detail = (
+            f"crafted {self._crafted_up_to_now}/{self.target} {self.recipe.output}"
+            f" ({crafts} grid fill{'s' if crafts != 1 else ''})"
+        )
+        if crafted <= 0:
+            raise GoalError(
+                f"the server crafted nothing from {self.recipe.describe()}"
+            )
+        return (
+            GoalStatus.DONE
+            if self._crafted_up_to_now >= self.target
+            else GoalStatus.RUNNING
+        )
+
+    async def _open(self, bot: Bot) -> object | None:
+        if self.recipe.size <= 2:
+            return bot.player_menu
+        if self.table is None:
+            raise GoalError(
+                f"{self.recipe.describe()} needs a 3x3 grid: pass the position of "
+                "a crafting table as table=(x, y, z)"
+            )
+        current = bot.menu
+        if current.is_open and current.identifier == "minecraft:crafting":
+            return current
+        centre = block_center(*self.table)
+        if self._eye_distance(bot, centre) > self.reach:
+            await _approach(bot, centre, self.reach, self)
+            return None
+        try:
+            return await current.open_block(self.table, reach=self.reach)
+        except ContainerError as error:
+            self.last_detail = f"open crafting table at {self.table}: {error}"
+            await _approach(bot, centre, self.reach, self)
+            return None
+
+    def describe(self) -> str:
+        where = f" at {self.table}" if self.table is not None else ""
+        return (
+            f"craft {self.recipe.count * self.times}x {self.recipe.output}"
+            f"{where}"
+        )
 
 
 # ----------------------------------------------------------------------

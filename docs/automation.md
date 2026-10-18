@@ -51,6 +51,7 @@ class Goal:
 | `PlaceBlockGoal(position, *, item=None, face=BlockFace.UP, reach=4.5)` | the position is non-air | selects the hotbar item first, clicks the neighbour behind `face` |
 | `ReachGoal(x, z, *, y=None, tolerance=1.0, timeout=30.0)` | within `tolerance` of the point | navigation failure keeps it running with the error in `last_detail` |
 | `AttackEntityGoal(entity_id, *, reach=3.0)` | the entity left `bot.entities` | swings/attacks with the release-appropriate packet |
+| `CraftGoal(recipe, *, times=1, table=None, reach=4.5)` | the server delivered `recipe.count * times` items in this run | 2x2 recipes craft in the inventory; bigger ones need `table=(x, y, z)` and the goal walks over and opens it; missing materials fail with the missing list |
 | `WaitGoal(seconds)` | the deadline passed | `reset()` re-arms it |
 
 Out-of-reach targets are approached inside the goal, so a caller never has to

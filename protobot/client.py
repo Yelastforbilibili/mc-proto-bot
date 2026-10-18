@@ -321,6 +321,9 @@ PLAYER_CONTAINER_ID = 0
 #: + 1 off hand).
 PLAYER_INVENTORY_LAST_SLOT = 45
 
+#: Defensive cap when decoding an announced container slot count.
+_MAX_CONTAINER_SLOTS = 1024
+
 
 class _UnsupportedEntityMetadata(Exception):
     pass
@@ -543,6 +546,8 @@ class Bot:
         self._actions = None
         self._goals = None
         self._tasks = None
+        self._menu = None
+        self._layout_cache = {}
         self._last_seen_messages = _LastSeenMessagesTracker()
 
     async def __aenter__(self) -> Bot:
@@ -1014,6 +1019,29 @@ class Bot:
 
             self._tasks = TaskRunner(self)
         return self._tasks
+
+    @property
+    def menu(self):
+        """The window the server currently has open, with named slots.
+
+        Resolves the active container on every use, so it follows chests being
+        opened and closed; :attr:`player_menu` always addresses the player's
+        own inventory (container 0), which is never "opened".
+        """
+
+        if self._menu is None:
+            from .containers import Menu
+
+            self._menu = Menu(self)
+        return self._menu
+
+    @property
+    def player_menu(self):
+        """The player's own inventory window (container 0)."""
+
+        from .containers import player_menu
+
+        return player_menu(self)
 
     def take_sequence(self) -> int:
         """Allocate the next interaction sequence number.
@@ -3200,6 +3228,14 @@ class Bot:
             await self._handle_container_content(packet.payload)
         elif packet.packet_id == ids.clientbound_container_set_slot:
             await self._handle_container_slot(packet.payload)
+        elif ids.clientbound_container_set_data and (
+            packet.packet_id == ids.clientbound_container_set_data
+        ):
+            await self._handle_container_set_data(packet.payload)
+        elif ids.clientbound_set_cursor_item and (
+            packet.packet_id == ids.clientbound_set_cursor_item
+        ):
+            await self._handle_set_cursor_item(packet.payload)
         elif packet.packet_id == ids.clientbound_open_screen:
             await self._handle_open_screen(packet.payload)
         elif packet.packet_id == ids.clientbound_add_entity:
@@ -4279,16 +4315,58 @@ class Bot:
         reader = PacketReader(payload)
         container_id = reader.read_varint()
         state_id = reader.read_varint()
+        body = reader.read_remaining()
         state = self._container_state(container_id)
         state.state_id = state_id
-        state.content_data = reader.read_remaining()
+        state.content_data = body
         state.slots.clear()
+        state.items.clear()
+        state.unreadable.clear()
         state.carried_item_data = b""
+        state.carried_item = ItemStack()
+        state.carried_unknown = False
         state.is_open = True
-        self._active_container_id = container_id
+        state.revision += 1
+        state.slot_revision += 1
+        # Only a menu the server actually opened can be the active one.  The
+        # player inventory (container 0) is re-sent on every join, respawn and
+        # state change, so treating its content packet as "the open menu" would
+        # clobber a chest the player just opened -- the server sends both in the
+        # same tick, inventory last.
+        if container_id != PLAYER_CONTAINER_ID:
+            self._active_container_id = container_id
+        self._decode_container_content(state, body)
         if container_id == PLAYER_CONTAINER_ID:
-            await self._sync_player_inventory(state.content_data)
+            await self._sync_player_inventory(state)
+        elif self._mirror_open_menu(state):
+            await self.events.emit(
+                "inventory_sync", dict(self.player.inventory), state.carried_item
+            )
         await self.events.emit("container_content", state)
+
+    def _decode_container_content(self, state: ContainerState, body: bytes) -> None:
+        """Decode ``count`` slots plus the carried stack into ``state``."""
+
+        reader = PacketReader(body)
+        try:
+            count = reader.read_varint()
+            if not 0 <= count <= _MAX_CONTAINER_SLOTS:
+                raise ProtocolError(f"invalid container slot count {count}")
+            state.slot_count = count
+            for slot in range(count):
+                start = reader.offset
+                state.items[slot] = self._read_item_stack(reader)
+                state.slots[slot] = body[start : reader.offset]
+            start = reader.offset
+            state.carried_item = self._read_item_stack(reader)
+            state.carried_item_data = body[start : reader.offset]
+            reader.expect_end()
+        except _UnsupportedItemComponents:
+            # Component payloads are not self-delimiting, so every slot from
+            # here on is opaque: keep it byte-only and let callers steer around
+            # it rather than silently reading them as empty.
+            state.unreadable.update(range(len(state.items), state.slot_count))
+            state.carried_unknown = True
 
     async def _handle_container_slot(self, payload: bytes) -> None:
         reader = PacketReader(payload)
@@ -4298,12 +4376,115 @@ class Bot:
         raw = reader.read_remaining()
         state = self._container_state(container_id)
         state.state_id = state_id
-        state.slots[slot] = raw
         state.is_open = True
-        self._active_container_id = container_id
+        state.revision += 1
+        state.slot_revision += 1
+        if slot < 0:
+            # Releases before the dedicated cursor packet announce the cursor
+            # as slot -1; it is not a window slot.
+            state.carried_item_data = raw
+            state.cursor_revision += 1
+            try:
+                state.carried_item = self._read_item_stack(PacketReader(raw))
+                state.carried_unknown = False
+            except (_UnsupportedItemComponents, ProtocolError):
+                state.carried_unknown = True
+            await self.events.emit("container_cursor", state)
+            return
+        state.slots[slot] = raw
+        try:
+            item = self._read_item_stack(PacketReader(raw))
+        except (_UnsupportedItemComponents, ProtocolError):
+            state.items.pop(slot, None)
+            state.unreadable.add(slot)
+            await self.events.emit("container_unparsed", state, slot)
+            return
+        state.unreadable.discard(slot)
+        state.items[slot] = item
         if container_id == PLAYER_CONTAINER_ID:
             await self._sync_player_slot(slot, raw)
+        elif self._mirror_open_menu(state, slot):
+            await self.events.emit("inventory_slot", state, slot)
         await self.events.emit("container_slot", state, slot)
+
+    async def _handle_container_set_data(self, payload: bytes) -> None:
+        reader = PacketReader(payload)
+        container_id = reader.read_varint()
+        data_id = reader.read_short()
+        value = reader.read_short()
+        reader.expect_end()
+        state = self._container_state(container_id)
+        state.data[data_id] = value
+        state.revision += 1
+        await self.events.emit("container_data", state, data_id, value)
+
+    async def _handle_set_cursor_item(self, payload: bytes) -> None:
+        """Track the stack the player carries on the cursor.
+
+        Every supported release announces the cursor with its own packet
+        instead of a ``container_set_slot`` for slot ``-1``.  The cursor is a
+        property of the player, so it is applied to the window that currently
+        has it -- without this the local cursor goes stale after the first
+        click and every following click reports an old ``state_id``.
+        """
+
+        state = self.active_container
+        if state is None:
+            state = self.containers.get(PLAYER_CONTAINER_ID)
+        if state is None:
+            return
+        reader = PacketReader(payload)
+        try:
+            state.carried_item = self._read_item_stack(reader)
+            reader.expect_end()
+            state.carried_item_data = payload
+            state.carried_unknown = False
+        except (_UnsupportedItemComponents, ProtocolError):
+            state.carried_item_data = payload
+            state.carried_unknown = True
+        state.revision += 1
+        state.slot_revision += 1
+        state.cursor_revision += 1
+        await self.events.emit("container_cursor", state)
+
+    def _menu_layout(self, state: ContainerState):
+        """Layout of the open window, cached by menu type and slot count."""
+
+        key = (state.menu_type_id, state.slot_count)
+        layout = self._layout_cache.get(key)
+        if layout is None:
+            from .containers.layouts import layout_for
+
+            layout = layout_for(
+                self.version.menu_identifier(state.menu_type_id), state.slot_count
+            )
+            self._layout_cache[key] = layout
+        return layout
+
+    def _mirror_open_menu(self, state: ContainerState, slot: int | None = None) -> bool:
+        """Copy a window's player-side slots into ``player.inventory``.
+
+        While a window is open the server announces inventory changes on *that
+        window's* container id: a ``/give`` lands in the window's player slots,
+        not on container 0.  Without this the public inventory view would go
+        stale for as long as a chest or a villager stays open.
+        """
+
+        player = self._menu_layout(state).player
+        if not player:
+            return False
+        if slot is None:
+            targets = [index for index in player if index in state.items]
+        else:
+            targets = [slot] if slot in player else []
+        if not targets:
+            return False
+        for menu_slot in targets:
+            position = player.index(menu_slot)
+            target = 9 + position if position < 27 else 36 + (position - 27)
+            if 0 <= target <= PLAYER_INVENTORY_LAST_SLOT:
+                self.player.inventory[target] = state.items[menu_slot]
+        return True
 
     async def _sync_player_slot(self, slot: int, raw: bytes) -> None:
         """Mirror one ``Container 0`` slot into ``player.inventory``.
@@ -4327,24 +4508,13 @@ class Bot:
         self.player.inventory[slot] = item
         await self.events.emit("inventory", slot, item)
 
-    async def _sync_player_inventory(self, raw: bytes) -> None:
-        """Mirror a full ``Container 0`` content packet into the inventory."""
+    async def _sync_player_inventory(self, state: ContainerState) -> None:
+        """Mirror a decoded ``Container 0`` content packet into the inventory."""
 
-        reader = PacketReader(raw)
-        try:
-            count = reader.read_varint()
-            if not 0 <= count <= PLAYER_INVENTORY_LAST_SLOT + 1:
-                raise ProtocolError(f"invalid player inventory slot count {count}")
-            slots = {}
-            for slot in range(count):
-                slots[slot] = self._read_item_stack(reader)
-            carried = self._read_item_stack(reader)
-        except (_UnsupportedItemComponents, ProtocolError) as error:
-            await self.events.emit("inventory_unparsed", -1, str(error), raw)
-            return
-        reader.expect_end()
-        self.player.inventory.update(slots)
-        await self.events.emit("inventory_sync", dict(self.player.inventory), carried)
+        for slot, item in state.items.items():
+            if 0 <= slot <= PLAYER_INVENTORY_LAST_SLOT:
+                self.player.inventory[slot] = item
+        await self.events.emit("inventory_sync", dict(self.player.inventory), state.carried_item)
 
     async def _handle_container_close(self, payload: bytes) -> None:
         reader = PacketReader(payload)
