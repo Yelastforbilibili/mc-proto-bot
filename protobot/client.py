@@ -3341,6 +3341,11 @@ class Bot:
             await self._handle_set_equipment(packet.payload)
         elif packet.packet_id == ids.clientbound_set_passengers:
             await self._handle_set_passengers(packet.payload)
+        elif (
+            ids.clientbound_swing_animation
+            and packet.packet_id == ids.clientbound_swing_animation
+        ):
+            await self._handle_swing_animation(packet.payload)
         elif packet.packet_id == ids.clientbound_set_player_inventory:
             await self._handle_set_player_inventory(packet.payload)
         elif packet.packet_id == ids.clientbound_start_configuration:
@@ -4203,6 +4208,33 @@ class Bot:
             self.player.velocity_x, self.player.velocity_y, self.player.velocity_z = velocity
             self.physics_state.velocity = Vec3(*velocity)
         await self.events.emit("entity_motion", entity_id, velocity, entity)
+
+    async def _handle_swing_animation(self, payload: bytes) -> None:
+        """Another player (or mob) moved its arm where we can see it.
+
+        The server broadcasts this whenever anyone swings, including us: our own
+        swings come back on this packet, which is what makes it useful as proof
+        that the arm animation really went out.
+
+        The payload changed shape in 26.3. Up to 26.2 it is the old
+        ``ClientboundAnimatePacket``: an entity id and one action byte, where 0
+        is "swing the main arm". From 26.3 it is
+        ``ClientboundSwingAnimationPacket``: entity id, hand, then the
+        ``SwingAnimation`` component (type and duration). Both start with the
+        entity id, and in both a main-hand swing carries 0, so the event reports
+        that one number and leaves the rest alone.
+        """
+
+        reader = PacketReader(payload)
+        entity_id = reader.read_varint()
+        if reader.remaining == 1:
+            hand = reader.read_unsigned_byte()
+        else:
+            hand = reader.read_varint()
+            reader.read_varint()
+            reader.read_varint()
+        reader.expect_end()
+        await self.events.emit("swing_animation", entity_id, hand)
 
     async def _handle_set_passengers(self, payload: bytes) -> None:
         reader = PacketReader(payload)

@@ -112,6 +112,41 @@ hand. Scenario 1 of `tools/live_suite.py` asserts the server recorded them:
 [#1] ✓ 挖一个方块 (4.7s)
 ```
 
+The server's own event log says it *received* the swings. To prove the arm is
+visible to other players, `tools/live_swing_seen.py` connects a second bot a few
+blocks away and listens for the broadcast the server makes from those swings,
+`clientbound_swing_animation` (surfaced as the `swing_animation` event):
+
+```
+[bridge] 26.3-205-a90108f (MC: 26.3) players=0
+{
+ "target": [2, -60, -4],
+ "dig_status": "ActionStatus.CONFIRMED",
+ "state_before": 10,
+ "state_after": 0,
+ "watcher_sees_entities": 62,
+ "swings_seen": 4,
+ "animations": [{"entity_id": 4619, "hand": 0}, ...],
+ "ok": true
+}
+```
+
+Two details that made that probe fail twice before it worked, both about the
+second bot rather than the digger:
+
+- **Wait for the chunk without ticking.** `tick()` runs the physics over what the
+  client has decoded so far; ticking before the ground arrives means falling,
+  and the server believes the falling position because the client keeps
+  reporting it. A bot at y=-2500 is tracking nothing.
+- **Keep the watcher ticking.** An idle bot stops answering, and the server
+  drops its entity tracking, so the animation never arrives.
+
+The 26.3 payload also changed shape: up to 26.2 it is the old
+`ClientboundAnimatePacket` (entity id + one action byte, 0 = main arm), from
+26.3 it is `ClientboundSwingAnimationPacket` (entity id, hand, then the
+`SwingAnimation` component). Both put 0 in the second field for a main-hand
+swing, which is what the event reports.
+
 ## Things that bit us
 
 - **A leftover mob spoils the proof.** The server tracks entities dozens of
