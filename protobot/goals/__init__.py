@@ -26,6 +26,7 @@ from .builtin import (
 )
 from .composite import AnyOfGoal, SequenceGoal
 from .runner import DEFAULT_TICK_INTERVAL, GoalRunner
+from .travel import StuckWatchdog, TravelGoal, WaitChunkGoal
 
 __all__ = [
     "AnyOfGoal",
@@ -41,6 +42,9 @@ __all__ = [
     "PlaceBlockGoal",
     "ReachGoal",
     "SequenceGoal",
+    "StuckWatchdog",
+    "TravelGoal",
+    "WaitChunkGoal",
     "WaitGoal",
     "block_center",
 ]

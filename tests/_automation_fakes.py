@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from protobot.actions import ActionStatus, ActionResult
 from protobot.events import EventBus
 from protobot.goals import GoalRunner
+from protobot.navigation import NavigationTimeout
 from protobot.physics import Vec3
 from protobot.protocol.versions import get_version
 from protobot.state import ItemStack
@@ -25,6 +26,8 @@ class FakeWorld:
     def __init__(self, states=None, *, unknown=False) -> None:
         self.states = dict(states or {})
         self.unknown = unknown
+        # ``None`` means "do not model chunks", so block lookups decide
+        self.chunks: dict[tuple[int, int], object] | None = None
 
     def get_state_id(self, x: int, y: int, z: int) -> int:
         if self.unknown:
@@ -91,6 +94,9 @@ class FakeBot:
         self.place_state: int | None = 1
         self.remove_on_attack = True
         self.navigation: list[tuple[float, float]] = []
+        self.navigation_blocked = False
+        self.navigation_failures = 0
+        self.navigation_raises: Exception | None = None
         self._actions = FakeActions(self)
         self._goals = GoalRunner(self)
         self._tasks = TaskRunner(self)
@@ -114,7 +120,14 @@ class FakeBot:
 
     async def navigate_to(self, x, z, *, y=None, tolerance=0.3, timeout=60.0, **kwargs):
         self.navigation.append((x, z))
+        if self.navigation_raises is not None:
+            raise self.navigation_raises
+        if self.navigation_failures > 0:
+            self.navigation_failures -= 1
+            raise NavigationTimeout("no path")
         state = self.physics_state
+        if self.navigation_blocked:
+            return state
         position = state.position
         state.position = Vec3(x, y if y is not None else position.y, z)
         return state

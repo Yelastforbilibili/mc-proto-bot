@@ -52,10 +52,37 @@ class Goal:
 | `ReachGoal(x, z, *, y=None, tolerance=1.0, timeout=30.0)` | within `tolerance` of the point | navigation failure keeps it running with the error in `last_detail` |
 | `AttackEntityGoal(entity_id, *, reach=3.0)` | the entity left `bot.entities` | swings/attacks with the release-appropriate packet |
 | `CraftGoal(recipe, *, times=1, table=None, reach=4.5)` | the server delivered `recipe.count * times` items in this run | 2x2 recipes craft in the inventory; bigger ones need `table=(x, y, z)` and the goal walks over and opens it; missing materials fail with the missing list |
+| `TravelGoal(x, z, *, y=None, tolerance=1.0, timeout=120.0, segment_seconds=20.0)` | within `tolerance` of the point | walks in segments to the edge of the terrain it has decoded, so a destination outside the server's view distance still works; a walk that makes no progress hits the watchdog |
+| `WaitChunkGoal(x, z, *, timeout=30.0)` | the chunk holding `(x, z)` is decoded | the small step for "I am at the edge and the server has not sent what comes next" |
 | `WaitGoal(seconds)` | the deadline passed | `reset()` re-arms it |
 
 Out-of-reach targets are approached inside the goal, so a caller never has to
 pair a walk with an action by hand.
+
+### Travelling past the loaded world
+
+A client only knows the chunks the server sent, and the pathfinder refuses to
+plan through terrain it has not decoded. `TravelGoal` therefore treats a long
+trip as a series of known-destination walks: when the destination chunk is
+missing it walks to the furthest decoded point along the line (steps of 4
+blocks, at most 64), lets the server stream the next chunks in, and continues.
+The goal is only "there" when the horizontal distance is inside `tolerance`, so
+a partial walk never reports success.
+
+`StuckWatchdog(distance=0.6, seconds=3.0, limit=3)` is the guard against a
+pathfinder that returns without moving the player: it observes positions, and a
+player that stays inside `distance` for `seconds` earns a strike. `TravelGoal`
+counts strikes as its own retries and fails with "no progress" once they run
+out, so a door that will not open or a hole the bot keeps falling into ends the
+goal instead of spinning forever.
+
+```python
+from protobot import TravelGoal
+
+report = await bot.goals.run(TravelGoal(240.5, 0.5, timeout=120.0))
+if not report.ok:
+    print(report.detail)   # e.g. "gave up 12.4 blocks short of (240.5, 0.5)"
+```
 
 ### Composition
 
@@ -169,3 +196,34 @@ Both halves matter: `state_after` is the client's own decoded world, and
 `server_block` is read back from the server through the prototest bridge.  See
 [protocol-verification.md](protocol-verification.md) for why the item table is
 generated data rather than a constant.
+
+### Walking past the view distance
+
+`tools/live_travel.py` asks for a destination further away than the server has
+sent terrain for, then checks the result the way the server sees it (bridge
+`/players`) and greps the server log for the movement complaints a cheating
+client provokes:
+
+```bash
+uv run python tools/live_travel.py --distance 220
+```
+
+```
+{
+  "status": "done", "elapsed": 52.703, "segments": 4,
+  "segment_targets": [[156.8, -4.5], [220.3, -4.5], [364.8, -4.5], [364.8, -4.5]],
+  "start_server": [144.82, -60.0, -4.5],
+  "end_server":   [364.34, -60.0, -4.5],
+  "target": [364.82, -4.5],
+  "walked": 219.52,
+  "server_distance_to_target": 0.48,
+  "suspicious_log": []
+}
+```
+
+The segment list is the frontier logic in one line: the goal could not hand the
+whole 220 blocks to the pathfinder because most of it was not decoded yet, so it
+walked to the edge of the known world, waited for the next chunks, and repeated.
+`walked` and `end_server` come from the server's own player record, and
+`suspicious_log` is empty, so the movement was ordinary walking rather than
+teleporting.

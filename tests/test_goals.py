@@ -12,6 +12,7 @@ import time
 import unittest
 
 from protobot.actions import ActionStatus
+from protobot.navigation import PathNotFound
 from protobot.goals import (
     AnyOfGoal,
     AttackEntityGoal,
@@ -23,6 +24,9 @@ from protobot.goals import (
     PlaceBlockGoal,
     ReachGoal,
     SequenceGoal,
+    StuckWatchdog,
+    TravelGoal,
+    WaitChunkGoal,
     WaitGoal,
 )
 from tests._automation_fakes import FakeBot
@@ -328,6 +332,144 @@ class WaitGoalTests(unittest.IsolatedAsyncioTestCase):
     def test_negative_seconds_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             WaitGoal(-1.0)
+
+
+class WatchdogTests(unittest.TestCase):
+    def test_moving_keeps_the_watchdog_quiet(self) -> None:
+        watchdog = StuckWatchdog(distance=1.0, seconds=1.0, limit=2)
+        self.assertFalse(watchdog.observe((0.0, 0.0), 0.0))
+        self.assertFalse(watchdog.observe((2.0, 0.0), 5.0))
+        self.assertEqual(watchdog.strikes, 0)
+        self.assertFalse(watchdog.exhausted)
+
+    def test_standing_still_strikes_after_the_grace_period(self) -> None:
+        watchdog = StuckWatchdog(distance=1.0, seconds=2.0, limit=1)
+        self.assertFalse(watchdog.observe((0.0, 0.0), 0.0))
+        self.assertFalse(watchdog.observe((0.2, 0.0), 1.0))
+        self.assertTrue(watchdog.observe((0.2, 0.0), 2.5))
+        self.assertEqual(watchdog.strikes, 1)
+        self.assertTrue(watchdog.exhausted)
+
+    def test_reset_clears_the_strikes(self) -> None:
+        watchdog = StuckWatchdog(seconds=0.0, limit=1)
+        watchdog.observe((0.0, 0.0), 0.0)
+        self.assertTrue(watchdog.observe((0.0, 0.0), 1.0))
+        watchdog.reset()
+        self.assertEqual(watchdog.strikes, 0)
+        self.assertFalse(watchdog.exhausted)
+
+    def test_a_limit_is_required(self) -> None:
+        with self.assertRaises(ValueError):
+            StuckWatchdog(limit=0)
+
+
+class WaitChunkTests(unittest.IsolatedAsyncioTestCase):
+    def test_reached_when_the_chunk_is_decoded(self) -> None:
+        bot = FakeBot()
+        bot.world.chunks = {(1, 0): "chunk"}
+        self.assertTrue(WaitChunkGoal(30.5, 3.0).is_reached(bot))
+        self.assertFalse(WaitChunkGoal(35.0, 3.0).is_reached(bot))
+
+    def test_falls_back_to_block_lookups_without_a_chunk_map(self) -> None:
+        self.assertTrue(WaitChunkGoal(30.0, 3.0).is_reached(FakeBot()))
+        self.assertFalse(WaitChunkGoal(30.0, 3.0).is_reached(FakeBot(unknown=True)))
+
+    async def test_waits_until_the_server_sends_the_chunk(self) -> None:
+        bot = FakeBot()
+        bot.world.chunks = {}
+        goal = WaitChunkGoal(16, 0)
+        self.assertFalse(goal.is_reached(bot))
+        bot.world.chunks[(1, 0)] = "chunk"
+        report = await bot.goals.run(goal, timeout=5.0)
+        self.assertTrue(report.ok, report.detail)
+
+    async def test_gives_up_on_a_chunk_that_never_arrives(self) -> None:
+        bot = FakeBot()
+        bot.world.chunks = {}
+        report = await bot.goals.run(WaitChunkGoal(16, 0, timeout=0.05), timeout=5.0)
+        self.assertFalse(report.ok)
+        self.assertIn("never loaded", report.detail)
+
+    def test_describe_names_the_chunk(self) -> None:
+        self.assertEqual(WaitChunkGoal(30.5, 12.5).describe(), "wait for chunk (1, 0)")
+
+
+class TravelGoalTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self.bot = FakeBot()
+
+    async def test_already_there_does_not_walk(self) -> None:
+        report = await self.bot.goals.run(TravelGoal(0.5, 0.5), timeout=5.0)
+        self.assertTrue(report.ok, report.detail)
+        self.assertEqual(self.bot.navigation, [])
+
+    async def test_walks_straight_when_the_chunk_is_known(self) -> None:
+        report = await self.bot.goals.run(TravelGoal(8.5, 4.5), timeout=5.0)
+        self.assertTrue(report.ok, report.detail)
+        self.assertEqual(self.bot.navigation, [(8.5, 4.5)])
+
+    async def test_stops_at_the_loaded_frontier(self) -> None:
+        # Chunk (1, 0) covers x = 16..31, so nothing past x = 16 is known yet.
+        self.bot.world.chunks = {(0, 0): "here"}
+        goal = TravelGoal(40.5, 0.5, tolerance=0.5)
+        status = await goal.tick(self.bot)
+        self.assertIs(status, GoalStatus.RUNNING)
+        self.assertIn("stepping", goal.last_detail)
+        walked = self.bot.navigation[-1]
+        self.assertLess(walked[0], 16.0)
+        self.assertGreater(walked[0], 0.5)
+
+    async def test_finishes_once_the_chunks_arrive(self) -> None:
+        self.bot.world.chunks = {(0, 0): "here"}
+        goal = TravelGoal(40.5, 0.5, tolerance=0.5)
+        await goal.tick(self.bot)
+        # The server streams the rest of the terrain in as the player moves.
+        for chunk_x in range(0, 4):
+            self.bot.world.chunks[(chunk_x, 0)] = "chunk"
+        report = await self.bot.goals.run(goal, timeout=5.0)
+        self.assertTrue(report.ok, report.detail)
+        self.assertEqual(self.bot.navigation[-1], (40.5, 0.5))
+
+    async def test_a_failing_walk_becomes_a_goal_failure(self) -> None:
+        self.bot.navigation_failures = 99
+        report = await self.bot.goals.run(
+            TravelGoal(8.5, 0.5, max_strikes=2), timeout=5.0
+        )
+        self.assertFalse(report.ok)
+        self.assertIn("no path", report.detail)
+
+    async def test_a_blocked_walk_hits_the_watchdog(self) -> None:
+        self.bot.navigation_blocked = True
+        report = await self.bot.goals.run(
+            TravelGoal(8.5, 0.5, stuck_seconds=0.0, max_strikes=2), timeout=5.0
+        )
+        self.assertFalse(report.ok)
+        self.assertIn("no progress", report.detail)
+
+    async def test_timeout_reports_the_remaining_distance(self) -> None:
+        self.bot.navigation_blocked = True
+        report = await self.bot.goals.run(
+            TravelGoal(8.5, 0.5, timeout=0.01), timeout=5.0
+        )
+        self.assertFalse(report.ok)
+        self.assertIn("blocks short of", report.detail)
+
+    async def test_waits_for_the_chunk_under_the_player(self) -> None:
+        # A pathfinder that plans from undecoded terrain is worse than slow.
+        self.bot.world.chunks = {}
+        goal = TravelGoal(8.5, 0.5)
+        status = await goal.tick(self.bot)
+        self.assertIs(status, GoalStatus.RUNNING)
+        self.assertIn("under the player", goal.last_detail)
+        self.assertEqual(self.bot.navigation, [])
+
+    async def test_a_pathfinder_refusal_is_a_strike_not_a_crash(self) -> None:
+        self.bot.navigation_raises = PathNotFound("the start cell has no surface")
+        report = await self.bot.goals.run(
+            TravelGoal(8.5, 0.5, max_strikes=2), timeout=5.0
+        )
+        self.assertFalse(report.ok)
+        self.assertIn("no surface", report.detail)
 
 
 if __name__ == "__main__":
