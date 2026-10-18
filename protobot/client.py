@@ -982,6 +982,21 @@ class Bot:
             self.version.packets.serverbound_container_close,
             PacketWriter().write_varint(container_id).to_bytes(),
         )
+        # The server does not echo our own close, so clear the local view here:
+        # later clicks still name this container id, and the server would ignore
+        # them because it has already closed the window.
+        closed = self.containers.get(container_id)
+        if closed is not None:
+            closed.is_open = False
+        if self._active_container_id == container_id:
+            self._active_container_id = None
+        zero = self.containers.get(PLAYER_CONTAINER_ID)
+        if zero is not None:
+            for slot in range(PLAYER_INVENTORY_LAST_SLOT + 1):
+                stack = self.player.inventory.get(slot)
+                if stack is not None:
+                    zero.items[slot] = stack
+                    zero.unreadable.discard(slot)
 
     @property
     def actions(self):
@@ -4507,7 +4522,16 @@ class Bot:
             position = player.index(menu_slot)
             target = 9 + position if position < 27 else 36 + (position - 27)
             if 0 <= target <= PLAYER_INVENTORY_LAST_SLOT:
-                self.player.inventory[target] = state.items[menu_slot]
+                stack = state.items[menu_slot]
+                self.player.inventory[target] = stack
+                zero = self.containers.get(PLAYER_CONTAINER_ID)
+                if zero is not None and zero is not state:
+                    # Container 0 stops updating while a window is open, so keep
+                    # its decoded view in step too: menus read slot contents from
+                    # their own state, and acting on a stale slot does nothing.
+                    zero.items[target] = stack
+                    if menu_slot in state.slots:
+                        zero.slots[target] = state.slots[menu_slot]
         return True
 
     async def _sync_player_slot(self, slot: int, raw: bytes) -> None:

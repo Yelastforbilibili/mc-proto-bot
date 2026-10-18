@@ -31,6 +31,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Event bus** — subscribe to chat, chunk, entity, container, health/death, join/leave, and raw packet events.
 - **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
 - **Diagnostic CLI** — live regression checks and movement traces against a local server.
+- **In-game acceptance suite** — `tools/live_suite.py` builds its own scenes on a real server and runs 23 numbered scenarios (dig, place, every container, crafting, navigation, combat, tools, items with components, and three mixed end-to-end jobs) triggered from chat by any player typing a number; every check asks the server (`data get`) rather than the bot. See [docs/acceptance-suite.md](docs/acceptance-suite.md).
 
 ## Installation
 
