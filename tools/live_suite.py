@@ -694,53 +694,52 @@ class Suite:
 
     # -- dispatch -----------------------------------------------------
     async def kill(
-        self, entity_id: int, *, max_hits: int = 30, timeout: float = 45.0
+        self, entity_id: int, *, max_hits: int = 40, timeout: float = 90.0
     ) -> int:
-        """Hit a tracked entity until it is gone, walking after it when it escapes.
+        """Hit a live entity until it is gone, walking after it when it escapes.
 
-        The server only accepts a hit while the entity is inside the three block
-        attack range, and a cow is knocked back by every hit, so a plain swing
-        loop misses once it drifts away.
+        A cow with its brain on walks away and is knocked back by every hit, so
+        this is a chase: close the distance, aim at the box centre, hit, wait
+        out the attack cooldown (a hit landed before it is up deals no damage),
+        repeat.  The server validates the distance, not the crosshair, so once
+        the target is inside three blocks the hit is sent even if the ray clips
+        the ground first.
         """
 
         hits = 0
+        self.last_kill_distance = None
         deadline = time.monotonic() + timeout
-        for _ in range(max_hits):
-            if time.monotonic() > deadline:
-                break
+        while hits < max_hits and time.monotonic() < deadline:
             entity = self.bot.entities.get(entity_id)
             if entity is None:
-                break
-            near = math.dist((entity.x, entity.y, entity.z), self.feet()) <= 2.8
-            hit = self.bot.actions.raycast_entity(max_distance=3.0)
-            if (hit is None or hit.entity_id != entity_id) and not near:
+                return hits
+            distance = math.dist((entity.x, entity.y, entity.z), self.feet())
+            if distance > 2.6:
+                # Close and short steps: a fleeing cow moves while the path is
+                # being planned, so one long walk to where it used to be is
+                # wasted time.
                 try:
                     await self.bot.navigate_to(
-                        entity.x, entity.z, tolerance=1.6, timeout=3.0
+                        entity.x, entity.z, tolerance=1.0, timeout=2.5
                     )
                 except Exception:
-                    pass
+                    await self.settle(0.1)
                 entity = self.bot.entities.get(entity_id)
                 if entity is None:
-                    break
-                near = math.dist((entity.x, entity.y, entity.z), self.feet()) <= 2.8
-                hit = self.bot.actions.raycast_entity(max_distance=3.0)
+                    return hits
+                distance = math.dist((entity.x, entity.y, entity.z), self.feet())
+                self.last_kill_distance = distance
+                if distance > 3.0:
+                    continue
             try:
                 await self.bot.actions.look_at_entity(entity_id)
             except Exception:
-                break
-            await self.settle(0.1)
-            if hit is not None and hit.entity_id == entity_id:
-                result = await self.bot.actions.attack_looked_at(max_distance=3.0)
-            elif near:
-                # The server checks the distance, not the crosshair, so a nearby
-                # mob is hittable even when the ray skims past its box.
-                result = await self.bot.actions.attack(entity_id, swing=True)
-            else:
-                await self.settle(0.2)
-                continue
-            if result is not None:
-                hits += 1
+                return hits
+            await self.settle(0.05)
+            await self.bot.actions.attack(entity_id, swing=True)
+            hits += 1
+            # Attack strength only refills while no hit is landing; firing
+            # faster than that deals a fraction of the damage.
             await self.settle(0.65)
         return hits
 
@@ -866,7 +865,10 @@ async def dig_one(s: Suite) -> None:
     assert local == 0 and server == 0, f"本地={local} 服务端={server}"
     events = s.events("break")
     assert events, "服务端没有 break 事件"
+    swings = s.events("swing")
+    assert swings, "服务端没有记录摆臂（挖方块必须带 swing，否则反作弊会标记）"
     await s.say(f"    服务端 break {events[-1].get('block')} @ {target}")
+    await s.say(f"    服务端 swing {len(swings)} 次 {swings[-1].get('animation')}")
 
 
 @case(2, "挖掘/放置", "放一个方块")
@@ -883,6 +885,7 @@ async def place_one(s: Suite) -> None:
     assert "dirt" in server_type or "grass" in server_type, f"服务端是 {server_type}"
     events = s.events("place")
     assert events, "服务端没有 place 事件"
+    assert s.events("swing"), "服务端没有记录摆臂"
     await s.say(f"    服务端 place {server_type} @ {target}")
 
 
@@ -995,9 +998,14 @@ async def furnace_smelt(s: Suite) -> None:
     assert cobble is not None and coal is not None, "背包里没有原料"
     moved_in = await menu.move(cobble, input_slot, count=1)
     moved_fuel = await menu.move(coal, fuel_slot, count=1)
-    assert moved_in == 1 and moved_fuel == 1, (
+    await s.settle(0.3)
+    # A furnace starts burning the same tick the fuel lands, so the pile can be
+    # gone from the slot before the click's echo arrives: "moved 0" is the truth
+    # about the slot, not about the click. The fire is the proof that landed.
+    lit = menu.data_value("lit_time")
+    assert moved_in == 1 and (moved_fuel == 1 or lit > 0), (
         f"投料 {moved_in}/{moved_fuel}，槽位 in={input_slot} fuel={fuel_slot} "
-        f"in={menu.item(input_slot)} fuel={menu.item(fuel_slot)} "
+        f"in={menu.item(input_slot)} fuel={menu.item(fuel_slot)} lit={lit} "
         f"cobble={cobble} coal={coal} carried={menu.carried} "
         f"state={menu.state_id} revision={menu.revision} "
         f"server_coal={s.server_count('minecraft:coal')} "
@@ -1219,35 +1227,59 @@ def _server_position(s: Suite) -> tuple[float, float, float]:
 # ---------------------------------------------------------------------------
 # 5. combat
 # ---------------------------------------------------------------------------
-@case(15, "战斗", "打牛到死")
+@case(15, "战斗", "打牛到死", timeout=180.0)
 async def kill_cow(s: Suite) -> None:
     spot = (s.anchor[0] + 2.5, float(s.anchor[1]), s.anchor[2] + 0.5)
-    entity_id = await s.summon("minecraft:cow", spot, no_ai=True)
+    # A sword, because that is what a player brings to a fight: a bare hand
+    # needs ten hits and gives a live cow ten chances to walk out of reach.
+    s.give("minecraft:iron_sword", 1)
+    await s.settle(0.4)
+    await s.hold("minecraft:iron_sword")
+    # A live cow, brain included: every hit knocks it back, so the killer has to
+    # keep walking after it instead of standing in one place swinging.
+    entity_id = await s.summon("minecraft:cow", spot)
     await s.bot.actions.look_at_entity(entity_id)
     health_before = s.entity_health("minecraft:cow")
     assert health_before and health_before > 0, f"服务端血量 {health_before}"
     swings = await s.kill(entity_id)
     await s.settle(0.5)
-    gone = s.entity_health("minecraft:cow") is None
-    assert gone, "牛还活着"
+    health_after = s.entity_health("minecraft:cow")
+    assert health_after is None, (
+        f"牛还活着：{swings} 次命中后服务端血量 {health_after}，"
+        f"最后距离 {s.last_kill_distance}"
+    )
     assert not any(eid == entity_id for eid in s.bot.entities), "客户端还留着实体"
     bad = s.anti_cheat_lines()
     assert not bad, f"反作弊日志：{bad[:2]}"
     await s.say(f"    服务端血量 {health_before:.0f} → 消失，{swings} 个攻击包")
 
 
-@case(16, "战斗", "击中最近的目标")
+@case(16, "战斗", "选中最近目标并实战命中")
 async def pick_nearest(s: Suite) -> None:
-    near = (s.anchor[0] + 2.2, float(s.anchor[1]), s.anchor[2] + 0.5)
-    far = (s.anchor[0] + 2.2, float(s.anchor[1]), s.anchor[2] + 2.6)
-    kill_before = s.command(f"kill @e[tag={TAG}]")
+    # Two live cows, one inside the three block attack range and one outside it.
+    # The test is not "the ray sees a cow": it is "the hit lands on the near cow
+    # and the far cow keeps its health".
+    near_tag = f"{TAG}-near"
+    far_tag = f"{TAG}-far"
+    for tag in (near_tag, far_tag):
+        s.command(f"kill @e[tag={tag}]")
     await s.settle(0.3)
+    near = (s.anchor[0] + 2.2, float(s.anchor[1]), s.anchor[2] + 0.5)
+    far = (s.anchor[0] + 2.2, float(s.anchor[1]), s.anchor[2] + 5.2)
     before = set(s.bot.entities)
-    s.command(f'summon minecraft:cow {far[0]:.2f} {far[1]:.2f} {far[2]:.2f} {{Tags:["{TAG}"],PersistenceRequired:1b}}')
+    s.command(
+        f'summon minecraft:cow {far[0]:.2f} {far[1]:.2f} {far[2]:.2f} '
+        f'{{Tags:["{far_tag}"],PersistenceRequired:1b}}'
+    )
     far_id = await s.wait_entity("minecraft:cow", far, before=before)
     before.add(far_id)
-    s.command(f'summon minecraft:cow {near[0]:.2f} {near[1]:.2f} {near[2]:.2f} {{Tags:["{TAG}"],PersistenceRequired:1b}}')
+    s.command(
+        f'summon minecraft:cow {near[0]:.2f} {near[1]:.2f} {near[2]:.2f} '
+        f'{{Tags:["{near_tag}"],PersistenceRequired:1b}}'
+    )
     near_id = await s.wait_entity("minecraft:cow", near, before=before)
+    await s.settle(0.3)
+
     center = s.bot.actions.entity_center(near_id)
     assert center is not None, "最近的牛没有被跟踪"
     await s.bot.actions.look_at(center)
@@ -1255,7 +1287,28 @@ async def pick_nearest(s: Suite) -> None:
     hit = s.bot.actions.raycast_entity()
     assert hit is not None, "射线里没有实体"
     assert hit.entity_id == near_id, f"选中 {hit.entity_id}，最近的是 {near_id}"
-    await s.say(f"    射线选中 {hit.entity_id}（近），忽略 {far_id}，距离 {hit.distance:.2f}")
+
+    near_before = s.entity_health("minecraft:cow", tag=near_tag)
+    far_before = s.entity_health("minecraft:cow", tag=far_tag)
+    assert near_before is not None and near_before > 0, f"近牛服务端血量 {near_before}"
+    assert far_before is not None and far_before > 0, f"远牛服务端血量 {far_before}"
+    result = await s.bot.actions.attack_looked_at(max_distance=3.0)
+    assert result is not None, "射线在牛身上却打不出去"
+    assert result.entity_id == near_id, f"打到了 {result.entity_id}，不是 {near_id}"
+    await s.settle(0.7)
+    near_after = s.entity_health("minecraft:cow", tag=near_tag)
+    far_after = s.entity_health("minecraft:cow", tag=far_tag)
+    assert near_after is None or near_after < near_before, (
+        f"近牛没掉血：{near_before} → {near_after}"
+    )
+    assert far_after == far_before, f"远牛也掉血了：{far_before} → {far_after}"
+    for tag in (near_tag, far_tag):
+        s.command(f"kill @e[tag={tag}]")
+    await s.say(
+        f"    射线选中 {near_id}（近，{hit.distance:.2f} 格）；"
+        f"实战命中：近牛 {near_before:.0f}→{near_after if near_after is not None else '死'}，"
+        f"远牛 {far_before:.0f} 未变"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1556,14 +1609,20 @@ async def mixed_expedition(s: Suite) -> None:
     assert out.status is GoalStatus.DONE, f"远征 {out.detail}"
     await s.settle(0.4)
     spot = (s.position()[0] + 2.0, float(s.feet()[1]), s.position()[2])
-    # Pinned in place: the scenario is about walking out, killing and walking
-    # back, and a wandering target turns "did the kill land" into a chase.
-    entity_id = await s.summon("minecraft:cow", spot, no_ai=True)
+    # A sword in the hotbar, the way a player would set out, and a real cow with
+    # its brain on: it walks, it gets knocked back, and the killer has to follow
+    # it, which is what a live server looks like.
+    s.give("minecraft:iron_sword", 1)
+    await s.settle(0.4)
+    await s.hold("minecraft:iron_sword")
+    entity_id = await s.summon("minecraft:cow", spot)
     await s.bot.actions.look_at_entity(entity_id)
     kills = await s.kill(entity_id)
     if s.entity_health("minecraft:cow") is not None:
         kills += await s.kill(entity_id)
-    assert s.entity_health("minecraft:cow") is None, f"远处的牛没死（{kills} 次命中）"
+    assert s.entity_health("minecraft:cow") is None, (
+        f"远处的牛没死（{kills} 次命中，最后距离 {s.last_kill_distance}）"
+    )
     home = await s.bot.goals.run(
         TravelGoal(start[0] + 0.5, start[2] + 0.5, tolerance=1.5, timeout=150.0),
         timeout=200.0,

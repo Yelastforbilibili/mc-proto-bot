@@ -23,6 +23,7 @@ from protobot.actions import (
     raycast_blocks,
     raycast_entities,
 )
+from protobot.actions import interactions as interactions_module
 from protobot.events import EventBus
 from protobot.physics import Vec3
 from protobot.protocol.codec import PacketReader
@@ -177,9 +178,14 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         bot.on_tick = lambda: bot.world.set_state_id(1, 64, 2, 0)
         result = await Actions(bot).dig((1, 64, 2), face=BlockFace.NORTH)
         self.assertEqual(result.status, ActionStatus.CONFIRMED)
-        self.assertEqual(len(bot.sent), 2)
+        self.assertEqual(len(bot.sent), 3)
 
-        start_id, start_payload = bot.sent[0]
+        # The arm swings before the button counts as down: a break with no
+        # swing behind it is what an anti-cheat flags first.
+        self.assertEqual(bot.sent[0][0], 0x2E)  # swing on 26.3 ("punch")
+        self.assertEqual(bot.sent[0][1], b"")
+
+        start_id, start_payload = bot.sent[1]
         self.assertEqual(start_id, 0x29)  # serverbound_player_action on 26.3
         reader = PacketReader(start_payload)
         self.assertEqual(reader.read_varint(), 0)  # START_DESTROY_BLOCK
@@ -188,7 +194,7 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reader.read_varint(), 0)  # first sequence
         self.assertEqual(reader.read_remaining(), b"")
 
-        stop_id, stop_payload = bot.sent[1]
+        stop_id, stop_payload = bot.sent[2]
         self.assertEqual(stop_id, 0x29)
         reader = PacketReader(stop_payload)
         # 26.3 inserted CHANGE_DESTROY_DIRECTION at ordinal 1, so STOP is 3 --
@@ -199,11 +205,28 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reader.read_varint(), 1)
         self.assertEqual(reader.read_remaining(), b"")
 
+    async def test_dig_keeps_swinging_while_the_button_is_held(self) -> None:
+        # A block that never breaks keeps the hold loop running, and a held
+        # button has to keep the arm moving or the break looks like a script.
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(1, 64, 2): 9}))
+        bot.on_tick = lambda: None
+        original = interactions_module.SWING_INTERVAL
+        interactions_module.SWING_INTERVAL = 0.01
+        try:
+            await Actions(bot).dig((1, 64, 2), hold=0.3, confirm_timeout=0.0)
+        finally:
+            interactions_module.SWING_INTERVAL = original
+        swings = [packet_id for packet_id, _ in bot.sent if packet_id == 0x2E]
+        actions = [packet_id for packet_id, _ in bot.sent if packet_id == 0x29]
+        self.assertEqual(len(actions), 2)  # START and STOP
+        # One swing as the button goes down, then one per animation while held.
+        self.assertGreaterEqual(len(swings), 3)
+
     async def test_dig_stop_keeps_the_classic_code_before_26_3(self) -> None:
         bot = _FakeBot(get_version("26.1"), _FakeWorld({(1, 64, 2): 9}))
         bot.on_tick = lambda: bot.world.set_state_id(1, 64, 2, 0)
         await Actions(bot).dig((1, 64, 2), face=BlockFace.NORTH)
-        reader = PacketReader(bot.sent[1][1])
+        reader = PacketReader(bot.sent[2][1])
         self.assertEqual(reader.read_varint(), 2)  # STOP_DESTROY_BLOCK on 26.1
 
     async def test_dig_aims_before_sending(self) -> None:
@@ -270,6 +293,9 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
             1 + 8 + 1 + 12 + 1 + 1 + 1,
             "hand + packed position + face + 3 floats + 2 booleans + sequence",
         )
+        # Using the hand on a block swings the arm, exactly like a break does.
+        self.assertEqual(bot.sent[1][0], 0x2E)
+        self.assertEqual(bot.sent[1][1], b"")
 
     async def test_place_block_places_above_the_clicked_block(self) -> None:
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 64, 0): 5}))

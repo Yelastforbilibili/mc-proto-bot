@@ -18,7 +18,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **数据驱动的版本表**——包 id 表、物品注册表、方块状态表都由 Mojang 官方 `reports/` 生成（`tools/gen_packet_ids.py`、`tools/gen_item_ids.py`、`protobot-export-block-states`）后入库，任何一张表与它声称的版本不符时 `tests/test_packet_ids.py` 直接失败。
 - **客户端物理**——20 Hz 确定性物理引擎，精确复刻原版移动逻辑，含船载物理与实体硬碰撞。
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
-- **交互动作层**——`bot.actions` 发送真实客户端使用的数据包：`dig`、`place_block`、`use_item_on`、`attack`、`interact`、`swing`，带射线瞄准，每个动作返回已确认/未确认的结果而不是发完就不管；各发布版的字段差异（26.3 的动作序号位移、26.3 无字段的 punch、26.1 之前的 Interact 布局）集中在一张 profile 表里。
+- **交互动作层**——`bot.actions` 发送真实客户端使用的数据包：`dig`、`place_block`、`use_item_on`、`attack`、`interact`、`swing`，带射线瞄准，每个动作返回已确认/未确认的结果而不是发完就不管；各发布版的字段差异（26.3 的动作序号位移、26.3 无字段的 punch、26.1 之前的 Interact 布局）集中在一张 profile 表里。挖方块与放方块都会按原版节奏（约 6 tick）摆臂，服务端因此会把动画广播给周围玩家，反作弊也不会看到"只有 PlayerAction、没有 swing"的机器人特征。
 - **实体射线与战斗**——客户端只拿到实体 id、脚部坐标与类型 id，所以 `raycast_entity` 用该版本自己的实体注册表（`protobot/data/entities-*.json.gz`）重建碰撞箱、矄准其中心，并把“准星上没有实体”和“没发出”分开报告；`attack_looked_at` 在 26.1+ 发 `ServerboundAttackPacket`，1.21.x 退回带 `ATTACK` 标记的 `Interact`，`tools/live_combat.py` 每打一下都向服务端查一次生物 `Health` 来证明击杀。
 - **行为目标层**——`bot.goals` 用目标而不是数据包描述意图：`BreakBlockGoal`、`PlaceBlockGoal`、`ReachGoal`、`AttackEntityGoal`、`WaitGoal`，可 `SequenceGoal`/`AnyOfGoal` 组合；`GoalRunner` 负责轮询、"超距先走过去"、超时与中断，成功以服务端回报的世界状态为准（自己说完成但目标没达成算失败）。
 - **远距离行进**——`TravelGoal` 能走到服务器视野之外的目的地：先走到已解码地形的边缘，等服务端把下一批区块送来再继续；`StuckWatchdog` 在"走完一轮却没有位移"时以 "no progress" 结束而不是空转，`WaitChunkGoal` 是同一思路的独立一步。

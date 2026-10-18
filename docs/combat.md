@@ -92,6 +92,26 @@ Paper 26.3 (the cow starts at 10 and is gone after the last hit):
 is empty because 0.65 s between hits is an ordinary player's cadence -- the
 server never logs "moved too quickly" or a reach complaint.
 
+## Arm swings
+
+`attack()` swings as part of the hit, but a swing is not only an attack
+flourish: the server turns every swing packet into an arm animation for nearby
+players, and a bot that breaks blocks with nothing but `PlayerAction` packets is
+the textbook anti-cheat signature of a script.
+
+So `dig()` swings before `START_DESTROY_BLOCK` and then once every
+`SWING_INTERVAL` (0.3 s, roughly a vanilla animation) while the button stays
+down, and `use_item_on()`/`place_block()` swing after using the hand on a block.
+The packets are the same ones `swing()` sends, so 26.3 gets the empty
+`ServerboundPunchPacket` and 26.1/1.21.x get `ServerboundSwingPacket` with the
+hand. Scenario 1 of `tools/live_suite.py` asserts the server recorded them:
+
+```
+[#1]     服务端 break [2, -60, 0] @ (2, -60, 0)
+[#1]     服务端 swing 4 次 ARM_SWING
+[#1] ✓ 挖一个方块 (4.7s)
+```
+
 ## Things that bit us
 
 - **A leftover mob spoils the proof.** The server tracks entities dozens of
@@ -106,3 +126,9 @@ server never logs "moved too quickly" or a reach complaint.
 - **`Bot` has no `entity_id`.** Nothing in the client tracks "which entity is
   me", so the ray cast does not try to skip the player; in survival the player's
   own box is simply not where the crosshair is.
+- **A pinned mob proves nothing.** Summoning with `NoAI:1b` keeps the target
+  still, which hides everything interesting: a live cow walks, and every hit
+  knocks it back out of reach, so the killer has to follow it. Scenarios 15 and
+  23 therefore summon ordinary cows and chase them, which is also why they land
+  11 hits for 10 health -- one of them fell inside the attack cooldown and dealt
+  no damage, exactly as it would for a player.

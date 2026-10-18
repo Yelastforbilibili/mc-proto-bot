@@ -11,6 +11,11 @@ server's own health value, not anything the client believes:
 4. wait for the server to remove the entity, and check the server log for
    movement/anti-cheat complaints.
 
+The mob is summoned with ``NoAI`` on purpose: this tool isolates the packet --
+one hit, one health point -- and a target that runs away would mix the chase in.
+For a live target that walks and is knocked back, run scenarios 15/16/23 of
+``tools/live_suite.py``, which summon ordinary cows and follow them.
+
 Run it with a Paper 26.3 server and the prototest bridge up::
 
     python tools/live_combat.py --version 26.3

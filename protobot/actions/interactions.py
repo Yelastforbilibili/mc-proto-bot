@@ -52,6 +52,12 @@ INTERACT_AT = 2
 #: One client tick at 20 Hz, used to pace the hold-and-wait loops.
 TICK_SECONDS = 0.05
 
+#: How often a held button swings the arm.  A vanilla client animates one swing
+#: per ~6 ticks, and every one of them is a swing packet; servers use them to
+#: make the arm move for other players, and anti-cheat uses them to tell a human
+#: mining a block from a stream of PlayerAction packets out of nowhere.
+SWING_INTERVAL = 0.3
+
 _HANDS = {"main_hand": 0, "main": 0, "off_hand": 1, "off": 1}
 
 #: Sentinel for "the caller did not say which tool", so ``tool=None`` can mean
@@ -276,20 +282,28 @@ class Actions:
         *,
         seconds: float,
         tick: bool,
+        swing_period: float | None = None,
     ) -> bool:
         """Tick the client until ``until()`` is true or ``seconds`` elapse.
 
         Ticking matters: a dig only makes progress while the player keeps
         sending movement packets, and the receive loop needs wall-clock time to
-        deliver the server's answer.
+        deliver the server's answer.  ``swing_period`` keeps the arm moving
+        while a button is held, the way a vanilla client does.
         """
 
         deadline = time.monotonic() + seconds
+        # The caller already swung when the button went down, so the next one is
+        # one animation later rather than immediately after it.
+        next_swing = time.monotonic() + (swing_period or 0.0)
         while True:
             if until():
                 return True
             if time.monotonic() >= deadline:
                 return False
+            if swing_period is not None and time.monotonic() >= next_swing:
+                await self._swing_packet()
+                next_swing = time.monotonic() + swing_period
             if tick:
                 await self.client.tick()
             await asyncio.sleep(TICK_SECONDS)
@@ -297,6 +311,16 @@ class Actions:
     # ------------------------------------------------------------------
     # arm / entity actions
     # ------------------------------------------------------------------
+    async def _swing_packet(self, hand: str | int = "main_hand") -> int:
+        """Send one arm swing without reporting it as an action of its own."""
+
+        payload = (
+            b""
+            if self.profile.swing_is_empty
+            else PacketWriter().write_varint(_hand(hand)).to_bytes()
+        )
+        return await self._send("serverbound_swing", "swing", payload)
+
     async def swing(self, *, hand: str | int = "main_hand") -> ActionResult:
         """Send one arm swing.
 
@@ -306,12 +330,7 @@ class Actions:
         """
 
         started = time.monotonic()
-        payload = (
-            b""
-            if self.profile.swing_is_empty
-            else PacketWriter().write_varint(_hand(hand)).to_bytes()
-        )
-        packet_id = await self._send("serverbound_swing", "swing", payload)
+        packet_id = await self._swing_packet(hand)
         return await self._emit(
             ActionResult(
                 action="swing",
@@ -525,7 +544,11 @@ class Actions:
 
         codes = self.profile.codes
         sequence = self._sequence()
-        packets = [
+        # Vanilla swings the arm as the button goes down: the animation is a
+        # packet of its own, and a break with no swing behind it is what an
+        # anti-cheat flags first.
+        packets = [await self._swing_packet()]
+        packets.append(
             await self._send(
                 "serverbound_player_action",
                 "dig",
@@ -536,12 +559,14 @@ class Actions:
                 .write_varint(sequence)
                 .to_bytes(),
             )
-        ]
+        )
 
         def changed() -> bool:
             return world.get_state_id(x, y, z) != state_before
 
-        broke = await self._settle(changed, seconds=hold, tick=tick)
+        broke = await self._settle(
+            changed, seconds=hold, tick=tick, swing_period=SWING_INTERVAL
+        )
 
         if send_stop:
             packets.append(
@@ -624,13 +649,16 @@ class Actions:
             .to_bytes()
         )
         packet_id = await self._send("serverbound_use_item_on", "use_item_on", payload)
+        # Vanilla swings the arm when the hand uses an item on a block, so the
+        # placement has an animation behind it just like a break does.
+        swing_id = await self._swing_packet(hand)
         return await self._emit(
             ActionResult(
                 action="use_item_on",
                 status=ActionStatus.SENT,
                 sequence=sequence,
                 position=position,
-                packets=(packet_id,),
+                packets=(packet_id, swing_id),
                 elapsed=time.monotonic() - started,
                 extra={"face": int(face), "cursor": cursor},
             )

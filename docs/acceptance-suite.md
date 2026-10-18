@@ -40,7 +40,7 @@ to a spam counter per message and removes one per tick, kicking above 200.
 
 | # | Category | Scenario | What it proves |
 | --- | --- | --- | --- |
-| 1 | dig/place | one block dug | start/stop dig, block update, drop picked up |
+| 1 | dig/place | one block dug | start/stop dig, a swing behind it, block update, drop picked up |
 | 2 | dig/place | one block placed | `use_item_on`, placement confirmed by the server |
 | 3 | dig/place | swing and empty use | arm animation plus a right click into the air |
 | 4 | dig/place | ray hits the block | block raycast against the loaded world |
@@ -54,8 +54,8 @@ to a spam counter per message and removes one per tick, kicking above 200.
 | 12 | navigation | short walk | `navigate_to` lands on the target |
 | 13 | navigation | long walk | `TravelGoal` across chunk borders |
 | 14 | navigation | there and back | two trips, no drift |
-| 15 | combat | kill a cow | entity raycast, attack, server health to zero |
-| 16 | combat | nearest target | the ray picks the nearer of two mobs |
+| 15 | combat | kill a cow | a live cow (knockback and all) chased down, server health to zero |
+| 16 | combat | nearest target | the ray picks the nearer mob, the hit lands on it, the far one keeps its health |
 | 17 | tools | hardness numbers | the bundled table matches vanilla times |
 | 18 | tools | tool choice and speed | `equip_tool` and a measured break delay |
 | 19 | components | known components | a window with data components decodes fully |
