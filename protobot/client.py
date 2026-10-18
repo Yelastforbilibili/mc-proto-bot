@@ -55,6 +55,7 @@ from .protocol.codec import PacketReader, PacketWriter
 from .protocol.connection import ConnectionState, ProtocolConnection, RawPacket
 from .protocol.framing import make_handshake
 from .protocol.nbt import read_anonymous_nbt
+from .protocol.stacks import StackFrameError, read_stack, read_stacks
 from .protocol.versions import VersionSpec, get_version
 from .registry import RegistryStore
 from .srv import resolve_minecraft_srv
@@ -4282,11 +4283,16 @@ class Bot:
         if not 0 <= slot <= 45:
             raise ProtocolError(f"invalid player inventory slot {slot}")
         try:
-            item = self._read_item_stack(reader)
-        except _UnsupportedItemComponents as error:
+            item = read_stack(
+                payload,
+                item_identifier=self.version.item_identifier,
+                codecs=self.version.component_codecs,
+                start=reader.offset,
+                end=len(payload),
+            ).item
+        except (StackFrameError, ProtocolError) as error:
             await self.events.emit("inventory_unparsed", slot, str(error), payload)
             return
-        reader.expect_end()
         self.player.inventory[slot] = item
         await self.events.emit("inventory", slot, item)
 
@@ -4345,28 +4351,48 @@ class Bot:
         await self.events.emit("container_content", state)
 
     def _decode_container_content(self, state: ContainerState, body: bytes) -> None:
-        """Decode ``count`` slots plus the carried stack into ``state``."""
+        """Decode ``count`` slots plus the carried stack into ``state``.
+
+        ``count`` is a slot count, not a byte length, and a stack carrying added
+        data components hides its own end -- so the slot list is recovered as a
+        whole (see :mod:`protobot.protocol.stacks`) instead of slot by slot.
+        """
 
         reader = PacketReader(body)
+        count = reader.read_varint()
+        if not 0 <= count <= _MAX_CONTAINER_SLOTS:
+            raise ProtocolError(f"invalid container slot count {count}")
+        state.slot_count = count
         try:
-            count = reader.read_varint()
-            if not 0 <= count <= _MAX_CONTAINER_SLOTS:
-                raise ProtocolError(f"invalid container slot count {count}")
-            state.slot_count = count
-            for slot in range(count):
-                start = reader.offset
-                state.items[slot] = self._read_item_stack(reader)
-                state.slots[slot] = body[start : reader.offset]
-            start = reader.offset
-            state.carried_item = self._read_item_stack(reader)
-            state.carried_item_data = body[start : reader.offset]
-            reader.expect_end()
-        except _UnsupportedItemComponents:
-            # Component payloads are not self-delimiting, so every slot from
-            # here on is opaque: keep it byte-only and let callers steer around
-            # it rather than silently reading them as empty.
-            state.unreadable.update(range(len(state.items), state.slot_count))
+            frames = read_stacks(
+                body,
+                count + 1,
+                item_identifier=self.version.item_identifier,
+                codecs=self.version.component_codecs,
+                start=reader.offset,
+                end=len(body),
+            )
+        except StackFrameError:
+            # No patch lengths add up: keep every slot byte-only and let callers
+            # steer around them rather than silently reading them as empty.
+            state.unreadable.update(range(count))
             state.carried_unknown = True
+            return
+        for slot, frame in enumerate(frames[:count]):
+            state.items[slot] = frame.item
+            state.slots[slot] = body[frame.start : frame.stop]
+        carried = frames[count]
+        state.carried_item = carried.item
+        state.carried_item_data = body[carried.start : carried.stop]
+
+    def _decode_stack_frame(self, raw: bytes) -> ItemStack:
+        """Decode one stack that must fill ``raw`` exactly."""
+
+        return read_stack(
+            raw,
+            item_identifier=self.version.item_identifier,
+            codecs=self.version.component_codecs,
+        ).item
 
     async def _handle_container_slot(self, payload: bytes) -> None:
         reader = PacketReader(payload)
@@ -4385,16 +4411,16 @@ class Bot:
             state.carried_item_data = raw
             state.cursor_revision += 1
             try:
-                state.carried_item = self._read_item_stack(PacketReader(raw))
+                state.carried_item = self._decode_stack_frame(raw)
                 state.carried_unknown = False
-            except (_UnsupportedItemComponents, ProtocolError):
+            except (StackFrameError, ProtocolError):
                 state.carried_unknown = True
             await self.events.emit("container_cursor", state)
             return
         state.slots[slot] = raw
         try:
-            item = self._read_item_stack(PacketReader(raw))
-        except (_UnsupportedItemComponents, ProtocolError):
+            item = self._decode_stack_frame(raw)
+        except (StackFrameError, ProtocolError):
             state.items.pop(slot, None)
             state.unreadable.add(slot)
             await self.events.emit("container_unparsed", state, slot)
@@ -4433,13 +4459,11 @@ class Bot:
             state = self.containers.get(PLAYER_CONTAINER_ID)
         if state is None:
             return
-        reader = PacketReader(payload)
         try:
-            state.carried_item = self._read_item_stack(reader)
-            reader.expect_end()
+            state.carried_item = self._decode_stack_frame(payload)
             state.carried_item_data = payload
             state.carried_unknown = False
-        except (_UnsupportedItemComponents, ProtocolError):
+        except (StackFrameError, ProtocolError):
             state.carried_item_data = payload
             state.carried_unknown = True
         state.revision += 1

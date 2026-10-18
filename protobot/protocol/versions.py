@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections.abc import Callable
 
 from protobot.errors import UnsupportedVersion
 from protobot.protocol.breaking import BreakTable
 from protobot.protocol.breaking import table_for as breaking_table_for
+from protobot.protocol.component_codecs import codecs_by_id
+from protobot.protocol.components import ComponentTable
+from protobot.protocol.components import table_for as component_table_for
 from protobot.protocol.entities import EntityTable, table_for as entity_table_for
 from protobot.protocol.items import ItemTable, table_for
 from protobot.protocol.menus import MenuTable, table_for as menu_table_for
@@ -240,6 +244,35 @@ class VersionSpec:
 
         table = self.entities
         return None if table is None else table.size(registry_id)
+
+    def component_identifier(self, registry_id: int) -> str | None:
+        """Resolve a data component type ID to its name.
+
+        Component patches are the one part of an item stack whose values are
+        not self delimiting, so the stack decoder needs this release's names to
+        pick a byte length for each one (:mod:`protobot.protocol.stacks`).
+        """
+
+        table = self.components
+        return None if table is None else table.identifier(registry_id)
+
+    @property
+    def components(self) -> ComponentTable | None:
+        """The bundled data-component-type registry for this release."""
+
+        return component_table_for(self.protocol)
+
+    @property
+    def component_codecs(self) -> dict[int, Callable[[bytes, int, int], int]]:
+        """Component type ID -> value reader, for the components we can read.
+
+        Ten name lookups, so this is rebuilt on demand rather than cached: a
+        frozen dataclass has nowhere tidy to keep a cache, and the cost is far
+        below the per-update budget it sits in.
+        """
+
+        table = self.components
+        return {} if table is None else codecs_by_id(table)
 
     def hardness(self, identifier: str) -> float | None:
         """Vanilla block hardness, or ``None`` when the block is not in the table.

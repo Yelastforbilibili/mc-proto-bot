@@ -197,11 +197,18 @@ time a chest or a villager stays open.
 
 ## Items this protocol cannot decode
 
-An item carrying *added* data components is not self-delimiting on the wire, so
-a slot holding one keeps its raw bytes and is reported through
+An item carrying *added* data components is not self-delimiting on the wire, so a
+slot holding one keeps its raw bytes and is reported through
 `menu.readable(slot) == False` / `ContainerState.unreadable`. Queries skip those
 slots and `move` refuses to touch them instead of silently treating them as
-empty. Decoding them is tracked as the "component item" work item.
+empty.
+
+That is the *honest* fallback, used when the component values in a multi-slot
+packet cannot be read and the split is ambiguous. Two things are still exact: a
+single-stack packet (the cursor, a clicked slot, the player inventory) is
+delimited by the packet end, and a window whose components all have a codec
+decodes completely. See [components.md](components.md) for the wire format, the
+component codecs that ship, and the live proof.
 
 ## Adding a menu
 

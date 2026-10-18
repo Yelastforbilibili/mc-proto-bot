@@ -22,12 +22,20 @@ class EquipmentSlot(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class ItemStack:
-    """Safely decoded identity and removal-only component patch."""
+    """Safely decoded identity, removal list, and raw added-component patch.
+
+    ``components`` holds the bytes of the added data-component patch verbatim.
+    Each component value is only self-delimiting to the codec that wrote it, so
+    the stack keeps the payload instead of guessing field by field; the frame
+    around it (count, item id, patch length) is what ``protobot.protocol.stacks``
+    recovers, and that is what makes the *next* slot readable.
+    """
 
     count: int = 0
     item_id: int | None = None
     identifier: str | None = None
     removed_component_ids: tuple[int, ...] = ()
+    components: bytes = b""
 
     def __post_init__(self) -> None:
         if self.count < 0:
@@ -42,6 +50,12 @@ class ItemStack:
     @property
     def empty(self) -> bool:
         return self.count == 0
+
+    @property
+    def has_components(self) -> bool:
+        """True when the stack carries an added-component patch."""
+
+        return bool(self.components)
 
 
 @dataclass(slots=True)

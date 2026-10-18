@@ -25,6 +25,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **任务脚本层**——`bot.tasks` 把目标串成可重试的脚本：`Task` + `GoalStep`/`CallStep`/`WaitStep`，内置 `BreakBlocks`/`PlaceBlocks`；每步失败会写明是哪一步、第几次尝试，整条任务超时也记在报告里。
 - **容器交互层**——`bot.menu` 能打开服务端能开的任何界面（全部菜单类型，槽位布局由该版本的菜单注册表生成），并用真实点击搬东西：`deposit`、`withdraw`、`move`、`quick_move`、`swap_with_hotbar`、`throw`；每次点击都靠观察服务端的槽位更新来确认，而不是本地预测，进度条可按名字读（`data_value("cook_progress")`）。
 - **合成**——`bot.menu.craft(recipe)` 一格一格点满合成网格（背包里的 2×2，或目标自己走过去、右键打开工作台后的 3×3），取走产物再放回背包，所以 `CraftGoal` 可以直接说"八根木棍"，而服务端自己的背包就是证据；配方是显式描述（`Recipe`、`recipe_for`），不是爬来的配方库。
+- **带数据组件的物品**——受损的工具、附魔书、改过名的剑，末尾都是一段组件补丁，组件值没有长度前缀；解码器按该版本自己的组件 id（`protobot/data/components-*.json.gz`）精确跳过认得的组件（`damage`、`enchantments`、`custom_name`、`unbreakable` 等），认不得时宁可直接报"这一窗不可解"也不猜长度：真实测试里曾经把一瓶药水解成 `polished_sulfur_stairs`，后面每个槽位都错位。单栈包（光标、被点的槽位、玩家背包）则总是精确的，因为包尾就是它的长度。见 [docs/components.md](docs/components.md) 与 `tools/live_components.py`。
 - **硬度与工具选择**——硬度是协议里唯一不发包的方块属性，所以按版本单独发布（`protobot/data/breaking-*.json.gz`，由 `tools/gen_break_times.py` 从 minecraft-data 生成、再按名字对齐该版本自己的方块表）；`version.breaking.seconds("minecraft:stone", tool=...)` 给的是原版数值，`bot.actions.break_time(block)` 用当前手持物品算，`equip_tool`/`best_tool_for` 会挑热键栏里真正挖得动、而且最快的那把工具。`tools/live_tool.py` 在真服上验证：同样按住 0.4 秒，铁镐 0.45 秒挖掉石头，木镐只到 0.36 进度，服务端在松手后 0.7 秒才把它补完。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
 - **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡、玩家加入/退出与原始数据包事件。
