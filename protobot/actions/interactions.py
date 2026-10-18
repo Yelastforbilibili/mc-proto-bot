@@ -20,18 +20,22 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..physics import Vec3
 from ..protocol.codec import PacketWriter
-from .errors import UnsupportedAction
+from ..protocol.entities import DEFAULT_HEIGHT, DEFAULT_WIDTH
+from .errors import ActionError, UnsupportedAction
 from .profiles import InteractionProfile, profile_for
 from .raycast import (
     BlockFace,
     BlockHit,
+    EntityHit,
     direction_from_angles,
     look_angles,
     raycast_blocks,
+    raycast_entities,
 )
 from .results import ActionResult, ActionStatus
 
@@ -158,6 +162,107 @@ class Actions:
             origin if origin is not None else self.eye_position(),
             direction if direction is not None else self.look_direction(),
             max_distance=max_distance,
+        )
+
+    # ------------------------------------------------------------------
+    # entity raycast
+    # ------------------------------------------------------------------
+
+    def entity_size(self, entity) -> tuple[float, float]:
+        """Hitbox of a tracked entity: measured data first, then the table.
+
+        ``set_entity_data`` only carries collision dimensions for a handful of
+        types, so the per-release entity table is the usual source.  Sizes that
+        neither source knows stay at the vanilla humanoid default rather than
+        being skipped, because a missing box turns a real hit into a miss.
+        """
+
+        width = getattr(entity, "collision_width", None)
+        height = getattr(entity, "collision_height", None)
+        if width and height:
+            return (float(width), float(height))
+        type_id = getattr(entity, "type_id", None)
+        if type_id is not None:
+            size = self.version.entity_size(type_id)
+            if size is not None:
+                return size
+        return (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+
+    def _entity_candidates(
+        self,
+    ) -> list[tuple[int, Vec3, tuple[float, float]]]:
+        """Every tracked entity as ``(id, feet, size)`` for the ray cast."""
+
+        own = getattr(self.client, "entity_id", None)
+        candidates: list[tuple[int, Vec3, tuple[float, float]]] = []
+        for entity_id, entity in self.client.entities.items():
+            if own is not None and entity_id == own:
+                continue
+            candidates.append(
+                (
+                    entity_id,
+                    Vec3(entity.x, entity.y, entity.z),
+                    self.entity_size(entity),
+                )
+            )
+        return candidates
+
+    def raycast_entity(
+        self,
+        *,
+        max_distance: float = 3.0,
+        origin: Vec3 | None = None,
+        direction: Vec3 | None = None,
+    ) -> EntityHit | None:
+        """The entity the player is looking at, within attack reach.
+
+        Three blocks is the survival reach the server enforces; a hit farther
+        away than that would only waste a packet.
+        """
+
+        return raycast_entities(
+            self._entity_candidates(),
+            origin if origin is not None else self.eye_position(),
+            direction if direction is not None else self.look_direction(),
+            max_distance=max_distance,
+        )
+
+    def entity_center(self, entity_id: int) -> Vec3 | None:
+        """Middle of an entity's hitbox -- where an aim should point."""
+
+        entity = self.client.entities.get(entity_id)
+        if entity is None:
+            return None
+        size = self.entity_size(entity)
+        return Vec3(entity.x, entity.y + size[1] / 2.0, entity.z)
+
+    async def look_at_entity(self, entity_id: int) -> tuple[float, float]:
+        """Turn towards an entity's centre and send the rotation."""
+
+        center = self.entity_center(entity_id)
+        if center is None:
+            raise ActionError(
+                f"entity {entity_id} is not tracked, so there is nothing to aim at"
+            )
+        return await self.look_at(center)
+
+    async def attack_looked_at(
+        self, *, max_distance: float = 3.0, swing: bool = True
+    ) -> ActionResult | None:
+        """Aim at the entity under the crosshair and hit it.
+
+        Returns ``None`` when the crosshair is not on an entity, so a caller
+        can tell "nothing there" from "not sent".
+        """
+
+        hit = self.raycast_entity(max_distance=max_distance)
+        if hit is None:
+            return None
+        await self.look_at(hit.center)
+        result = await self.attack(hit.entity_id, swing=swing)
+        return replace(
+            result,
+            evidence=f"hit entity {hit.entity_id} at {hit.distance:.2f} blocks",
         )
 
     async def _settle(

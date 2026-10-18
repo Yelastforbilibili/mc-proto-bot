@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from protobot.errors import UnsupportedVersion
+from protobot.protocol.entities import EntityTable, table_for as entity_table_for
 from protobot.protocol.items import ItemTable, table_for
 from protobot.protocol.menus import MenuTable, table_for as menu_table_for
 
@@ -213,6 +214,30 @@ class VersionSpec:
         """The bundled menu registry for this release, if one ships."""
 
         return menu_table_for(self.protocol)
+
+    def entity_identifier(self, registry_id: int) -> str | None:
+        """Resolve an entity-type ID to its name.
+
+        Entity raycasting needs the name twice: to look up the hitbox, and to
+        decide whether the thing in front of the player is what the caller
+        asked for.  Unknown ids stay ``None`` so callers can fall back instead
+        of guessing a size.
+        """
+
+        table = self.entities
+        return None if table is None else table.identifier(registry_id)
+
+    @property
+    def entities(self) -> EntityTable | None:
+        """The bundled entity-type registry for this release, if one ships."""
+
+        return entity_table_for(self.protocol)
+
+    def entity_size(self, registry_id: int) -> tuple[float, float] | None:
+        """Hitbox ``(width, height)`` of an entity type, if measured."""
+
+        table = self.entities
+        return None if table is None else table.size(registry_id)
 
     def hard_collision_dimensions(self, registry_id: int) -> tuple[float, float] | None:
         for entity_id, width, height in self.hard_collision_entities:

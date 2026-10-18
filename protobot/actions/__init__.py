@@ -32,7 +32,15 @@ server jar, so a primitive branches on data rather than on a guess.
 from .errors import ActionError, ActionTimeout, UnsupportedAction
 from .interactions import Actions
 from .profiles import ActionCodes, InteractionProfile, profile_for
-from .raycast import BlockFace, BlockHit, look_angles, raycast_blocks
+from .raycast import (
+    BlockFace,
+    BlockHit,
+    EntityHit,
+    entity_bounds,
+    look_angles,
+    raycast_blocks,
+    raycast_entities,
+)
 from .results import ActionResult, ActionStatus
 
 __all__ = [
@@ -44,9 +52,12 @@ __all__ = [
     "Actions",
     "BlockFace",
     "BlockHit",
+    "EntityHit",
     "InteractionProfile",
     "UnsupportedAction",
+    "entity_bounds",
     "look_angles",
     "profile_for",
     "raycast_blocks",
+    "raycast_entities",
 ]

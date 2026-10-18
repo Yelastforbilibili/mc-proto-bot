@@ -14,7 +14,14 @@ from .auth import (
     refresh_login,
 )
 from .client import AttributeModifierUpdate, AttributeUpdate, Bot, connect
-from .actions import ActionResult, Actions, ActionStatus, UnsupportedAction
+from .actions import (
+    ActionResult,
+    Actions,
+    ActionStatus,
+    EntityHit,
+    UnsupportedAction,
+    raycast_entities,
+)
 from .errors import (
     AuthenticationError,
     ConnectionClosed,
@@ -101,6 +108,7 @@ __all__ = [
     "DEFAULT_BLOCK",
     "SUPPORTED_VERSIONS",
     "ActionResult",
+    "EntityHit",
     "ActionStatus",
     "Actions",
     "AttributeModifierUpdate",
@@ -186,6 +194,7 @@ __all__ = [
     "plain_text",
     "register_translations",
     "resolve_minecraft_srv",
+    "raycast_entities",
     "recipe_for",
     "minecraft_sha1_digest",
     "MinecraftProfile",

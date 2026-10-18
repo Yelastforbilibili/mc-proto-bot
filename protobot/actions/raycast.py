@@ -16,7 +16,7 @@ same trade-off the collision engine makes.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import IntEnum
 
@@ -252,3 +252,118 @@ def raycast_blocks(
             origin.z + direction.z * travelled,
         )
         return BlockHit(position, face, point, travelled, state_id)
+
+
+# -- entities ------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class EntityHit:
+    """The entity the crosshair is on, and where the ray met its box."""
+
+    entity_id: int
+    feet: Vec3
+    point: Vec3
+    distance: float
+    width: float
+    height: float
+
+    @property
+    def center(self) -> Vec3:
+        """The middle of the hitbox -- what an attack should be aimed at."""
+
+        return Vec3(self.feet.x, self.feet.y + self.height / 2.0, self.feet.z)
+
+    def __str__(self) -> str:
+        return (
+            f"entity {self.entity_id} at {self.distance:.2f} blocks"
+            f" ({self.width:g}x{self.height:g})"
+        )
+
+
+def entity_bounds(feet: Vec3, size: tuple[float, float]) -> tuple[Vec3, Vec3]:
+    """The hitbox of an entity standing with its feet at ``feet``.
+
+    The server sends entity positions as the *feet* centre, and vanilla builds
+    the box symmetrically around x/z from there, so the two agree without an
+    offset table.
+    """
+
+    width, height = size
+    half = width / 2.0
+    return (
+        Vec3(feet.x - half, feet.y, feet.z - half),
+        Vec3(feet.x + half, feet.y + height, feet.z + half),
+    )
+
+
+def _ray_aabb(origin: Vec3, direction: Vec3, low: Vec3, high: Vec3) -> float | None:
+    """Distance along a unit ray to an arbitrary box, or ``None``."""
+
+    t_min = 0.0
+    t_max = math.inf
+    for index, coordinate in enumerate((origin.x, origin.y, origin.z)):
+        low_edge = (low.x, low.y, low.z)[index]
+        high_edge = (high.x, high.y, high.z)[index]
+        delta = (direction.x, direction.y, direction.z)[index]
+        if delta == 0.0:
+            if coordinate < low_edge or coordinate > high_edge:
+                return None
+            continue
+        t_low = (low_edge - coordinate) / delta
+        t_high = (high_edge - coordinate) / delta
+        if t_low > t_high:
+            t_low, t_high = t_high, t_low
+        if t_low > t_min:
+            t_min = t_low
+        if t_high < t_max:
+            t_max = t_high
+        if t_min > t_max:
+            return None
+    return t_min
+
+
+def raycast_entities(
+    candidates: Iterable[tuple[int, Vec3, tuple[float, float]]],
+    origin: Vec3,
+    direction: Vec3,
+    *,
+    max_distance: float = 3.0,
+    skip: frozenset[int] | set[int] = frozenset(),
+) -> EntityHit | None:
+    """Nearest entity box the ray meets within ``max_distance``.
+
+    ``candidates`` yields ``(entity_id, feet_position, (width, height))``; the
+    caller owns the hitbox lookup because sizes are per-release data.  Vanilla
+    survival reach for entities is 3 blocks and the server enforces the same
+    distance, so a hit reported farther than that is not actionable.
+    """
+
+    length = math.sqrt(direction.length_squared)
+    if length == 0.0:
+        return None
+    unit = Vec3(direction.x / length, direction.y / length, direction.z / length)
+    best: EntityHit | None = None
+    for entity_id, feet, size in candidates:
+        if entity_id in skip:
+            continue
+        low, high = entity_bounds(feet, size)
+        travelled = _ray_aabb(origin, unit, low, high)
+        if travelled is None or travelled > max_distance:
+            continue
+        if best is not None and travelled >= best.distance:
+            continue
+        best = EntityHit(
+            entity_id=entity_id,
+            feet=feet,
+            point=Vec3(
+                origin.x + unit.x * travelled,
+                origin.y + unit.y * travelled,
+                origin.z + unit.z * travelled,
+            ),
+            distance=travelled,
+            width=size[0],
+            height=size[1],
+        )
+    return best
+

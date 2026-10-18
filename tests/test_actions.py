@@ -12,17 +12,22 @@ import unittest
 from types import SimpleNamespace
 
 from protobot.actions import (
+    ActionError,
     ActionStatus,
     Actions,
     BlockFace,
+    EntityHit,
     UnsupportedAction,
+    entity_bounds,
     look_angles,
     raycast_blocks,
+    raycast_entities,
 )
 from protobot.events import EventBus
 from protobot.physics import Vec3
 from protobot.protocol.codec import PacketReader
 from protobot.protocol.versions import get_version
+from protobot.state import EntityState
 
 
 class _FakeWorld:
@@ -45,6 +50,7 @@ class _FakeBot:
         self.looks: list[tuple[float, float]] = []
         self.events = EventBus()
         self.world = world if world is not None else _FakeWorld()
+        self.entities: dict[int, EntityState] = {}
         self.physics_state = SimpleNamespace(
             position=Vec3(0.5, 64.0, 0.5),
             eye_height=1.62,
@@ -382,6 +388,106 @@ class UnsupportedActionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(UnsupportedAction):
             await Actions(bot).swing()
         self.assertEqual(bot.sent, [])
+
+
+class EntityRaycastTests(unittest.TestCase):
+    def test_bounds_are_centred_on_the_feet(self) -> None:
+        low, high = entity_bounds(Vec3(10.0, 64.0, -3.0), (0.6, 1.8))
+        self.assertAlmostEqual(low.x, 9.7)
+        self.assertAlmostEqual(low.z, -3.3)
+        self.assertAlmostEqual(high.x, 10.3)
+        self.assertAlmostEqual(high.y, 65.8)
+
+    def test_the_nearest_box_wins(self) -> None:
+        candidates = [
+            (7, Vec3(0.0, 0.0, 3.0), (0.6, 1.8)),
+            (9, Vec3(0.0, 0.0, 1.5), (0.6, 1.8)),
+        ]
+        hit = raycast_entities(candidates, Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0))
+        assert hit is not None
+        self.assertEqual(hit.entity_id, 9)
+        self.assertAlmostEqual(hit.distance, 1.2)
+        self.assertAlmostEqual(hit.center.y, 0.9)
+
+    def test_reach_limits_what_counts_as_a_hit(self) -> None:
+        candidates = [(4, Vec3(0.0, 0.0, 5.0), (0.6, 1.8))]
+        origin, direction = Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0)
+        self.assertIsNone(
+            raycast_entities(candidates, origin, direction, max_distance=3.0)
+        )
+        self.assertIsNotNone(
+            raycast_entities(candidates, origin, direction, max_distance=6.0)
+        )
+
+    def test_a_ray_that_misses_every_box_hits_nothing(self) -> None:
+        candidates = [(4, Vec3(2.0, 0.0, 2.0), (0.6, 1.8))]
+        hit = raycast_entities(candidates, Vec3(0.0, 1.0, 0.0), Vec3(0.0, 0.0, 1.0))
+        self.assertIsNone(hit)
+
+    def test_skip_excludes_entities(self) -> None:
+        candidates = [(4, Vec3(0.0, 0.0, 1.5), (0.6, 1.8))]
+        hit = raycast_entities(
+            candidates,
+            Vec3(0.0, 1.0, 0.0),
+            Vec3(0.0, 0.0, 1.0),
+            skip={4},
+        )
+        self.assertIsNone(hit)
+
+
+class EntityActionTests(unittest.IsolatedAsyncioTestCase):
+    def _bot_with_zombie(self, *, distance: float = 2.0) -> _FakeBot:
+        # 154 is ``minecraft:zombie`` on 26.3, with a 0.6x1.95 box: tall enough
+        # that a level ray from the eye actually meets it.
+        bot = _FakeBot(get_version("26.3"))
+        bot.entities[154] = EntityState(
+            entity_id=154, type_id=154, x=0.5, y=64.0, z=0.5 + distance
+        )
+        return bot
+
+    def test_the_size_comes_from_the_release_table(self) -> None:
+        bot = self._bot_with_zombie()
+        actions = Actions(bot)
+        self.assertEqual(actions.entity_size(bot.entities[154]), (0.6, 1.95))
+
+    def test_unknown_types_fall_back_to_a_humanoid_box(self) -> None:
+        bot = _FakeBot(get_version("26.3"))
+        bot.entities[99] = EntityState(entity_id=99, type_id=None)
+        self.assertEqual(Actions(bot).entity_size(bot.entities[99]), (0.6, 1.8))
+
+    def test_measured_collision_data_wins_over_the_table(self) -> None:
+        bot = _FakeBot(get_version("26.3"))
+        bot.entities[5] = EntityState(
+            entity_id=5, type_id=30, collision_width=1.2, collision_height=2.4
+        )
+        self.assertEqual(Actions(bot).entity_size(bot.entities[5]), (1.2, 2.4))
+
+    async def test_attack_looked_at_aims_then_hits(self) -> None:
+        bot = self._bot_with_zombie()
+        actions = Actions(bot)
+        result = await actions.attack_looked_at()
+        assert result is not None
+        self.assertEqual(result.entity_id, 154)
+        # the box is 0.3 deep, so a mob 2 blocks away is met 1.7 blocks out
+        self.assertIn("1.70 blocks", result.evidence)
+        self.assertTrue(bot.looks)  # it aimed before swinging
+        self.assertEqual(result.status, ActionStatus.SENT)
+
+    async def test_attack_looked_at_returns_none_with_nothing_to_hit(self) -> None:
+        bot = _FakeBot(get_version("26.3"))
+        self.assertIsNone(await Actions(bot).attack_looked_at())
+        self.assertEqual(bot.sent, [])
+
+    async def test_look_at_entity_refuses_an_untracked_entity(self) -> None:
+        bot = _FakeBot(get_version("26.3"))
+        with self.assertRaises(ActionError):
+            await Actions(bot).look_at_entity(1234)
+
+    async def test_interact_reaches_a_tracked_entity(self) -> None:
+        bot = self._bot_with_zombie()
+        result = await Actions(bot).interact(154)
+        self.assertEqual(result.entity_id, 154)
+        self.assertTrue(bot.sent)
 
 
 if __name__ == "__main__":
