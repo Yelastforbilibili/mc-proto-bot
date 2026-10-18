@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from protobot.errors import UnsupportedVersion
+from protobot.protocol.items import ItemTable, table_for
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,42 @@ class PlayPacketIds:
     #: 0 means unverified for this release, as above.
     clientbound_player_info_update: int = 0
     clientbound_player_info_remove: int = 0
+    # --- interaction ---------------------------------------------------
+    # Everything below exists for ``protobot.actions``: the packet ids the
+    # primitive layer needs in order to dig, place, attack, interact and
+    # swing.  ``0`` means this release does not key the packet here, and the
+    # action layer refuses to send rather than guessing an id.
+    #:
+    #: ``PlayerActionPacket``: dig start/progress/finish, drop item, release.
+    serverbound_player_action: int = 0
+    #: ``UseItemOnPacket``: right click a specific block face.
+    serverbound_use_item_on: int = 0
+    #: ``InteractPacket``: attack / interact / interact-at an entity.
+    serverbound_interact: int = 0
+    #: Arm swing. ``punch`` from 26.3 on, ``arm_animation`` before it.
+    serverbound_swing: int = 0
+    #: 26.3 split the entity attack out of ``interact`` into its own packet.
+    #: Absent (0) on every earlier release.
+    serverbound_attack: int = 0
+    #: Confirms a container slot state id; the server resyncs the whole
+    #: inventory when a client never acknowledges one.
+    serverbound_container_slot_state_changed: int = 0
+    serverbound_set_creative_mode_slot: int = 0
+    #: Ack for a ``player_action`` sequence number: the dig confirmation.
+    clientbound_block_changed_ack: int = 0
+    #: Break particles; broadcast to everyone but the breaking player.
+    clientbound_block_destruction: int = 0
+    #: Other entities' arm swings (26.3 split this out of ``animation``).
+    clientbound_swing_animation: int = 0
+    #: Which hotbar slot the server thinks is selected.
+    clientbound_set_held_slot: int = 0
+    #: Furnace/brewing/enchanting progress bars.
+    clientbound_container_set_data: int = 0
+    #: Hit feedback for the entity in view.
+    clientbound_hurt_animation: int = 0
+    clientbound_damage_event: int = 0
+    #: Broken-block replacement packet new in 26.3 (0 on earlier releases).
+    clientbound_add_transient_block: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +136,15 @@ class ConfigurationPacketIds:
     clientbound_select_known_packs: int = 0x0E
     clientbound_code_of_conduct: int = 0x13
 
+
+#: 1.21.8 keeps the 1.21.11-26.2 transfer/select_known_packs numbering: its
+#: clientbound configuration table has transfer at 0x0B and select_known_packs
+#: at 0x0E (source=1.21.8 reports/packets.json, configuration state).
+#: ``code_of_conduct`` does not exist in 772 at all -- that table ends at 0x12
+#: ``show_dialog`` -- so the inherited 0x13 default names no packet.  Nothing
+#: sends it on this protocol, so the default is kept instead of re-pointing it
+#: at a real packet that means something else.
+_CONFIGURATION_772 = ConfigurationPacketIds()
 
 #: 1.21.11 through 26.2 share this numbering. 26.3 inserts ``post_effects``
 #: at 0x0A, shifting every later clientbound configuration packet by one.
@@ -127,12 +173,25 @@ class VersionSpec:
     configuration: ConfigurationPacketIds = _CONFIGURATION_774_776
 
     def item_identifier(self, registry_id: int) -> str | None:
-        """Resolve an item ID using this exact release's static registry."""
+        """Resolve an item ID using this exact release's registry.
+
+        ``item_identifiers`` holds the handful of overrides the physics and
+        equipment code needs; the full registry is the bundled
+        ``protobot/data/items-<protocol>.json.gz`` table, because item IDs are
+        per-release and guessing them silently selects the wrong item.
+        """
 
         for item_id, identifier in self.item_identifiers:
             if item_id == registry_id:
                 return identifier
-        return None
+        table = self.items
+        return None if table is None else table.identifier(registry_id)
+
+    @property
+    def items(self) -> ItemTable | None:
+        """The bundled item registry for this release, if one ships."""
+
+        return table_for(self.protocol)
 
     def hard_collision_dimensions(self, registry_id: int) -> tuple[float, float] | None:
         for entity_id, width, height in self.hard_collision_entities:
@@ -151,6 +210,47 @@ class VersionSpec:
             return "chest_raft" if chest else "raft"
         return "chest_boat" if chest else "boat"
 
+
+# 1.21.8 entity-type registry ids.  Source: the release's own Mojang
+# ``reports/registries.json`` (``minecraft:entity_type`` protocol_id), which
+# matches minecraft-data ``data/pc/1.21.8/entities.json`` id-for-id for all 20
+# boat/raft types.  Every later release inserts entities, so none of these
+# numbers are shared with the 26.x tables below.
+_BOAT_ENTITIES_772 = (
+    0,  # acacia_boat
+    1,  # acacia_chest_boat
+    8,  # bamboo_chest_raft
+    9,  # bamboo_raft
+    12,  # birch_boat
+    13,  # birch_chest_boat
+    22,  # cherry_boat
+    23,  # cherry_chest_boat
+    31,  # dark_oak_boat
+    32,  # dark_oak_chest_boat
+    72,  # jungle_boat
+    73,  # jungle_chest_boat
+    79,  # mangrove_boat
+    80,  # mangrove_chest_boat
+    85,  # oak_boat
+    86,  # oak_chest_boat
+    90,  # pale_oak_boat
+    91,  # pale_oak_chest_boat
+    120,  # spruce_boat
+    121,  # spruce_chest_boat
+)
+_CHEST_BOAT_ENTITIES_772 = (1, 8, 13, 23, 32, 73, 80, 86, 91, 121)
+_RAFT_ENTITIES_772 = (8, 9)
+_HAPPY_GHAST_ENTITY_772 = 56
+_SHULKER_ENTITY_772 = 107
+
+#: Boat 1.375 x 0.5625 is the unchanged vanilla AbstractBoat box; happy_ghast
+#: is 4.0 x 4.0 and the shulker 1.0 x 1.0.  All three are the dimensions
+#: minecraft-data records for 1.21.8 (entities.json width/height).
+_HARD_COLLISION_ENTITIES_772 = (
+    *((entity_id, 1.375, 0.5625) for entity_id in _BOAT_ENTITIES_772),
+    (_HAPPY_GHAST_ENTITY_772, 4.0, 4.0),
+    (_SHULKER_ENTITY_772, 1.0, 1.0),
+)
 
 _BOAT_ENTITIES = (
         0,
@@ -223,6 +323,106 @@ _HARD_COLLISION_ENTITIES_777 = (
 )
 
 
+# Protocol 772 play ids.  Generated from the official 1.21.8 server bundle
+# (``java -DbundlerMainClass=net.minecraft.data.Main -jar server-bundle.jar
+# --reports``) with ``tools/gen_packet_ids.py --reports .../packets.json``;
+# ``tests/data/packet-ids-772.json`` is the same table and audits every field
+# below.  minecraft-data's 1.21.8 protocol.json agrees on every play field it
+# defines (it omits this release's play-state transfer packet).
+_PLAY_772 = PlayPacketIds(
+    clientbound_add_entity=0x01,
+    clientbound_remove_entities=0x46,
+    clientbound_set_entity_data=0x5C,
+    clientbound_set_entity_motion=0x5E,
+    clientbound_set_equipment=0x5F,
+    clientbound_set_passengers=0x64,
+    clientbound_move_entity_pos=0x2E,
+    clientbound_move_entity_pos_rot=0x2F,
+    clientbound_move_entity_rot=0x31,
+    clientbound_teleport_entity=0x76,
+    clientbound_move_vehicle=0x32,
+    clientbound_update_attributes=0x7C,
+    clientbound_update_mob_effect=0x7D,
+    clientbound_remove_mob_effect=0x47,
+    clientbound_hurt_animation=0x24,
+    clientbound_damage_event=0x19,
+    clientbound_block_update=0x08,
+    clientbound_section_blocks_update=0x4D,
+    clientbound_block_changed_ack=0x04,
+    clientbound_block_destruction=0x05,
+    clientbound_chunk_data=0x27,  # level_chunk_with_light
+    clientbound_unload_chunk=0x21,  # forget_level_chunk
+    clientbound_chunk_batch_finished=0x0B,
+    clientbound_login=0x2B,
+    clientbound_disconnect=0x1C,
+    clientbound_keep_alive=0x26,
+    clientbound_ping=0x36,
+    clientbound_game_event=0x22,
+    clientbound_respawn=0x4B,
+    clientbound_player_abilities=0x39,
+    clientbound_position=0x41,  # player_position
+    clientbound_start_configuration=0x6F,
+    # The play-state transfer packet (identical shape to the configuration one).
+    clientbound_transfer=0x7A,
+    clientbound_sound=0x6E,
+    clientbound_set_health=0x61,
+    clientbound_player_combat_kill=0x3D,
+    clientbound_player_info_update=0x3F,
+    clientbound_player_info_remove=0x3E,
+    clientbound_custom_payload=0x18,
+    clientbound_player_chat=0x3A,
+    clientbound_system_chat=0x72,
+    clientbound_profileless_chat=0x1D,  # disguised_chat
+    clientbound_container_close=0x11,
+    clientbound_container_set_content=0x12,
+    clientbound_container_set_slot=0x14,
+    clientbound_container_set_data=0x13,
+    clientbound_open_screen=0x34,
+    clientbound_set_player_inventory=0x65,
+    clientbound_set_held_slot=0x62,
+    # 1.21.8 still bundles every entity animation (arm swing, hurt, crit) into
+    # the generic ``animate`` packet, which is 1.21.x's "animation".
+    clientbound_swing_animation=0x02,
+    # Absent in 772: ``add_transient_block`` is a 26.3 packet that replaces a
+    # broken block without a second block update.  0 = not keyed here.
+    clientbound_add_transient_block=0,
+    serverbound_keep_alive=0x1B,
+    serverbound_pong=0x2C,
+    serverbound_client_command=0x0B,
+    serverbound_player_abilities=0x27,
+    serverbound_player_command=0x29,
+    serverbound_player_input=0x2A,
+    serverbound_player_loaded=0x2B,
+    serverbound_configuration_acknowledged=0x0F,
+    serverbound_teleport_confirm=0x00,  # accept_teleportation
+    serverbound_custom_payload=0x15,
+    serverbound_tick_end=0x0C,  # client_tick_end
+    serverbound_chunk_batch_received=0x0A,
+    serverbound_position=0x1D,  # move_player_pos
+    serverbound_position_look=0x1E,  # move_player_pos_rot
+    serverbound_look=0x1F,  # move_player_rot
+    serverbound_flying=0x20,  # move_player_status_only
+    serverbound_move_vehicle=0x21,
+    serverbound_paddle_boat=0x22,
+    serverbound_player_action=0x28,
+    serverbound_use_item_on=0x3F,
+    serverbound_interact=0x19,
+    serverbound_swing=0x3C,
+    # Absent in 772: 1.21.8 attacks through ``interact`` (mode 1), there is no
+    # separate attack packet.  0 = not keyed here.
+    serverbound_attack=0,
+    serverbound_use_item=0x40,
+    serverbound_container_slot_state_changed=0x13,
+    serverbound_container_click=0x11,
+    serverbound_container_close=0x12,
+    serverbound_set_carried_item=0x34,
+    serverbound_set_creative_mode_slot=0x37,
+    serverbound_chat=0x08,
+    serverbound_chat_ack=0x05,
+    serverbound_chat_command=0x06,
+    serverbound_chat_session_update=0x09,
+)
+
 _PLAY_774 = PlayPacketIds(
     clientbound_add_entity=0x01,
     clientbound_custom_payload=0x18,
@@ -286,6 +486,28 @@ _PLAY_774 = PlayPacketIds(
     serverbound_set_carried_item=0x34,
     serverbound_tick_end=0x0C,
     serverbound_use_item=0x40,
+    # Interaction ids, from minecraft-data's 1.21.11 table (test_packet_ids).
+    serverbound_player_action=0x28,
+    serverbound_use_item_on=0x3F,
+    serverbound_interact=0x19,
+    serverbound_swing=0x3C,
+    serverbound_container_slot_state_changed=0x13,
+    serverbound_set_creative_mode_slot=0x37,
+    clientbound_block_changed_ack=0x04,
+    clientbound_block_destruction=0x05,
+    clientbound_swing_animation=0x02,
+    clientbound_set_held_slot=0x67,
+    clientbound_container_set_data=0x13,
+    clientbound_hurt_animation=0x29,
+    clientbound_damage_event=0x19,
+    # Released with the interaction layer: previously left at 0 ("unverified")
+    # even though the release data has always carried them.
+    clientbound_sound=0x73,
+    clientbound_set_health=0x66,
+    clientbound_player_combat_kill=0x42,
+    clientbound_player_info_update=0x44,
+    clientbound_player_info_remove=0x43,
+    serverbound_client_command=0x0B,
 )
 
 _PLAY_775_776 = PlayPacketIds(
@@ -293,6 +515,22 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_set_health=0x68,  # 104: Float health, VarInt food, Float saturation
     clientbound_player_combat_kill=0x44,  # 68: VarInt entity id + death message
     serverbound_client_command=0x0C,  # 12: one VarInt, 0 = perform respawn
+    # Interaction ids, from the 26.1 reports/packets.json.  26.1, 26.1.1 and
+    # 26.1.2 share protocol 775 and agree on every one of these.
+    serverbound_player_action=0x29,
+    serverbound_use_item_on=0x42,
+    serverbound_interact=0x1A,
+    serverbound_swing=0x3F,  # renamed from "swing" to "punch" in 26.3 (0x2E)
+    serverbound_attack=0x01,
+    serverbound_container_slot_state_changed=0x14,
+    serverbound_set_creative_mode_slot=0x38,
+    clientbound_block_changed_ack=0x04,
+    clientbound_block_destruction=0x05,
+    clientbound_swing_animation=0x02,
+    clientbound_set_held_slot=0x69,
+    clientbound_container_set_data=0x13,
+    clientbound_hurt_animation=0x2A,
+    clientbound_damage_event=0x19,
     # 69/70: right after combat_kill, followed by player_look_at (0x47) and
     # player_position (0x48) -- both neighbours are verified ids from this
     # very table, and there is no room left in between.
@@ -369,6 +607,22 @@ _PLAY_775_776 = PlayPacketIds(
 # uses set_carried_item.
 _PLAY_777 = PlayPacketIds(
     clientbound_sound=0x77,
+    # Interaction ids, from the 26.3 server's reports/packets.json.
+    serverbound_player_action=0x29,
+    serverbound_use_item_on=0x42,
+    serverbound_interact=0x1A,
+    serverbound_swing=0x2E,
+    serverbound_attack=0x01,
+    serverbound_container_slot_state_changed=0x14,
+    serverbound_set_creative_mode_slot=0x39,
+    clientbound_block_changed_ack=0x04,
+    clientbound_block_destruction=0x05,
+    clientbound_swing_animation=0x7B,
+    clientbound_set_held_slot=0x6B,
+    clientbound_container_set_data=0x13,
+    clientbound_hurt_animation=0x2B,
+    clientbound_damage_event=0x19,
+    clientbound_add_transient_block=0x25,
     clientbound_set_health=0x6A,
     clientbound_player_combat_kill=0x45,
     serverbound_client_command=0x0C,
@@ -439,6 +693,23 @@ _PLAY_777 = PlayPacketIds(
 )
 
 SUPPORTED_VERSIONS: dict[str, VersionSpec] = {
+    "1.21.8": VersionSpec(
+        "1.21.8",
+        772,
+        # Mojang's own version.json (inside the 1.21.8 server bundle) reports
+        # world_version 4440, which is the level.dat DataVersion.
+        4440,
+        _PLAY_772,
+        # minecraft:item protocol_id in 1.21.8 reports/registries.json.
+        ((826, "minecraft:elytra"), (916, "minecraft:leather_boots")),
+        _HARD_COLLISION_ENTITIES_772,
+        _BOAT_ENTITIES_772,
+        _CHEST_BOAT_ENTITIES_772,
+        _RAFT_ENTITIES_772,
+        happy_ghast_entity=_HAPPY_GHAST_ENTITY_772,
+        shulker_entity=_SHULKER_ENTITY_772,
+        configuration=_CONFIGURATION_772,
+    ),
     "1.21.11": VersionSpec(
         "1.21.11",
         774,

@@ -312,6 +312,16 @@ class _UnsupportedItemComponents(Exception):
     pass
 
 
+#: Container id the server uses for the player's own inventory.  Its slot
+#: updates have to be mirrored into ``Bot.player.inventory`` or the bot cannot
+#: see items it was given, picked up or had damaged.
+PLAYER_CONTAINER_ID = 0
+
+#: Highest player-inventory slot index (9 crafting/armour + 27 main + 9 hotbar
+#: + 1 off hand).
+PLAYER_INVENTORY_LAST_SLOT = 45
+
+
 class _UnsupportedEntityMetadata(Exception):
     pass
 
@@ -530,6 +540,9 @@ class Bot:
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
+        self._actions = None
+        self._goals = None
+        self._tasks = None
         self._last_seen_messages = _LastSeenMessagesTracker()
 
     async def __aenter__(self) -> Bot:
@@ -964,6 +977,57 @@ class Bot:
             PacketWriter().write_varint(container_id).to_bytes(),
         )
 
+    @property
+    def actions(self):
+        """Interaction primitives (dig, place, attack, ...), created on demand.
+
+        The object only stores a reference to this bot, so it stays valid
+        across reconnects and is cheap enough to read on every use.
+        """
+
+        if self._actions is None:
+            from .actions import Actions
+
+            self._actions = Actions(self)
+        return self._actions
+
+    @property
+    def goals(self):
+        """Goal runner: declarative objectives retried until they are true.
+
+        Created on demand and bound to this bot, so it survives reconnects the
+        same way :attr:`actions` does.
+        """
+
+        if self._goals is None:
+            from .goals import GoalRunner
+
+            self._goals = GoalRunner(self)
+        return self._goals
+
+    @property
+    def tasks(self):
+        """Task runner: scripts of steps with retries and a report."""
+
+        if self._tasks is None:
+            from .tasks import TaskRunner
+
+            self._tasks = TaskRunner(self)
+        return self._tasks
+
+    def take_sequence(self) -> int:
+        """Allocate the next interaction sequence number.
+
+        ``PlayerAction``, ``UseItem`` and ``UseItemOn`` all carry a sequence
+        that the server may acknowledge; vanilla keeps one counter per client
+        and this is it, so the interaction layer and :meth:`use_item` share a
+        single monotonic stream.
+        """
+
+        sequence = self._next_sequence
+        self._next_sequence = (sequence + 1) & 0x7FFFFFFF
+        return sequence
+
     async def use_item(
         self,
         *,
@@ -983,8 +1047,7 @@ class Bot:
         if hand not in (0, 1):
             raise ValueError("interaction hand must be main_hand (0) or off_hand (1)")
         if sequence is None:
-            sequence = self._next_sequence
-            self._next_sequence = (sequence + 1) & 0x7FFFFFFF
+            sequence = self.take_sequence()
         elif not 0 <= sequence < (1 << 31):
             raise ValueError("use-item sequence must be a non-negative VarInt")
         yaw = self.player.yaw if yaw is None else yaw
@@ -3147,6 +3210,11 @@ class Bot:
             await self._handle_game_event(packet.payload)
         elif packet.packet_id == ids.clientbound_block_update:
             await self._handle_block_update(packet.payload)
+        elif (
+            ids.clientbound_block_changed_ack
+            and packet.packet_id == ids.clientbound_block_changed_ack
+        ):
+            await self._handle_block_changed_ack(packet.payload)
         elif packet.packet_id == ids.clientbound_custom_payload:
             reader = PacketReader(packet.payload)
             channel = reader.read_string(max_chars=32767)
@@ -3396,6 +3464,20 @@ class Bot:
         reader.expect_end()
         self.world.set_state_id(x, y, z, state_id)
         await self.events.emit("block_update", x, y, z, state_id)
+
+    async def _handle_block_changed_ack(self, payload: bytes) -> None:
+        """The server confirming it received a ``PlayerAction`` sequence.
+
+        The packet carries the sequence number only: the resulting block state
+        arrives separately as a ``block_update``.  It is still the earliest
+        proof that an action reached the server, so it is surfaced as an event
+        and never used to mutate the world.
+        """
+
+        reader = PacketReader(payload)
+        sequence = reader.read_varint()
+        reader.expect_end()
+        await self.events.emit("block_changed_ack", sequence)
 
     async def _handle_chunk_batch_finished(self, payload: bytes) -> None:
         reader = PacketReader(payload)
@@ -4204,6 +4286,8 @@ class Bot:
         state.carried_item_data = b""
         state.is_open = True
         self._active_container_id = container_id
+        if container_id == PLAYER_CONTAINER_ID:
+            await self._sync_player_inventory(state.content_data)
         await self.events.emit("container_content", state)
 
     async def _handle_container_slot(self, payload: bytes) -> None:
@@ -4211,12 +4295,56 @@ class Bot:
         container_id = reader.read_varint()
         state_id = reader.read_varint()
         slot = reader.read_short()
+        raw = reader.read_remaining()
         state = self._container_state(container_id)
         state.state_id = state_id
-        state.slots[slot] = reader.read_remaining()
+        state.slots[slot] = raw
         state.is_open = True
         self._active_container_id = container_id
+        if container_id == PLAYER_CONTAINER_ID:
+            await self._sync_player_slot(slot, raw)
         await self.events.emit("container_slot", state, slot)
+
+    async def _sync_player_slot(self, slot: int, raw: bytes) -> None:
+        """Mirror one ``Container 0`` slot into ``player.inventory``.
+
+        The server announces items gained outside a container (``/give``,
+        pickups, consumed durability) as slot updates on container 0, so a bot
+        that only listens to :meth:`_handle_set_player_inventory` keeps
+        believing its inventory is empty -- and then cannot select the hotbar
+        slot holding the block it was just handed.
+        """
+
+        if not 0 <= slot <= PLAYER_INVENTORY_LAST_SLOT:
+            return
+        reader = PacketReader(raw)
+        try:
+            item = self._read_item_stack(reader)
+        except (_UnsupportedItemComponents, ProtocolError) as error:
+            await self.events.emit("inventory_unparsed", slot, str(error), raw)
+            return
+        reader.expect_end()
+        self.player.inventory[slot] = item
+        await self.events.emit("inventory", slot, item)
+
+    async def _sync_player_inventory(self, raw: bytes) -> None:
+        """Mirror a full ``Container 0`` content packet into the inventory."""
+
+        reader = PacketReader(raw)
+        try:
+            count = reader.read_varint()
+            if not 0 <= count <= PLAYER_INVENTORY_LAST_SLOT + 1:
+                raise ProtocolError(f"invalid player inventory slot count {count}")
+            slots = {}
+            for slot in range(count):
+                slots[slot] = self._read_item_stack(reader)
+            carried = self._read_item_stack(reader)
+        except (_UnsupportedItemComponents, ProtocolError) as error:
+            await self.events.emit("inventory_unparsed", -1, str(error), raw)
+            return
+        reader.expect_end()
+        self.player.inventory.update(slots)
+        await self.events.emit("inventory_sync", dict(self.player.inventory), carried)
 
     async def _handle_container_close(self, payload: bytes) -> None:
         reader = PacketReader(payload)

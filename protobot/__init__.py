@@ -14,6 +14,7 @@ from .auth import (
     refresh_login,
 )
 from .client import AttributeModifierUpdate, AttributeUpdate, Bot, connect
+from .actions import ActionResult, Actions, ActionStatus, UnsupportedAction
 from .errors import (
     AuthenticationError,
     ConnectionClosed,
@@ -22,6 +23,8 @@ from .errors import (
     ProtocolError,
     UnsupportedVersion,
 )
+from .goals import Goal, GoalError, GoalReport, GoalRunner, GoalStatus
+from .tasks import Step, StepReport, Task, TaskError, TaskReport, TaskRunner
 from . import log
 from .modlist import (
     ChannelFlow,
@@ -88,6 +91,9 @@ __all__ = [
     "AIR",
     "DEFAULT_BLOCK",
     "SUPPORTED_VERSIONS",
+    "ActionResult",
+    "ActionStatus",
+    "Actions",
     "AttributeModifierUpdate",
     "AttributeUpdate",
     "AuthenticationError",
@@ -107,6 +113,11 @@ __all__ = [
     "EquipmentSlot",
     "ExposedFunction",
     "FlightPathfinder",
+    "Goal",
+    "GoalError",
+    "GoalReport",
+    "GoalRunner",
+    "GoalStatus",
     "ItemStack",
     "Loader",
     "LoginRejected",
@@ -136,7 +147,14 @@ __all__ = [
     "StaticCollisionWorld",
     "StdoutProxy",
     "StatusEffect",
+    "Step",
+    "StepReport",
     "TRANSLATIONS",
+    "Task",
+    "TaskError",
+    "TaskReport",
+    "TaskRunner",
+    "UnsupportedAction",
     "UnsupportedVersion",
     "__version__",
     "Vec3",

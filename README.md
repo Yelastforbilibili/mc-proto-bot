@@ -14,9 +14,13 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Full protocol stack** — handshake → login → configuration → play, keep-alive, teleport confirmation, chunk decoding, and server transfers, all bounds-checked and deterministic.
 - **Online & offline mode** — full support for Mojang session-server authenticated login (RSA/AES-CFB8 stream encryption) and Microsoft OAuth sign-in (authorization-code by default, device-code with your own Azure app), as well as offline-mode servers.
 - **SRV records** — `_minecraft._tcp` lookup like a vanilla client, so an address that publishes a backend host and port resolves to it.
-- **Multiple releases** — Minecraft `1.21.11`, `26.1`, `26.1.1`, `26.1.2`, `26.2`, and `26.3` out of the box (bundled per-version block-state tables).
+- **Multiple releases** — Minecraft `1.21.8`, `1.21.11`, `26.1`, `26.1.1`, `26.1.2`, `26.2`, and `26.3` out of the box (bundled per-version block-state tables).
+- **Generated version data** — packet-id tables, item registries, and block-state tables are generated from Mojang's own `reports/` (`tools/gen_packet_ids.py`, `tools/gen_item_ids.py`, `protobot-export-block-states`) and checked in, so `tests/test_packet_ids.py` fails the moment a shipped table disagrees with the release it claims to describe.
 - **Client-side physics** — a 20 Hz deterministic physics engine that mirrors vanilla movement, including boats and hard entity collision.
 - **Navigation** — A\* path planning and execution over the decoded world with automatic replanning.
+- **Interaction layer** — `bot.actions` sends the packets a real client uses for `dig`, `place_block`, `use_item_on`, `attack`, `interact`, and `swing`, with raycast targeting and a confirmed/unconfirmed result per action instead of fire-and-forget writes; per-release payload differences (26.3's shifted action ordinals, 26.3's field-less punch, the pre-26.1 interact shape) live as data in one profile table.
+- **Goal layer** — `bot.goals` describes intent instead of packets: `BreakBlockGoal`, `PlaceBlockGoal`, `ReachGoal`, `AttackEntityGoal`, `WaitGoal`, composable with `SequenceGoal`/`AnyOfGoal`; `GoalRunner` owns the loop, walks over when the target is out of reach, and reports success only when the server-confirmed world says so (a goal that claims done while `is_reached()` is false fails).
+- **Task layer** — `bot.tasks` chains goals into retryable scripts: `Task` with `GoalStep`/`CallStep`/`WaitStep`, plus ready-made `BreakBlocks`/`PlaceBlocks`; a failure names the step and the attempt number, and a task-level timeout is part of the report.
 - **Mod loader handshakes** — Forge, NeoForge, and Fabric client mod declarations, plus Velocity modern forwarding.
 - **Event bus** — subscribe to chat, chunk, entity, container, health/death, join/leave, and raw packet events.
 - **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
@@ -369,6 +373,56 @@ A refresh must return to the endpoint family that issued the token. Passing the
 same `client_id` selects it automatically (the launcher ID means MSA, anything
 else means Azure AD); `azure_ad=True/False` overrides the choice. `protobot
 login` records this in its cache so `protobot run` renews correctly.
+
+## Automation layers
+
+Three layers sit on top of the protocol client and each one is usable on its own:
+`bot.actions` (one packet-level action, confirmed against the decoded world),
+`bot.goals` (an objective the runner ticks until the world says it is true), and
+`bot.tasks` (a retryable script of goals and calls).
+
+```python
+from protobot import connect
+from protobot.goals import BreakBlockGoal, ReachGoal, SequenceGoal
+
+bot = await connect("127.0.0.1", username="Miner")
+await bot.wait_world()
+
+goal = SequenceGoal(
+    ReachGoal(10.5, 4.5),          # walk there first
+    BreakBlockGoal((8, -60, 4)),   # then dig that block
+)
+report = await bot.goals.run(goal, timeout=90)
+print(report.status, report.elapsed, report.detail)
+await bot.close()
+```
+
+Goals never mutate the world locally: `is_reached()` reads the decoded state, so
+the runner only finishes once the server actually sent the block update. A goal
+that reports `DONE` while `is_reached()` is false counts as a failure, and a
+target outside the interaction range is walked to by the goal itself.
+
+```python
+from protobot.goals import BreakBlockGoal
+from protobot.tasks import BreakBlocks, GoalStep, Task, WaitStep
+
+task = Task("harvest")
+task.add(GoalStep(BreakBlockGoal((8, -60, 4)), timeout=30))
+task.add(BreakBlocks([(9, -60, 4), (10, -60, 4)]))
+task.add(WaitStep(0.5))
+
+report = await bot.tasks.run(task, timeout=120)
+if not report.ok:
+    print(report.failed_step.name, report.failed_step.detail)
+```
+
+Steps retry (`TaskRunner(bot, retries=1)` by default), a failure names the step
+and the attempt that failed, and every layer emits events on `bot.events`
+(`action`, `goal_start`/`goal_done`, `task_start`/`task_step`/`task_done`).
+
+See [`docs/automation.md`](docs/automation.md) for the contracts and how to add a
+goal, and [`docs/protocol-verification.md`](docs/protocol-verification.md) for how
+the per-release payloads were verified.
 
 ## Bot CLI and plugin system
 

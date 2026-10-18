@@ -14,9 +14,13 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **完整协议栈**——握手 → 登录 → 配置 → 游戏全流程，含 keep-alive、传送确认、区块解码与服务器转移，全部经过边界检查、行为确定。
 - **正版与离线双支持**——完整支持 Mojang session-server 正版加密验证（RSA/AES-CFB8 8位流式加密）、微软 OAuth 交互登录（默认授权码流程，可选设备码流程）及离线模式。
 - **SRV 记录解析**——像原版客户端一样查询 `_minecraft._tcp`，自动连到地址所发布的后端主机与端口。
-- **多版本支持**——开箱支持 Minecraft `1.21.11`、`26.1`、`26.1.1`、`26.1.2`、`26.2`、`26.3`（内置各版本方块状态表）。
+- **多版本支持**——开箱支持 Minecraft `1.21.8`、`1.21.11`、`26.1`、`26.1.1`、`26.1.2`、`26.2`、`26.3`（内置各版本方块状态表）。
+- **数据驱动的版本表**——包 id 表、物品注册表、方块状态表都由 Mojang 官方 `reports/` 生成（`tools/gen_packet_ids.py`、`tools/gen_item_ids.py`、`protobot-export-block-states`）后入库，任何一张表与它声称的版本不符时 `tests/test_packet_ids.py` 直接失败。
 - **客户端物理**——20 Hz 确定性物理引擎，精确复刻原版移动逻辑，含船载物理与实体硬碰撞。
 - **导航寻路**——基于解码后世界的 A\* 路径规划与执行，支持自动重规划。
+- **交互动作层**——`bot.actions` 发送真实客户端使用的数据包：`dig`、`place_block`、`use_item_on`、`attack`、`interact`、`swing`，带射线瞄准，每个动作返回已确认/未确认的结果而不是发完就不管；各发布版的字段差异（26.3 的动作序号位移、26.3 无字段的 punch、26.1 之前的 Interact 布局）集中在一张 profile 表里。
+- **行为目标层**——`bot.goals` 用目标而不是数据包描述意图：`BreakBlockGoal`、`PlaceBlockGoal`、`ReachGoal`、`AttackEntityGoal`、`WaitGoal`，可 `SequenceGoal`/`AnyOfGoal` 组合；`GoalRunner` 负责轮询、"超距先走过去"、超时与中断，成功以服务端回报的世界状态为准（自己说完成但目标没达成算失败）。
+- **任务脚本层**——`bot.tasks` 把目标串成可重试的脚本：`Task` + `GoalStep`/`CallStep`/`WaitStep`，内置 `BreakBlocks`/`PlaceBlocks`；每步失败会写明是哪一步、第几次尝试，整条任务超时也记在报告里。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
 - **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡、玩家加入/退出与原始数据包事件。
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
@@ -324,6 +328,53 @@ profile = await refresh_login(profile.refresh_token, "<你的 Azure 应用 ID>")
 续期必须回到签发该令牌的那一套端点。传入相同的 `client_id` 就会自动选对（启动器 ID
 表示 MSA，其他表示 Azure AD）；`azure_ad=True/False` 可强制指定。`protobot login`
 会把这一点记录到缓存里，`protobot run` 便能正确续期。
+
+## 自动化三层
+
+协议客户端之上还有三层，每一层都能单独使用：`bot.actions`（单个数据包级动作，
+以解码后的世界确认结果）、`bot.goals`（一个目标，runner 一直 tick 到世界证明它成立）、
+`bot.tasks`（可重试的目标与调用脚本）。
+
+```python
+from protobot import connect
+from protobot.goals import BreakBlockGoal, ReachGoal, SequenceGoal
+
+bot = await connect("127.0.0.1", username="Miner")
+await bot.wait_world()
+
+goal = SequenceGoal(
+    ReachGoal(10.5, 4.5),          # 先走过去
+    BreakBlockGoal((8, -60, 4)),   # 再挖掉它
+)
+report = await bot.goals.run(goal, timeout=90)
+print(report.status, report.elapsed, report.detail)
+await bot.close()
+```
+
+目标层不会在本地改世界：`is_reached()` 读的是解码后的状态，所以 runner 只在服务器
+真正发来方块更新后才算完成。目标自己报 `DONE` 但 `is_reached()` 为假会被判定为失败；
+目标超出交互距离时由目标自己走过去。
+
+```python
+from protobot.goals import BreakBlockGoal
+from protobot.tasks import BreakBlocks, GoalStep, Task, WaitStep
+
+task = Task("harvest")
+task.add(GoalStep(BreakBlockGoal((8, -60, 4)), timeout=30))
+task.add(BreakBlocks([(9, -60, 4), (10, -60, 4)]))
+task.add(WaitStep(0.5))
+
+report = await bot.tasks.run(task, timeout=120)
+if not report.ok:
+    print(report.failed_step.name, report.failed_step.detail)
+```
+
+步骤自动重试（`TaskRunner(bot, retries=1)` 为默认），失败报告会写明是哪一步、第几次
+尝试失败；每层都会在 `bot.events` 上发事件（`action`、`goal_start`/`goal_done`、
+`task_start`/`task_step`/`task_done`）。
+
+契约与自定义目标的写法见 [`docs/automation.md`](docs/automation.md)，各发布版数据包
+的验证过程见 [`docs/protocol-verification.md`](docs/protocol-verification.md)。
 
 ## 机器人 CLI 与插件系统
 
