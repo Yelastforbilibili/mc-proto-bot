@@ -43,6 +43,11 @@ CHAT_LIMIT = 230
 # Vanilla kicks a player whose chat spam counter passes 200; the counter grows by
 # 20 per message and shrinks by one per tick, so one message per second is safe.
 CHAT_INTERVAL = 1.05
+# A respawn request is ignored while the server still considers the player alive,
+# which happens when the join-time health packet has not been processed yet, so
+# keep asking until the client is standing again.
+REVIVE_RESEND = 2.0
+REVIVE_TIMEOUT = 15.0
 TAG = "suite"
 
 
@@ -312,6 +317,12 @@ class Suite:
         )
         self.journal: list[tuple[float, int, int]] = []
         self.started = time.monotonic()
+        self.revive_task: asyncio.Task | None = None
+        # A dead bot lies on the death screen: no movement, no physics, and the
+        # next scenario fails for a reason that has nothing to do with what it
+        # tests.  The server never respawns a player by itself, so the suite
+        # treats the core's death event as "get up now".
+        bot.events.on("death", self.on_death)
 
     def journal_packet(self, packet: Any) -> None:
         if packet.packet_id not in self.container_packets:
@@ -542,9 +553,73 @@ class Suite:
         except Exception:
             pass
 
+    async def revive(self, *, announce: bool = True) -> bool:
+        """Make sure the bot is standing before a scenario runs."""
+
+        task = self.revive_task
+        if task is not None and not task.done():
+            await task  # join the respawn that the death event already started
+        if not getattr(self.bot.player, "dead", False):
+            return False
+        await self._revive_now(announce=announce)
+        return True
+
+    async def _revive_now(self, *, announce: bool = True) -> None:
+        """Respawn is Client Status (0 = perform respawn).
+
+        The server answers with the respawn packet and a position sync carrying
+        a teleport id, which the core confirms and follows with Player Loaded.
+        Both flags matter: until they are set there is no physics state and no
+        loaded chunk, so every later click would be built on nothing.
+        """
+
+        if announce:
+            await self.say("[bot] 我死了，正在重生")
+        deadline = time.monotonic() + REVIVE_TIMEOUT
+        sent = 0.0
+        while time.monotonic() < deadline:
+            if not self.bot.player.dead and self.bot.player.loaded:
+                break
+            # Resend every couple of seconds: the server ignores a respawn for a
+            # player it still considers alive, which happens when the join-time
+            # health packet has not been processed server side yet.
+            if time.monotonic() - sent > REVIVE_RESEND:
+                await self.bot.respawn()
+                sent = time.monotonic()
+            await asyncio.sleep(0.05)
+        else:
+            raise AssertionError("重生后没有站起来：服务器没有回应 Client Status")
+        await self.settle(0.3)
+        await self.wait_chunk(self.feet(), timeout=10.0)
+        print("[death] respawned", flush=True)
+
+    def schedule_revive(self) -> None:
+        """Respawn in the background.
+
+        The death event is dispatched from inside the packet loop, so awaiting
+        the whole respawn here would stop the client from reading the very
+        packets the respawn is waiting for.
+        """
+
+        if self.revive_task is not None and not self.revive_task.done():
+            return
+        self.revive_task = asyncio.create_task(self._revive_in_background())
+
+    async def _revive_in_background(self) -> None:
+        try:
+            await self._revive_now(announce=not self.busy)
+        except Exception as error:  # a failed revive must not kill the client
+            print(f"[death] revive failed: {type(error).__name__}: {error}", flush=True)
+
+    async def on_death(self, message: Any) -> None:
+        text = _plain_component(message).strip()
+        print(f"[death] {text or '(no message)'}", flush=True)
+        self.schedule_revive()
+
     async def reset(self) -> None:
         """Between scenarios: back at the anchor, no window, no items, no mobs."""
 
+        await self.revive()
         await self.close_menu()
         await self.empty_player_grid()
         self.clear_inventory()

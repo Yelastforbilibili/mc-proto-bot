@@ -83,6 +83,28 @@ left = server_items(s.command("data get block ... Items"))
 assert left.get("minecraft:oak_log") == 10
 ```
 
+## Death and respawn
+
+A dead bot lies on the death screen: no physics, no clicks, and every scenario
+after it fails for a reason that has nothing to do with what it tests. The
+server never respawns a player by itself, so the suite treats the core's `death`
+event as "get up now": it sends Client Status (0 = perform respawn) and waits
+for **both** the respawn packet and the position sync that follows, because the
+respawn clears `player.loaded` and the next click needs a loaded position.
+
+The handler only *starts* a task. It is dispatched from inside the client's
+packet loop, so awaiting the whole respawn there would stop the client from
+reading the very packets it is waiting for — that deadlock is what made the
+first version sit for ten seconds and then recover at the deadline. The request
+is also resent every couple of seconds: the server ignores a respawn for a player
+it still considers alive, which happens when the join-time health packet has not
+been processed yet. `Suite.revive()` is called again by `reset()`, so a scenario
+always begins on its feet.
+
+```python
+bot.events.on("death", suite.on_death)   # wires the same handler as live_suite.py
+```
+
 ## Things that bit us
 
 - **A command is not a fact.** `/give` returns as soon as it is dispatched;
