@@ -118,3 +118,27 @@ bot.events.on("death", suite.on_death)   # wires the same handler as live_suite.
   before counting them.
 - **Two bots, one server.** The suite identifies its own chat echoes by player
   name; offline servers echo chat without a sender uuid.
+- **A runner without an active window is dead on arrival.** A scenario that opens
+  a menu leaves it open when it fails, and the next scenario's clicks then go to
+  a window the server has already replaced; `reset()` closes whatever is still
+  open before it starts.
+- **A pause is a lie about the movement.** The bot only ticks when the test code
+  asks it to, so every blocking call (bridge HTTP, `time.sleep`, a long
+  `wait_for`) is a gap in the movement record; a movement check then flags the
+  first step after the gap. `Suite.keep_ticking()` runs alongside the scenarios
+  and ticks whenever the last movement packet is more than 75 ms old.
+- **Back-to-back digging is a fast break.** Vanilla waits five ticks after a
+  block breaks before starting the next one; `dig()` now enforces the same
+  cooldown, so a three block column can be mined in a loop.
+
+## The result this document is written against
+
+```
+python tools/live_suite.py --version 26.3 \
+    --server-log ..\Test26.3Server\logs\latest.log --run all
+[suite] 23/23 passed
+[suite] no anti-cheat alerts
+```
+
+301 unit tests plus the 23 live scenarios; GrimAC 2.x with
+`alerts.print-to-console: true`, `experimental-checks: false`.

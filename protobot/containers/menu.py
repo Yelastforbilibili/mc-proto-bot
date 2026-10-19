@@ -902,7 +902,13 @@ class Menu:
         reach: float = 4.5,
         timeout: float = 2.0,
     ) -> Menu:
-        """Right-click a block and return the window the server opens."""
+        """Right-click a block and return the window the server opens.
+
+        The click is what a real client sends: it turns towards the point its
+        own ray hits -- inside a movement packet, never as a bare look -- and
+        then names that face and that point.  Clicking a block the eye is not
+        looking at is what makes a window silently not open.
+        """
 
         x, y, z = position
         center = Vec3(x + 0.5, y + 0.5, z + 0.5)
@@ -913,9 +919,38 @@ class Menu:
                 f"{position} is {math.sqrt(offset.length_squared):.1f} blocks away,"
                 f" beyond the {reach} block reach"
             )
+        actions = self.bot.actions
+        hit = actions.raycast()
+        cursor: tuple[float, float, float] | None = None
+        target = center
+        if hit is not None and hit.position == position:
+            if face is None:
+                face = hit.face
+            target = hit.point
+            cursor = (
+                min(1.0, max(0.0, hit.point.x - x)),
+                min(1.0, max(0.0, hit.point.y - y)),
+                min(1.0, max(0.0, hit.point.z - z)),
+            )
+        await actions.turn_to(target)
+        # A second ray now that the view is on the target: the first one was
+        # taken from the old rotation and may have hit nothing at all.
+        if cursor is None:
+            hit = actions.raycast()
+            if hit is not None and hit.position == position:
+                if face is None:
+                    face = hit.face
+                cursor = (
+                    min(1.0, max(0.0, hit.point.x - x)),
+                    min(1.0, max(0.0, hit.point.y - y)),
+                    min(1.0, max(0.0, hit.point.z - z)),
+                )
         before = self._open_windows()
-        await self.bot.actions.look_at(center)
-        await self.bot.actions.use_item_on(position, face=face or BlockFace.UP)
+        await actions.use_item_on(
+            position,
+            face=face if face is not None else BlockFace.UP,
+            cursor=cursor,
+        )
         return await self._wait_for_window(before, timeout=timeout)
 
     async def open_entity(

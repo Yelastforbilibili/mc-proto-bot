@@ -75,6 +75,8 @@ CLIENTBOUND_FIELDS: dict[str, tuple[str | tuple[str, ...] | None, str | None]] =
     "clientbound_block_destruction": ("block_destruction", "block_break_animation"),
     #: Broken-block replacement for the 26.3 client (``add_transient_block``).
     "clientbound_add_transient_block": ("add_transient_block", None),
+    #: Absolute entity position; 26.3 split this out of ``teleport_entity``.
+    "clientbound_entity_position_sync": ("entity_position_sync", None),
     "clientbound_chunk_data": ("level_chunk_with_light", "map_chunk"),
     "clientbound_unload_chunk": ("forget_level_chunk", "unload_chunk"),
     "clientbound_chunk_batch_finished": (

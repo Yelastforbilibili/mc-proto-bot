@@ -9,6 +9,7 @@ import hmac
 import ipaddress
 import json
 import math
+import os
 import secrets
 import time
 import uuid
@@ -80,6 +81,42 @@ _MOVEMENT_EFFECTS = {
     29: "minecraft:dolphins_grace",
     36: "minecraft:weaving",
 }
+
+# ``PROTOBOT_TRACE_SEND=1`` prints every packet the client puts on the wire,
+# which is the only way to tell "the click was rejected locally" apart from
+# "the click never left" when a server action silently does nothing.
+_TRACE_SEND = os.environ.get("PROTOBOT_TRACE_SEND", "").strip() not in (
+    "",
+    "0",
+    "false",
+)
+# ``PROTOBOT_TRACE_RECV=1`` does the same for inbound packets, which is how one
+# tells "the server never answered" apart from "we dropped the answer".
+_TRACE_RECV = os.environ.get("PROTOBOT_TRACE_RECV", "").strip() not in (
+    "",
+    "0",
+    "false",
+)
+# ``PROTOBOT_TRACE_POS=<path>`` appends one CSV line per sent movement tick
+# (wall clock, x, y, z, yaw, pitch, on_ground).  Aligning that file with a
+# server-side anti-cheat alert timestamp is how one finds the exact tick and
+# spot a movement prediction disagreed with the server.
+_TRACE_POS = os.environ.get("PROTOBOT_TRACE_POS", "").strip()
+
+
+def _serverbound_name(packets: object, packet_id: int) -> str:
+    for field in getattr(packets, "__dataclass_fields__", ()):
+        if field.startswith("serverbound_") and getattr(packets, field) == packet_id:
+            return field[len("serverbound_") :]
+    return str(packet_id)
+
+
+def _clientbound_name(packets: object, packet_id: int) -> str:
+    for field in getattr(packets, "__dataclass_fields__", ()):
+        if field.startswith("clientbound_") and getattr(packets, field) == packet_id:
+            return field[len("clientbound_") :]
+    return str(packet_id)
+
 
 # Player Info Update action bits: 1.21.4+ has eight of them, which is
 # exactly one byte of the fixed-size bit set the packet carries.
@@ -325,6 +362,12 @@ PLAYER_INVENTORY_LAST_SLOT = 45
 #: Defensive cap when decoding an announced container slot count.
 _MAX_CONTAINER_SLOTS = 1024
 
+#: Minimum wall-clock gap between two movement packets.  A vanilla client only
+#: moves once per 20 Hz tick, and anti-cheat timer checks measure exactly that:
+#: Grim's Timer adds 50 ms per movement packet and flags a client that runs
+#: ahead of real time.  Bursts (aim right after a position packet) have to wait.
+MIN_TICK_GAP = 0.05
+
 
 class _UnsupportedEntityMetadata(Exception):
     pass
@@ -541,6 +584,11 @@ class Bot:
         # 26.3 kicks a client that sends two position-bearing movement packets
         # without a client_tick_end in between; see _send_position_packet.
         self._position_sent_this_tick = False
+        # Monotonic time of the last movement packet; see _begin_tick_packet.
+        self._last_tick_packet_time = 0.0
+        # Rotation carried by the last look/posRot packet; see _rotation_unchanged.
+        self._last_sent_yaw = None
+        self._last_sent_pitch = None
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -784,6 +832,13 @@ class Bot:
 
     async def send_raw(self, packet_id: int, payload: bytes = b"") -> None:
         """Send a packet in the current state for advanced protocol use."""
+        if _TRACE_SEND:
+            print(
+                f"[send] {time.time():.4f}"
+                f" {_serverbound_name(self.version.packets, packet_id)}"
+                f" {len(payload)}B",
+                flush=True,
+            )
         await self._connection.send_packet(packet_id, payload)
 
     async def send_configuration_payload(self, channel: str, data: bytes = b"") -> None:
@@ -1116,6 +1171,11 @@ class Bot:
             raise TypeError("hotbar slot must be an int")
         if not 0 <= slot <= 8:
             raise ValueError("hotbar slot must be between 0 and 8")
+        if self.player.selected_hotbar_slot == slot:
+            # Vanilla never tells the server about a slot it is already holding.
+            # Repeating it is what anti-cheat flags as "sent duplicate slot id"
+            # (Grim's BadPacketsA), and the server learns nothing from it.
+            return
         await self.send_raw(
             self.version.packets.serverbound_set_carried_item,
             PacketWriter().write_short(slot).to_bytes(),
@@ -1435,6 +1495,7 @@ class Bot:
     ) -> None:
         self._require_play()
         self._set_movement_flags(on_ground, horizontal_collision)
+        yaw = self._wire_yaw(yaw)
         self.player.x, self.player.y, self.player.z = x, y, z
         self.player.yaw, self.player.pitch = yaw, pitch
         self.physics_state.position = Vec3(x, y, z)
@@ -1455,22 +1516,62 @@ class Bot:
         await self._send_position_packet(
             self.version.packets.serverbound_position_look, payload
         )
+        self._last_sent_yaw, self._last_sent_pitch = yaw, pitch
 
-    async def _send_position_packet(self, packet_id: int, payload: bytes) -> None:
-        """Send a position-bearing movement packet within the tick budget.
+    async def wait_tick_budget(self) -> None:
+        """Sleep until the next movement packet may go out without speeding up.
 
-        Protocol 777 (26.3) disconnects a client whose second Pos/PosRot packet
-        arrives before ``client_tick_end``.  Callers that drive movement
-        manually (several ``send_position`` calls without ``end_tick``) would
-        trip that check, so close the current tick first, exactly like a
-        vanilla client that moves once per tick.  Older protocols are
-        unaffected.
+        Actions use this to place a packet (an arm swing, a stop-digging) right
+        before the movement packet that closes the tick, so anti-cheat never
+        finds it queued alone when a transaction arrives.
+        """
+
+        if not self._last_tick_packet_time:
+            return
+        delay = MIN_TICK_GAP - (time.monotonic() - self._last_tick_packet_time)
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+    async def _begin_tick_packet(self) -> None:
+        """Start a movement tick the way a vanilla client does.
+
+        A vanilla client emits exactly one movement packet per 20 Hz tick and
+        closes that tick with ``client_tick_end`` (26.3+).  Aiming used to send
+        a look packet straight after the previous tick's position packet, which
+        is two ticks inside one real-time frame.  Grim's Timer check adds 50 ms
+        per movement packet and flags once the balance runs ahead of real time,
+        and its TickTimer check flags a tick that carries two movement packets.
+        So close the previous tick and keep the packets 50 ms apart.
         """
 
         if self.version.protocol >= 777 and self._position_sent_this_tick:
             await self.end_tick()
-        await self.send_raw(packet_id, payload)
+        if self._last_tick_packet_time:
+            delay = MIN_TICK_GAP - (time.monotonic() - self._last_tick_packet_time)
+            if delay > 0:
+                await asyncio.sleep(delay)
+        self._last_tick_packet_time = time.monotonic()
         self._position_sent_this_tick = True
+
+    async def _send_position_packet(self, packet_id: int, payload: bytes) -> None:
+        """Send a position-bearing movement packet within the tick budget.
+
+        Whether the packet carries a position, a rotation or only the on-ground
+        flag, it belongs to one movement tick: ``_begin_tick_packet`` closes the
+        previous tick and keeps the 20 Hz cadence, exactly like a vanilla client
+        that moves once per tick.
+        """
+
+        await self._begin_tick_packet()
+        if _TRACE_SEND:
+            state = self.physics_state
+            print(
+                f"[pos] {time.time():.4f} y={state.position.y:.4f}"
+                f" ground={int(bool(self.player.on_ground))}"
+                f" vy={state.velocity.y:.4f}",
+                flush=True,
+            )
+        await self.send_raw(packet_id, payload)
 
     async def send_vehicle_position_and_rotation(
         self,
@@ -1491,6 +1592,7 @@ class Bot:
 
         self._require_play()
         self._validate_finite((x, y, z, yaw, pitch), "vehicle movement values")
+        yaw = self._wire_yaw(yaw)
         vehicle = self._controlled_root_vehicle()
         if vehicle is None:
             raise RuntimeError("the local player is not controlling a supported vehicle")
@@ -1800,6 +1902,38 @@ class Bot:
         await self.send_raw(self.version.packets.serverbound_player_command, payload)
         self._last_sent_sprinting = sprinting
 
+    def _wire_yaw(self, yaw: float) -> float:
+        """``yaw`` adjusted so this packet differs from the last by a small angle.
+
+        Yaw is modulo 360, and the physics engine, the navigation and the action
+        layer set it independently, so the same direction can arrive as 30 or as
+        390.  Two consecutive packets that disagree by about a full turn are a
+        snap to the server and to anti-cheat (Grim's AimModulo360, "Sent a large
+        yaw snap"), while the player turned by nothing at all.  Keeping every
+        packet within half a turn of the previous one makes the wire say what
+        really happened.
+        """
+
+        previous = self._last_sent_yaw
+        if previous is None:
+            return yaw
+        return previous + ((yaw - previous + 180.0) % 360.0 - 180.0)
+
+    def _rotation_unchanged(self, yaw: float, pitch: float) -> bool:
+        """True when a vanilla client would not send a rotation packet at all.
+
+        ``LocalPlayer.sendPosition`` only emits a look/posRot packet when
+        ``dYaw^2 + dPitch^2 > 9.0E-6``; otherwise it falls back to a position or
+        status packet.  Aiming twice at the same point therefore sends nothing,
+        and Grim's AimDuplicateLook check flags exactly that duplicate.
+        """
+
+        if self._last_sent_yaw is None or self._last_sent_pitch is None:
+            return False
+        yaw_delta = yaw - self._last_sent_yaw
+        pitch_delta = pitch - self._last_sent_pitch
+        return yaw_delta * yaw_delta + pitch_delta * pitch_delta <= 9.0e-6
+
     async def end_tick(self) -> None:
         self._require_play()
         await self.send_raw(self.version.packets.serverbound_tick_end)
@@ -1817,8 +1951,13 @@ class Bot:
 
         self._require_play()
         self._set_movement_flags(on_ground, horizontal_collision)
+        yaw = self._wire_yaw(yaw)
         self.player.yaw, self.player.pitch = yaw, pitch
         self.physics_state.yaw, self.physics_state.pitch = yaw, pitch
+        if self._rotation_unchanged(yaw, pitch):
+            # Vanilla sends nothing here (the server already has this rotation),
+            # and repeating it is what Grim's AimDuplicateLook flags.
+            return
         if self.anti_kick and self.physics_state.flying:
             # Meteor's packet mode converts rotation-only movement to a full
             # position+rotation packet so its Y rewrite can be applied.
@@ -1844,7 +1983,9 @@ class Bot:
             .write_unsigned_byte(self._movement_flags())
             .to_bytes()
         )
+        await self._begin_tick_packet()
         await self.send_raw(self.version.packets.serverbound_look, payload)
+        self._last_sent_yaw, self._last_sent_pitch = yaw, pitch
 
     async def send_status(
         self,
@@ -1872,10 +2013,32 @@ class Bot:
                 self.version.packets.serverbound_position, payload
             )
             return
+        await self._begin_tick_packet()
         await self.send_raw(
             self.version.packets.serverbound_flying,
             PacketWriter().write_unsigned_byte(self._movement_flags()).to_bytes(),
         )
+
+    def _trace_position(self, controls: MovementInput | None = None) -> None:
+        """Append this tick's movement to ``$PROTOBOT_TRACE_POS`` when set."""
+
+        if not _TRACE_POS:
+            return
+        state = self.physics_state
+        inputs = controls or MovementInput()
+        line = (
+            f"{time.time():.4f},{state.position.x:.4f},{state.position.y:.4f},"
+            f"{state.position.z:.4f},{state.yaw:.2f},{state.pitch:.2f},"
+            f"{int(state.on_ground)},{state.velocity.x:.4f},"
+            f"{state.velocity.y:.4f},{state.velocity.z:.4f},"
+            f"{int(inputs.forward > 0)},{int(inputs.strafe != 0)},"
+            f"{int(bool(inputs.jump))},{int(bool(inputs.sprint))}\n"
+        )
+        try:
+            with open(_TRACE_POS, "a", encoding="utf-8") as handle:
+                handle.write(line)
+        except OSError:
+            pass
 
     async def tick(
         self,
@@ -1948,6 +2111,7 @@ class Bot:
             self._set_local_flying(True)
             await self._send_flying_state()
         was_flying = self.physics_state.flying
+        position_serial = self._position_update_serial
         self.physics.tick(self.physics_state, controls, self.world)
         velocity = self.physics_state.velocity
         self.player.velocity_x = velocity.x
@@ -1985,23 +2149,41 @@ class Bot:
             await self._sync_sprinting(self.physics_state.sprinting)
         if send_position:
             state = self.physics_state
+            if self._position_update_serial != position_serial:
+                # An authoritative teleport landed while this tick was being
+                # sent.  The step above was computed from the pre-teleport
+                # position, so claiming it would describe a jump the server
+                # never made -- which is exactly what a movement prediction
+                # check flags.  Drop this tick's movement: the next tick starts
+                # from the teleported state, and the tick itself still ends.
+                if _TRACE_SEND:
+                    print(f"[tick] {time.monotonic():.3f} dropped movement (teleport race)", flush=True)
+                self._trace_position(controls)
+                await self.end_tick()
+                return self.physics_state
             if self._force_flight_active:
                 # Forced flight is local-only.  Do not let the predictor's
                 # landing flag switch the next tick back to walking, and do
                 # not advertise an on-ground movement packet while flying.
                 state.on_ground = False
                 state.vertical_collision = False
-            if self._force_flight_active and _navigation_tick:
-                # Navigation updates yaw immediately before the physics tick.
-                # Carry it in the same movement packet instead of sending a
-                # Look packet followed by a Position packet every tick.
+            # A vanilla client sends exactly one movement packet per tick, and
+            # the rotation rides in it when the view changed.  A separate Look
+            # packet would be a second movement packet in the same tick: the
+            # server then sees two ticks for one step of movement, which is what
+            # a prediction check reports as an offset.
+            turned = (
+                abs((self.player.yaw - state.yaw + 180.0) % 360.0 - 180.0) > 1e-4
+                or abs(self.player.pitch - state.pitch) > 1e-4
+            )
+            if turned or (self._force_flight_active and _navigation_tick):
                 await self.send_position_and_rotation(
                     state.position.x,
                     state.position.y,
                     state.position.z,
                     state.yaw,
                     state.pitch,
-                    on_ground=False,
+                    on_ground=False if self._force_flight_active else state.on_ground,
                     horizontal_collision=state.horizontal_collision,
                 )
             else:
@@ -2013,6 +2195,7 @@ class Bot:
                     horizontal_collision=state.horizontal_collision,
                 )
             self.player.yaw, self.player.pitch = state.yaw, state.pitch
+        self._trace_position(controls)
         self.player.pose = self.physics_state.pose
         self.player.crouching = self.physics_state.crouching
         self.player.swimming = self.physics_state.swimming
@@ -2917,8 +3100,10 @@ class Bot:
                     return False
 
                 if horizontal > tolerance:
+                    # Only set the heading here; ``tick`` carries it in the same
+                    # movement packet as the step (one packet per tick, like a
+                    # vanilla client).
                     state.yaw = math.degrees(math.atan2(-dx, dz))
-                    await self.send_look(state.yaw, state.pitch)
                 jump = (
                     waypoint.operation == "jump"
                     and state.position.y < waypoint.position.y - 0.05
@@ -2978,6 +3163,9 @@ class Bot:
         self._next_anti_kick = 0.0
         self._anti_kick_last_packet_y = None
         self._position_sent_this_tick = False
+        self._last_tick_packet_time = 0.0
+        self._last_sent_yaw = None
+        self._last_sent_pitch = None
         self._last_sent_input_flags = 0
         self._last_sent_sprinting = False
         self._next_sequence = 0
@@ -3040,6 +3228,12 @@ class Bot:
             while True:
                 packet = await self._connection.receive_packet(self.state)
                 await self.events.emit("packet", packet)
+                if _TRACE_RECV:
+                    print(
+                        f"[recv] {_clientbound_name(self.version.packets, packet.packet_id)}"
+                        f" {len(packet.payload)}B",
+                        flush=True,
+                    )
                 await self.events.emit(f"packet:{self.state.value}:{packet.packet_id}", packet)
                 if self.state is ConnectionState.LOGIN:
                     await self._handle_login(packet)
@@ -3296,6 +3490,11 @@ class Bot:
             await self._handle_move_entity(packet.payload, position=True, rotation=True)
         elif packet.packet_id == ids.clientbound_move_entity_rot:
             await self._handle_move_entity(packet.payload, position=False, rotation=True)
+        elif (
+            ids.clientbound_entity_position_sync
+            and packet.packet_id == ids.clientbound_entity_position_sync
+        ):
+            await self._handle_entity_position_sync(packet.payload)
         elif packet.packet_id == ids.clientbound_ping:
             reader = PacketReader(packet.payload)
             value = reader.read_int()
@@ -3758,6 +3957,7 @@ class Bot:
             .write_bool(False if self._no_fall else vehicle.on_ground)
             .to_bytes()
         )
+        await self._begin_tick_packet()
         await self.send_raw(self.version.packets.serverbound_move_vehicle, payload)
 
     async def _send_paddle_boat(self, vehicle: EntityState) -> None:
@@ -3922,6 +4122,56 @@ class Bot:
         entity.head_yaw = head_yaw
         entity.data = data
         await self.events.emit("entity_add", entity)
+
+    async def _handle_entity_position_sync(self, payload: bytes) -> None:
+        """Absolute position of a moving entity (26.3 ``entity_position_sync``).
+
+        The relative ``move_entity`` packets only carry small deltas, so a
+        knockback or any teleport-like correction arrives here.  A client that
+        ignores this packet keeps an entity at the last delta position and
+        slowly drifts away from where the server has it -- close enough to
+        look right on screen and far enough to make a aimed hit miss.
+        """
+
+        reader = PacketReader(payload)
+        entity_id = reader.read_varint()
+        kind = reader.read_varint()
+        if kind == 1:
+            count = reader.read_varint()
+            if count <= 0 or count > reader.remaining // 25:
+                raise ProtocolError(
+                    f"entity position path with {count} steps exceeds payload"
+                )
+            position = (0.0, 0.0, 0.0)
+            for _ in range(count):
+                # Each step is absolute; only the last one is where the entity
+                # is when the packet finishes, which is the point to track.
+                position = (
+                    reader.read_double(),
+                    reader.read_double(),
+                    reader.read_double(),
+                )
+                reader.read_varint()  # interpolation ticks for this step
+        elif kind == 0:
+            position = (
+                reader.read_double(),
+                reader.read_double(),
+                reader.read_double(),
+            )
+        else:
+            raise ProtocolError(f"unknown entity position path type {kind}")
+        yaw = reader.read_float()
+        pitch = reader.read_float()
+        on_ground = reader.read_bool()
+        reader.expect_end()
+        self._validate_finite((*position, yaw, pitch), "entity position sync")
+
+        entity = self.entities.get(entity_id)
+        if entity is not None:
+            entity.x, entity.y, entity.z = position
+            entity.yaw, entity.pitch = yaw, pitch
+            entity.on_ground = on_ground
+        await self.events.emit("entity_move", entity_id, entity)
 
     async def _handle_move_entity(
         self,
@@ -5085,6 +5335,16 @@ class Bot:
         packet_pitch = reader.read_float()
         relative = reader.read_unsigned_int()
         reader.expect_end()
+        if _TRACE_POS:
+            local = self.physics_state.position
+            print(
+                f"[tp] t={time.monotonic():.3f} id={teleport_id}"
+                f" pos=({values[0]:.4f},{values[1]:.4f},{values[2]:.4f})"
+                f" vel=({values[3]:.4f},{values[4]:.4f},{values[5]:.4f})"
+                f" rot=({packet_yaw:.3f},{packet_pitch:.3f}) rel=0x{relative:x}"
+                f" local=({local.x:.4f},{local.y:.4f},{local.z:.4f})",
+                flush=True,
+            )
 
         position = values[:3]
         packet_velocity = values[3:]
@@ -5143,6 +5403,20 @@ class Bot:
         self.physics_state.pitch = pitch
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
+        if not self.physics_state.on_ground and not self._force_flight_active:
+            # A teleport can put us on top of a block while the predictor still
+            # carries the "in the air" flag from before it.  Claiming that flag
+            # in the next movement packet is a ground spoof and anti-cheat
+            # flags it, so settle the flag from the world we have: a solid block
+            # right under the feet means we are standing on it.
+            below = self.world.get_state_id(
+                math.floor(position[0]),
+                math.floor(position[1] - 0.001),
+                math.floor(position[2]),
+            )
+            if below > 0:
+                self.player.on_ground = True
+                self.physics_state.on_ground = True
         if self._force_flight_active:
             # Keep forced local flight active after any authoritative position
             # sync.  This packet is not interpreted as a permission decision.

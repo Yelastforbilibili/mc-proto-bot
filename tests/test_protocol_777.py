@@ -206,6 +206,53 @@ class Decoding777Tests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(entity.on_ground)
         self.assertAlmostEqual(entity.yaw, 90.0)
 
+    async def test_entity_position_sync_sets_the_absolute_position(self) -> None:
+        bot, _sent = _make_bot()
+        entity = bot._entity_for_state(11)
+        entity.x, entity.y, entity.z = 1.0, 64.0, 1.0
+
+        linear = (
+            PacketWriter()
+            .write_varint(11)
+            .write_varint(0)  # linear path
+            .write_double(3.5)
+            .write_double(65.0)
+            .write_double(-2.5)
+            .write_float(90.0)
+            .write_float(-10.0)
+            .write_bool(True)
+            .to_bytes()
+        )
+        await bot._handle_entity_position_sync(linear)
+        self.assertEqual((entity.x, entity.y, entity.z), (3.5, 65.0, -2.5))
+        self.assertAlmostEqual(entity.yaw, 90.0)
+        self.assertAlmostEqual(entity.pitch, -10.0)
+        self.assertTrue(entity.on_ground)
+
+        # A stepped path is absolute per step; the last one is where the entity
+        # ends up, and that is the position a hitter has to aim at.
+        stepped = (
+            PacketWriter()
+            .write_varint(11)
+            .write_varint(1)
+            .write_varint(2)
+            .write_double(4.0)
+            .write_double(65.0)
+            .write_double(-3.0)
+            .write_varint(1)
+            .write_double(5.0)
+            .write_double(65.0)
+            .write_double(-4.0)
+            .write_varint(2)
+            .write_float(180.0)
+            .write_float(0.0)
+            .write_bool(False)
+            .to_bytes()
+        )
+        await bot._handle_entity_position_sync(stepped)
+        self.assertEqual((entity.x, entity.y, entity.z), (5.0, 65.0, -4.0))
+        self.assertFalse(entity.on_ground)
+
     async def test_move_entity_rot_reads_on_ground_first(self) -> None:
         bot, _sent = _make_bot()
         entity = bot._entity_for_state(9)

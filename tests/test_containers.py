@@ -275,7 +275,16 @@ class FakeActions:
     def __init__(self, bot: FakeBot) -> None:
         self.bot = bot
         self.looks: list[Vec3] = []
+        self.turns: list[Vec3] = []
         self.used: list[tuple[int, tuple[int, int, int]]] = []
+        self.hits: list[object] = []
+
+    def raycast(self, **_):
+        return self.hits.pop(0) if self.hits else None
+
+    async def turn_to(self, point, **_):
+        self.turns.append(point if isinstance(point, Vec3) else Vec3(*point))
+        return (0.0, 0.0)
 
     async def look_at(self, point) -> tuple[float, float]:
         self.looks.append(point)
@@ -679,7 +688,10 @@ class OpenTests(unittest.IsolatedAsyncioTestCase):
         menu = await Menu(bot).open_block((3, 63, 0))
         self.assertTrue(menu.is_open)
         self.assertEqual(menu.identifier, "minecraft:generic_9x3")
-        self.assertTrue(bot.actions.looks)
+        # The click has to be aimed: a window does not open for a click the
+        # player is not looking at, so the turn is part of the primitive.
+        self.assertEqual(bot.actions.turns, [open_block])
+        self.assertEqual(bot.actions.used, [(0, (3, 63, 0))])
 
     async def test_out_of_reach_block_is_refused(self) -> None:
         bot = FakeBot()

@@ -132,6 +132,10 @@ class PlayPacketIds:
     clientbound_damage_event: int = 0
     #: Broken-block replacement packet new in 26.3 (0 on earlier releases).
     clientbound_add_transient_block: int = 0
+    #: Absolute position of a moving entity.  Without it a tracked entity only
+    #: follows the small relative deltas and drifts away from where the server
+    #: has it -- which is what makes an aimed attack miss.
+    clientbound_entity_position_sync: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -725,6 +729,7 @@ _PLAY_777 = PlayPacketIds(
     clientbound_hurt_animation=0x2B,
     clientbound_damage_event=0x19,
     clientbound_add_transient_block=0x25,
+    clientbound_entity_position_sync=0x23,
     clientbound_set_health=0x6A,
     clientbound_player_combat_kill=0x45,
     serverbound_client_command=0x0C,

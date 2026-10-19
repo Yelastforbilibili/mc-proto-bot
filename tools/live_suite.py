@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import json
 import math
+import os
 import re
 import sys
 import time
@@ -131,18 +132,59 @@ class Bridge:
         self.call("/events/clear", body={})
 
     def log(self, *, since: int = 0, limit: int = 400) -> list[str]:
+        """Console lines the server wrote, oldest first.
+
+        The bridge answers with ``entries`` (a list of ``{seq, level, source,
+        msg}`` objects) and a ``next`` cursor, not with pre-joined text, so the
+        message is what gets matched against :data:`ANTI_CHEAT`.
+        """
+
         payload = self.call("/log", query={"since": since, "limit": limit})
-        lines = payload.get("lines") or payload.get("log") or []
-        if isinstance(lines, str):
-            return lines.splitlines()
-        return [str(line) for line in lines]
+        entries = payload.get("entries") or payload.get("lines") or []
+        lines: list[str] = []
+        for entry in entries:
+            if isinstance(entry, dict):
+                lines.append(str(entry.get("msg", "")))
+            else:
+                lines.append(str(entry))
+        return lines
+
+    def log_cursor(self) -> int:
+        """Where the next :meth:`log` call should start from."""
+
+        payload = self.call("/log", query={"since": 0, "limit": 1})
+        try:
+            return int(payload.get("next") or 0)
+        except (TypeError, ValueError):
+            return 0
 
     def inventory(self, name: str) -> dict[str, Any]:
         payload = self.call("/inventory", query={"name": name})
         return payload
 
 
-ANTI_CHEAT = ("moved too quickly", "moved wrongly", "Flying is not enabled")
+#: Lines the server writes when it thinks the bot is not playing the game the way
+#: a vanilla client does.  GrimAC prints one alert per flag to the console
+#: (``alerts.print-to-console: true``); the check names are listed one by one
+#: because the console prefix ("Grim") also appears on ordinary join messages.
+ANTI_CHEAT = (
+    "moved too quickly",
+    "moved wrongly",
+    "Flying is not enabled",
+    "触发了",
+    "failed PacketOrder",
+    "failed NoSwingBreak",
+    "failed FastBreak",
+    "failed Simulation",
+    "failed Post",
+    "failed BadPackets",
+    "failed Timer",
+    "failed Interact",
+    "failed Reach",
+    "failed MultiActions",
+    "failed Breaking",
+    "failed Prediction",
+)
 
 
 def _top_level_compounds(text: str) -> list[str]:
@@ -290,11 +332,23 @@ class Suite:
         *,
         world: str = "world",
         anchor: tuple[int, int, int] = (0, -60, 0),
+        server_log: str | None = None,
     ) -> None:
         self.bot = bot
         self.bridge = bridge
         self.world = world
         self.anchor = anchor
+        # The bridge's ``/log`` endpoint only answers with the lines it captured
+        # itself, so when the server log file is reachable on disk the suite
+        # reads that instead -- that is where GrimAC writes its alerts.
+        self.server_log = server_log
+        try:
+            self.log_offset = os.path.getsize(server_log) if server_log else 0
+        except OSError:
+            self.log_offset = 0
+        # The alert window restarts for every scenario; 0 means "not marked yet,
+        # fall back to the suite start".
+        self.alert_offset = 0
         self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.busy = False
         self.stop_requested = False
@@ -316,6 +370,12 @@ class Suite:
             if packet_id
         )
         self.journal: list[tuple[float, int, int]] = []
+        # Only the lines written after the suite started matter: an old flag from
+        # a previous run would make every scenario look dirty.
+        try:
+            self.log_since = self.bridge.log_cursor()
+        except Exception:  # a bridge that is not there only costs the check
+            self.log_since = 0
         self.started = time.monotonic()
         self.revive_task: asyncio.Task | None = None
         # A dead bot lies on the death screen: no movement, no physics, and the
@@ -340,6 +400,13 @@ class Suite:
     # -- chat ---------------------------------------------------------
     async def say(self, message: str) -> None:
         text = message if len(message) <= CHAT_LIMIT else message[: CHAT_LIMIT - 3] + "..."
+        # Grim's ChatB flags a chat packet whose text is not already trimmed
+        # ("Invalid chat message"), and these lines are indented for the console.
+        # Vanilla strips what a player types, so leading spaces never reach the
+        # wire; non-breaking spaces do the indenting instead.
+        stripped = text.lstrip(" ")
+        if stripped != text:
+            text = "\u00a0" * (len(text) - len(stripped)) + stripped
         # The vanilla server adds 20 to a spam counter per chat message and removes
         # one per tick, kicking the player above 200.  One message per second keeps
         # the counter flat, so the bot is never kicked for spamming.
@@ -530,7 +597,43 @@ class Suite:
         await self.wait_chunk(
             (math.floor(position[0]), math.floor(position[1]), math.floor(position[2]))
         )
+        # The server answers the teleport with a position packet.  Ticking before
+        # that packet lands makes the client claim the old spot, which the server
+        # logs as "moved too quickly" and answers with a second teleport, so wait
+        # for the client to actually be where it was sent.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if math.dist(self.position(), position) <= 1.0:
+                break
+            await asyncio.sleep(0.05)
         await self.settle(0.5)
+        # The server keeps its own copy of where we are, and a click that lands
+        # before that copy agrees with ours is ray-traced from the wrong eye:
+        # Grim's RotationPlace reports exactly that, and it only shows up on the
+        # first click after a teleport.  Wait until both sides agree.
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            server = self.server_position()
+            if server is not None and math.dist(server, position) <= 0.3:
+                break
+            await asyncio.sleep(0.05)
+        await self.settle(0.2)
+
+    def server_position(self) -> tuple[float, float, float] | None:
+        """Where the server says we are, or ``None`` if we are not listed."""
+
+        for player in self.bridge.players():
+            if player.get("name") != self.username:
+                continue
+            try:
+                return (
+                    float(player["x"]),
+                    float(player["y"]),
+                    float(player["z"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
 
     async def empty_player_grid(self) -> None:
         """Put the craft grid and the cursor back, which ``/clear`` does not touch.
@@ -628,6 +731,14 @@ class Suite:
         # inventory the moment the bot walks over them, which makes "dig three
         # logs" read as six.
         self.command("kill @e[type=minecraft:item]")
+        # Scenarios build small structures, and a probe script or a failed run
+        # can leave blocks behind.  Wipe the plot above the floor so every run
+        # starts from the same flat ground.
+        ax, ay, az = self.anchor
+        if not os.environ.get("SUITE_NO_WIPE"):
+            self.command(
+                f"fill {ax - 12} {ay} {az - 12} {ax + 12} {ay + 5} {az + 12} minecraft:air"
+            )
         await self.teleport(
             (self.anchor[0] + 0.5, float(self.anchor[1]), self.anchor[2] + 0.5)
         )
@@ -684,12 +795,49 @@ class Suite:
             return None
         return first_float(text.split(":")[-1])
 
+    def log_lines(self) -> list[str]:
+        """What the server wrote since the current scenario started.
+
+        Prefers the console log on disk (``--server-log``) because that is where
+        GrimAC prints one alert per flag; the bridge's captured log is the
+        fallback when no path is given.  The window starts at the scenario's own
+        start, so one alert cannot fail every scenario after it.
+        """
+
+        if self.server_log:
+            try:
+                with open(self.server_log, "r", encoding="utf-8", errors="replace") as handle:
+                    handle.seek(self.alert_offset or self.log_offset)
+                    return handle.read().splitlines()
+            except OSError:
+                return []
+        return self.bridge.log(since=self.log_since, limit=1000)
+
+    def mark_log(self) -> None:
+        """Start a fresh alert window for the next scenario."""
+
+        self.alert_offset = 0
+        if self.server_log:
+            try:
+                self.alert_offset = os.path.getsize(self.server_log)
+            except OSError:
+                self.alert_offset = 0
+        try:
+            self.log_since = self.bridge.log_cursor()
+        except Exception:  # a bridge that is not there only costs the check
+            self.log_since = 0
+
     def anti_cheat_lines(self) -> list[str]:
+        # The suite talks about its own alerts in chat, so a line that merely
+        # quotes an alert is not one: chat lines carry ``<name>`` and the log
+        # level ``Async Chat Thread``.
         return [
             line
-            for line in self.bridge.log(limit=800)
+            for line in self.log_lines()
             if any(marker in line for marker in ANTI_CHEAT)
             and self.username in line
+            and "Async Chat Thread" not in line
+            and f"<{self.username}>" not in line
         ]
 
     # -- dispatch -----------------------------------------------------
@@ -714,7 +862,7 @@ class Suite:
             if entity is None:
                 return hits
             distance = math.dist((entity.x, entity.y, entity.z), self.feet())
-            if distance > 2.6:
+            if distance > 2.2:
                 # Close and short steps: a fleeing cow moves while the path is
                 # being planned, so one long walk to where it used to be is
                 # wasted time.
@@ -736,7 +884,13 @@ class Suite:
             except Exception:
                 return hits
             await self.settle(0.05)
-            await self.bot.actions.attack(entity_id, swing=True)
+            # Hit through the crosshair, not through the entity table: a hit
+            # whose ray misses the box is what Grim's Hitboxes check flags, and
+            # that is exactly what a player cannot do either.
+            result = await self.bot.actions.attack_looked_at(max_distance=3.0)
+            if result is None or result.entity_id != entity_id:
+                await self.settle(0.1)
+                continue
             hits += 1
             # Attack strength only refills while no hit is landing; firing
             # faster than that deals a fraction of the damage.
@@ -808,6 +962,28 @@ class Suite:
             finally:
                 self.queue.task_done()
 
+    async def keep_ticking(self) -> None:
+        """Tick like a vanilla client, even while the test code is not.
+
+        A real client sends one movement packet per tick no matter what else it
+        is doing.  This suite blocks on its own HTTP calls (setblock, command,
+        inventory reads), and a pause looks like dropped ticks to the server and
+        to a movement-prediction check: the next claim then disagrees with the
+        prediction by most of a step.  Filling the gaps keeps the record
+        continuous, which is what the scenarios are supposed to be testing.
+        """
+
+        while not self.bot.closed.is_set():
+            await asyncio.sleep(0.02)
+            try:
+                behind = time.monotonic() - (self.bot._last_tick_packet_time or 0.0)
+                if behind > 0.075:
+                    await self.bot.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
+
     async def run_case(self, item: Case) -> bool:
         if self.bot.closed.is_set():
             print(f"[{item.number}] skipped: the bot is no longer connected", flush=True)
@@ -818,6 +994,7 @@ class Suite:
         await self.say(f"[#{item.number}] 开始：{item.category}·{item.title}")
         outcome = "PASS"
         detail = ""
+        self.mark_log()
         try:
             await self.reset()
             await asyncio.wait_for(item.run(self), timeout=item.timeout)
@@ -967,7 +1144,21 @@ async def menus_grid(s: Suite) -> None:
         target = s.clear_spot(s.spot(2, 0))
         s.setblock(target, block)
         await s.settle(0.35)
-        menu = await s.bot.menu.open_block(target)
+        try:
+            menu = await s.bot.menu.open_block(target)
+        except Exception as error:
+            server_block = s.bridge.block_type(s.world, target)
+            above = s.bridge.block_type(s.world, (target[0], target[1] + 1, target[2]))
+            windows = [
+                (container_id, state.is_open, state.menu_type_id, state.slot_count)
+                for container_id, state in sorted(s.bot.containers.items())
+            ]
+            eye = s.bot.physics_state.position
+            ray = s.bot.actions.raycast()
+            raise AssertionError(
+                f"{block} 打不开：{error}；服务端 {target} 是 {server_block}，上面是 {above}；"
+                f"眼 {eye}，本地射线 {ray}；手上 {s.bot.player_menu.carried}；窗口 {windows}"
+            ) from error
         identifier = menu.identifier
         assert identifier == expected, f"{block} 打开的是 {identifier}"
         assert menu.slot_count > 0, f"{identifier} 没有槽位"
@@ -1371,22 +1562,27 @@ async def tool_speed(s: Suite) -> None:
 
         s.bot.events.on("block_update", on_update)
         started = time.monotonic()
-        result = await s.bot.actions.dig(spot, hold=0.5)
-        release = started + 0.5
-        for _ in range(60):
+        # hold=None asks the library for a vanilla dig: it keeps the button
+        # down for the predicted time plus a margin and then releases.  An
+        # explicit short hold is an early release, and vanilla closes that with
+        # ABORT -- which cancels the dig on the server instead of finishing it.
+        result = await s.bot.actions.dig(spot, hold=None)
+        for _ in range(80):
             if updates:
                 break
             await s.settle(0.05)
         assert result.status is ActionStatus.CONFIRMED or updates, "方块没破"
         assert s.server_state(spot) == 0, "服务端方块还在"
-        return (updates[0] - release) if updates else 0.0
+        return (updates[0] - started) if updates else (time.monotonic() - started)
 
     iron_delay = await timed(iron_spot, "minecraft:iron_pickaxe")
     wood_delay = await timed(wood_spot, "minecraft:wooden_pickaxe")
-    assert iron_delay < 0.3, f"铁镐松手后还等了 {iron_delay:.2f}s"
-    assert wood_delay > 0.3, f"木镐松手后只等了 {wood_delay:.2f}s"
+    assert iron_delay < 0.9, f"铁镐破石头用了 {iron_delay:.2f}s，比 0.4s 的基准慢太多"
+    assert wood_delay > iron_delay + 0.4, (
+        f"木镐 {wood_delay:.2f}s 与铁镐 {iron_delay:.2f}s 没有拉开差距"
+    )
     await s.say(
-        f"    铁镐破石延迟 {iron_delay:.2f}s，木镐 {wood_delay:.2f}s（服务端补完）"
+        f"    铁镐破石 {iron_delay:.2f}s，木镐 {wood_delay:.2f}s（服务端基准 0.4 / 1.15）"
     )
 
 
@@ -1493,32 +1689,51 @@ async def components_unknown(s: Suite) -> None:
 # ---------------------------------------------------------------------------
 @case(21, "混合", "伐木工：走→挖→合成→放置→合成", timeout=180.0)
 async def mixed_lumberjack(s: Suite) -> None:
-    # A three block log column a couple of blocks away, plus the walk that reaches it.
-    column = [s.clear_spot(s.spot(3, 2, dy)) for dy in (0, 1, 2)]
+    # A three block log column a couple of blocks away, plus the walk that
+    # reaches it.  The column floats one block up (the floor block underneath
+    # stays), so every drop falls onto the walking surface: a hole that has to
+    # be stepped into would add a one block fall to the movement record, which
+    # is a movement-prediction edge case this scenario has no business testing.
+    # The walk goes along z, clear of the column.
+    column = [s.clear_spot(s.spot(3, 2, dy)) for dy in (1, 2, 3)]
     for position in column:
         s.setblock(position, "minecraft:oak_log")
     await s.settle(0.4)
     start = s.feet()
     walked = await s.bot.goals.run(
-        TravelGoal(start[0] + 2.5, start[2] + 0.5, tolerance=1.0, timeout=90.0), timeout=120.0
+        TravelGoal(start[0] + 0.5, start[2] + 2.5, tolerance=1.0, timeout=90.0),
+        timeout=120.0,
     )
     assert walked.status is GoalStatus.DONE, f"走过去 {walked.detail}"
     for position in column:
-        result = await s.bot.actions.dig(position, hold=3.4)
-        assert result.status is ActionStatus.CONFIRMED, f"{position} 没挖掉：{result.evidence}"
-    # Items only fly into the inventory within about a block, so step next to
-    # the column (not into it: those cells are still solid above) and wait for
-    # every drop to fall into reach.
-    collect = (column[0][0] + 1.6, column[0][2] + 0.6)
+        # No explicit hold: the library holds for the predicted break time plus
+        # a small margin and then releases, which is what a vanilla client does.
+        # An explicit short hold would go out as ABORT (a "fast break" to the
+        # anti-cheat) and leave the block standing.
+        result = await s.bot.actions.dig(position)
+        assert result.status is ActionStatus.CONFIRMED, (
+            f"{position} 没挖掉：{result.evidence}"
+            f"；feet={s.feet()} eye={s.bot.actions.eye_position()}"
+            f" visible={[face.name for face in s.bot.actions.visible_faces(position)]}"
+            f" pick={s.bot.actions.pick_face(position)}"
+            f" extra={result.extra}"
+        )
+    # Items only fly into the inventory within about a block.  The column
+    # leaves no hole, so the drops sit on the surface beside it and both sides
+    # are a plain walk on flat ground.
     logs = 0
-    for _ in range(3):
+    for collect in (
+        (column[0][0] - 0.5, column[0][2] + 0.5),
+        (column[0][0] + 1.5, column[0][2] + 0.5),
+        (column[0][0] + 0.5, column[0][2] + 1.5),
+    ):
         try:
             await s.bot.navigate_to(
-                collect[0], collect[1], tolerance=0.6, timeout=15.0
+                collect[0], collect[1], tolerance=0.5, timeout=20.0
             )
         except Exception:
             pass
-        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=4.0)
+        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=8.0)
         if logs >= 3:
             break
     assert logs == 3, f"服务端背包 log={logs}"
@@ -1653,10 +1868,17 @@ async def main_async(args: argparse.Namespace) -> int:
         version=args.version,
         timeout=30.0,
     )
-    suite = Suite(bot, bridge, world=args.world, anchor=(args.x, args.y, args.z))
+    suite = Suite(
+        bot,
+        bridge,
+        world=args.world,
+        anchor=(args.x, args.y, args.z),
+        server_log=args.server_log,
+    )
     bot.events.on("player_chat", suite.on_chat)
     bot.events.on("packet", suite.journal_packet)
     worker = asyncio.create_task(suite.worker())
+    idle = asyncio.create_task(suite.keep_ticking())
 
     try:
         await asyncio.sleep(1.0)
@@ -1687,12 +1909,20 @@ async def main_async(args: argparse.Namespace) -> int:
                 if not ok:
                     failures += 1
             print(f"[suite] {len(wanted) - failures}/{len(wanted)} passed", flush=True)
+            alerts = suite.anti_cheat_lines()
+            if alerts:
+                print(f"[suite] anti-cheat alerts: {len(alerts)}", flush=True)
+                for line in alerts[:10]:
+                    print(f"    {line.strip()}", flush=True)
+            else:
+                print("[suite] no anti-cheat alerts", flush=True)
             return 0 if failures == 0 else 1
         print("[suite] ready: type a number in game chat", flush=True)
         while not bot.closed.is_set():
             await asyncio.sleep(0.5)
     finally:
         worker.cancel()
+        idle.cancel()
         try:
             await bot.close()
         except Exception:
@@ -1715,6 +1945,11 @@ def main() -> int:
     parser.add_argument("--username", default="SuiteBot")
     parser.add_argument("--bridge", default="http://127.0.0.1:25963")
     parser.add_argument("--world", default="world")
+    parser.add_argument(
+        "--server-log",
+        default=None,
+        help="console log to scan for anti-cheat alerts (default: the bridge's copy)",
+    )
     parser.add_argument("--x", type=int, default=0)
     parser.add_argument("--y", type=int, default=-60)
     parser.add_argument("--z", type=int, default=0)

@@ -19,6 +19,7 @@
     "clientbound_custom_payload": 24,
     "clientbound_damage_event": 25,
     "clientbound_disconnect": 32,
+    "clientbound_entity_position_sync": 35,
     "clientbound_game_event": 39,
     "clientbound_hurt_animation": 43,
     "clientbound_keep_alive": 45,
@@ -93,5 +94,5 @@
   },
   "protocol": 777,
   "source": "reports:packets.json",
-  "version": "generated"
+  "version": "26.3"
 }

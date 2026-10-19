@@ -99,9 +99,10 @@ flourish: the server turns every swing packet into an arm animation for nearby
 players, and a bot that breaks blocks with nothing but `PlayerAction` packets is
 the textbook anti-cheat signature of a script.
 
-So `dig()` swings before `START_DESTROY_BLOCK` and then once every
-`SWING_INTERVAL` (0.3 s, roughly a vanilla animation) while the button stays
-down, and `use_item_on()`/`place_block()` swing after using the hand on a block.
+So `dig()` sends `START_DESTROY_BLOCK`, then swings before the movement packet of
+every tick while the button stays down, swings once more and only then sends
+`STOP_DESTROY_BLOCK`, and closes that tick with `client_tick_end`.
+`use_item_on()`/`place_block()` swing right after using the hand on a block.
 The packets are the same ones `swing()` sends, so 26.3 gets the empty
 `ServerboundPunchPacket` and 26.1/1.21.x get `ServerboundSwingPacket` with the
 hand. Scenario 1 of `tools/live_suite.py` asserts the server recorded them:

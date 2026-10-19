@@ -23,7 +23,6 @@ from protobot.actions import (
     raycast_blocks,
     raycast_entities,
 )
-from protobot.actions import interactions as interactions_module
 from protobot.events import EventBus
 from protobot.physics import Vec3
 from protobot.protocol.codec import PacketReader
@@ -49,6 +48,7 @@ class _FakeBot:
         self.version = version
         self.sent: list[tuple[int, bytes]] = []
         self.looks: list[tuple[float, float]] = []
+        self.turns: list[tuple[float, float]] = []
         self.events = EventBus()
         self.world = world if world is not None else _FakeWorld()
         self.entities: dict[int, EntityState] = {}
@@ -59,6 +59,7 @@ class _FakeBot:
             pitch=0.0,
         )
         self.ticks = 0
+        self.budget_waits = 0
         self._sequence = 0
         self.on_tick = None
 
@@ -70,10 +71,22 @@ class _FakeBot:
         self.physics_state.yaw = yaw
         self.physics_state.pitch = pitch
 
+    async def send_position_and_rotation(
+        self, x: float, y: float, z: float, yaw: float, pitch: float, **_: object
+    ) -> None:
+        self.turns.append((yaw, pitch))
+        self.looks.append((yaw, pitch))
+        self.physics_state.yaw = yaw
+        self.physics_state.pitch = pitch
+        self.physics_state.position = Vec3(x, y, z)
+
     def take_sequence(self) -> int:
         sequence = self._sequence
         self._sequence += 1
         return sequence
+
+    async def wait_tick_budget(self):
+        self.budget_waits += 1
 
     async def tick(self):
         self.ticks += 1
@@ -175,17 +188,19 @@ class LookAngleTests(unittest.TestCase):
 class PayloadTests(unittest.IsolatedAsyncioTestCase):
     async def test_dig_start_and_stop_payloads_on_26_3(self) -> None:
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(1, 64, 2): 9}))
+        # The button is released straight away, so the block breaks through the
+        # server's delayed-destroy path and the confirm window is what proves it.
         bot.on_tick = lambda: bot.world.set_state_id(1, 64, 2, 0)
-        result = await Actions(bot).dig((1, 64, 2), face=BlockFace.NORTH)
+        result = await Actions(bot).dig(
+            (1, 64, 2), face=BlockFace.NORTH, hold=0.0, confirm_timeout=1.0
+        )
         self.assertEqual(result.status, ActionStatus.CONFIRMED)
         self.assertEqual(len(bot.sent), 3)
 
-        # The arm swings before the button counts as down: a break with no
-        # swing behind it is what an anti-cheat flags first.
-        self.assertEqual(bot.sent[0][0], 0x2E)  # swing on 26.3 ("punch")
-        self.assertEqual(bot.sent[0][1], b"")
-
-        start_id, start_payload = bot.sent[1]
+        # Vanilla order inside the tick the button goes down: the action packet
+        # first, then the arm swing.  Grim's PacketOrderB reads the pair as
+        # "interaction, then animation" and flags the reverse.
+        start_id, start_payload = bot.sent[0]
         self.assertEqual(start_id, 0x29)  # serverbound_player_action on 26.3
         reader = PacketReader(start_payload)
         self.assertEqual(reader.read_varint(), 0)  # START_DESTROY_BLOCK
@@ -193,6 +208,9 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reader.read_unsigned_byte(), int(BlockFace.NORTH))
         self.assertEqual(reader.read_varint(), 0)  # first sequence
         self.assertEqual(reader.read_remaining(), b"")
+
+        self.assertEqual(bot.sent[1][0], 0x2E)  # swing on 26.3 ("punch")
+        self.assertEqual(bot.sent[1][1], b"")
 
         stop_id, stop_payload = bot.sent[2]
         self.assertEqual(stop_id, 0x29)
@@ -205,27 +223,34 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reader.read_varint(), 1)
         self.assertEqual(reader.read_remaining(), b"")
 
-    async def test_dig_keeps_swinging_while_the_button_is_held(self) -> None:
-        # A block that never breaks keeps the hold loop running, and a held
-        # button has to keep the arm moving or the break looks like a script.
+    async def test_dig_swings_once_per_tick_while_the_button_is_held(self) -> None:
+        # A vanilla client sends one animation packet per client tick while the
+        # button is held; Grim uses them as tick markers (FastBreak) and demands
+        # one in the same tick as the break (NoSwingBreak).
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(1, 64, 2): 9}))
-        bot.on_tick = lambda: None
-        original = interactions_module.SWING_INTERVAL
-        interactions_module.SWING_INTERVAL = 0.01
-        try:
-            await Actions(bot).dig((1, 64, 2), hold=0.3, confirm_timeout=0.0)
-        finally:
-            interactions_module.SWING_INTERVAL = original
+        ticks = {"count": 0}
+
+        def tick() -> None:
+            ticks["count"] += 1
+            if ticks["count"] >= 4:
+                bot.world.set_state_id(1, 64, 2, 0)
+
+        bot.on_tick = tick
+        await Actions(bot).dig((1, 64, 2), hold=5.0)
         swings = [packet_id for packet_id, _ in bot.sent if packet_id == 0x2E]
         actions = [packet_id for packet_id, _ in bot.sent if packet_id == 0x29]
         self.assertEqual(len(actions), 2)  # START and STOP
-        # One swing as the button goes down, then one per animation while held.
-        self.assertGreaterEqual(len(swings), 3)
+        # Four ticks of holding, plus the tick that closes the one STOP opened.
+        self.assertEqual(ticks["count"], 5)
+        # One swing as the button goes down, then exactly one per held tick.
+        self.assertEqual(len(swings), 1 + 4)
+        self.assertEqual(bot.sent[0][0], 0x29)  # the action comes first
+        self.assertEqual(bot.sent[1][0], 0x2E)  # then the swing
 
     async def test_dig_stop_keeps_the_classic_code_before_26_3(self) -> None:
         bot = _FakeBot(get_version("26.1"), _FakeWorld({(1, 64, 2): 9}))
         bot.on_tick = lambda: bot.world.set_state_id(1, 64, 2, 0)
-        await Actions(bot).dig((1, 64, 2), face=BlockFace.NORTH)
+        await Actions(bot).dig((1, 64, 2), hold=0.0, confirm_timeout=1.0)
         reader = PacketReader(bot.sent[2][1])
         self.assertEqual(reader.read_varint(), 2)  # STOP_DESTROY_BLOCK on 26.1
 
@@ -308,6 +333,18 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         reader.read_varint()
         self.assertEqual(reader.read_position(), (0, 64, 0))  # clicked block
         self.assertEqual(reader.read_varint(), int(BlockFace.UP))
+
+    async def test_place_block_turns_inside_a_movement_packet(self) -> None:
+        # Anti-cheat ray-traces the rotation of the tick a click arrives in, so
+        # a turn that travels in a bare look packet is one tick behind.  The
+        # rotation has to ride in a movement packet (position_and_rotation).
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 64, 0): 5}))
+        bot.on_tick = lambda: bot.world.set_state_id(0, 65, 0, 12)
+        await Actions(bot).place_block((0, 65, 0), face=BlockFace.UP)
+        self.assertEqual(len(bot.turns), 1)
+        yaw, pitch = bot.turns[0]
+        self.assertNotEqual((yaw, pitch), (0.0, 0.0))
+        self.assertEqual(bot.looks[-1], bot.turns[-1])
 
     async def test_place_block_rejects_occupied_destination(self) -> None:
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 65, 0): 3}))
@@ -494,8 +531,10 @@ class EntityActionTests(unittest.IsolatedAsyncioTestCase):
         result = await actions.attack_looked_at()
         assert result is not None
         self.assertEqual(result.entity_id, 154)
-        # the box is 0.3 deep, so a mob 2 blocks away is met 1.7 blocks out
-        self.assertIn("1.70 blocks", result.evidence)
+        # Aiming at the centre, then re-checking the crosshair, measures the
+        # reach from the ray rather than from the pre-turn rotation.
+        self.assertIn("hit entity 154", result.evidence)
+        self.assertTrue(result.evidence.endswith("blocks"))
         self.assertTrue(bot.looks)  # it aimed before swinging
         self.assertEqual(result.status, ActionStatus.SENT)
 
@@ -514,6 +553,62 @@ class EntityActionTests(unittest.IsolatedAsyncioTestCase):
         result = await Actions(bot).interact(154)
         self.assertEqual(result.entity_id, 154)
         self.assertTrue(bot.sent)
+
+
+class FaceChoiceTests(unittest.IsolatedAsyncioTestCase):
+    """A click may only name a face the eye can see.
+
+    Grim cancels a break that claims an impossible face without a word in the
+    console (``PositionBreakA``), so a wrong default reads as "the server
+    ignored my click" and costs a debugging session.  These pin the rule down.
+    """
+
+    def test_the_top_face_is_visible_from_above(self) -> None:
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(1, 63, 2): 4}))
+        actions = Actions(bot)
+        self.assertIn(BlockFace.UP, actions.visible_faces((1, 63, 2)))
+        self.assertEqual(actions.pick_face((1, 63, 2))[0], BlockFace.UP)
+
+    def test_a_block_above_the_eye_has_no_visible_top_face(self) -> None:
+        # Eye at y = 64.62, block occupies y = 64..65: the top face is above it.
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(1, 64, 2): 4}))
+        bot.physics_state.position = Vec3(0.5, 63.0, 0.5)
+        actions = Actions(bot)
+        self.assertNotIn(BlockFace.UP, actions.visible_faces((1, 64, 2)))
+        self.assertIn(BlockFace.NORTH, actions.visible_faces((1, 64, 2)))
+        self.assertEqual(actions.pick_face((1, 64, 2))[0], BlockFace.NORTH)
+
+    async def test_dig_never_claims_a_face_the_eye_cannot_see(self) -> None:
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(1, 64, 2): 4}))
+        bot.physics_state.position = Vec3(0.5, 63.0, 0.5)
+        bot.on_tick = lambda: bot.world.set_state_id(1, 64, 2, 0)
+        result = await Actions(bot).dig(
+            (1, 64, 2), face=BlockFace.UP, hold=0.0, confirm_timeout=0.0, tick=False
+        )
+        reader = PacketReader(bot.sent[0][1])
+        reader.read_varint()  # status
+        reader.read_position()
+        self.assertEqual(reader.read_unsigned_byte(), int(BlockFace.NORTH))
+        self.assertNotEqual(result.extra["face"], int(BlockFace.UP))
+
+    async def test_place_block_clicks_a_neighbour_it_can_see(self) -> None:
+        # Eye at y = 67.62, standing above the gap at (0, 65, 0).  Requesting
+        # DOWN would click the block at (0, 66, 0), but its underside faces
+        # down, away from the eye, so a client could not have clicked it.  The
+        # block underneath is fine: its top face is below the eye.
+        world = _FakeWorld({(0, 64, 0): 5, (0, 66, 0): 5})
+        bot = _FakeBot(get_version("26.3"), world)
+        bot.physics_state.position = Vec3(0.5, 66.0, 0.5)
+        result = await Actions(bot).place_block((0, 65, 0), face=BlockFace.DOWN)
+        self.assertEqual(result.extra["clicked"], (0, 64, 0))
+        self.assertEqual(result.extra["face"], int(BlockFace.UP))
+
+    async def test_place_block_rejects_when_no_neighbour_is_visible(self) -> None:
+        bot = _FakeBot(get_version("26.3"))
+        result = await Actions(bot).place_block((0, 65, 0))
+        self.assertEqual(result.status, ActionStatus.REJECTED)
+        self.assertIn("visible", result.evidence)
+        self.assertEqual(bot.sent, [])
 
 
 if __name__ == "__main__":
