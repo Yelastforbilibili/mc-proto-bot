@@ -13,13 +13,14 @@ from __future__ import annotations
 import asyncio
 import math
 
+from ..constants import GOAL_POLL_SECONDS
 from ..navigation import NavigationTimeout, PathNotFound
 from .base import Goal, GoalError, GoalStatus
 
 DEFAULT_TOLERANCE = 1.0
 DEFAULT_TIMEOUT = 120.0
 SEGMENT_SECONDS = 20.0
-POLL_SECONDS = 0.05
+POLL_SECONDS = GOAL_POLL_SECONDS
 FRONTIER_STEP = 4.0
 FRONTIER_LIMIT = 64.0
 

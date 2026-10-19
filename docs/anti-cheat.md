@@ -122,6 +122,19 @@ calls.  `Suite.keep_ticking()` fills those gaps: it ticks whenever the last
 movement packet is more than 75 ms old, exactly like a client that is not doing
 anything else.
 
+## What this document is not about
+
+The client still carries Meteor's cheating features -- `vclip` routes the
+planner through solid blocks, `anti_kick` writes a synthetic Y into periodic
+movement packets (`constants.ANTI_KICK_WIRE_OFFSET`), and `set_no_fall()`
+suppresses fall damage. They are opt-in: `connect()` and `Bot()` both default to
+`vclip=False, anti_kick=False`, and `tests/test_defaults.py` keeps them that way.
+
+None of that is "matching vanilla". Every rule in this document is behaviour a
+vanilla client produces, which is why the acceptance suite can assert zero
+alerts; the cheat switches exist for servers you own, and they are exactly the
+kind of packet an anti-cheat is written to catch.
+
 ## How to verify
 
 ```bash

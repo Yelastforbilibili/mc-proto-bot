@@ -36,6 +36,7 @@ from typing import Any, Awaitable, Callable
 
 from protobot import connect
 from protobot.actions import ActionStatus, BlockFace
+from protobot.constants import IDLE_TICK_SECONDS
 from protobot.crafting import recipe_for
 from protobot.goals import CraftGoal, GoalStatus, TravelGoal
 from protobot.physics import Vec3

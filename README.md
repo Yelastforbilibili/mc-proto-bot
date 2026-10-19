@@ -1012,6 +1012,24 @@ artifacts). Offline mode stays dependency-free in the wheel -- `[online]` and
 
 ## Notes and limitations
 
+- **One place for the tuning knobs.** Every tolerance this library chooses for
+  itself -- tick cadence, rotation epsilon, hold margins, break cooldown, reach
+  and aim offsets, container pacing -- lives in
+  [`protobot/constants.py`](protobot/constants.py). Vanilla constants stay next
+  to the code that mirrors them (`physics/engine.py`, `protocol/breaking.py`),
+  because moving them away from the source line they were transcribed from makes
+  the physics harder to audit. `tests/test_defaults.py` pins the values that the
+  packet sequence depends on.
+- **Cheat emulation is opt-in.** `connect(..., vclip=True)` plans routes through
+  solid blocks and `connect(..., anti_kick=True)` writes a synthetic position
+  into periodic movement packets. Both are `False` by default: they tell the
+  server something that did not happen, so they are only useful against servers
+  you own.
+- **Logging levels.** `protobot.log` is print-style and quiet by default
+  (`info`/`warn`/`error` only). `PROTOBOT_LOG=debug` (or
+  `protobot.set_log_level("debug")`) turns on the library's diagnostics, and the
+  `PROTOBOT_TRACE_SEND` / `PROTOBOT_TRACE_RECV` / `PROTOBOT_TRACE_POS` variables
+  dump packet and movement traces through the same channel.
 - **Online & offline mode.** Offline mode has zero third-party dependencies. For online-mode servers, install `protobot[online]` (requires `cryptography`).
 - **Secure chat is supported for online accounts.** ProtoBot fetches the account's ephemeral player certificate, registers a fresh chat session, signs `send_message()` payloads, tracks last-seen acknowledgements, and refreshes the certificate while connected. Offline-mode connections keep the unsigned fallback. `send_command()` continues to use the plain command packet.
 - Physics prediction mirrors vanilla 26.2 defaults; servers with heavy movement anti-cheat customisation may still issue corrections.

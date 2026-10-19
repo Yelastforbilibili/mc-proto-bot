@@ -884,6 +884,9 @@ git push origin main --tags
 
 ## 注意事项与限制
 
+- **可调参数只有一处。** 库自己选的容差——tick 节奏、旋转阈值、按住余量、破块冷却、触及与瞄准偏移、容器轮询间隔——全部在 [`protobot/constants.py`](protobot/constants.py)。原版常数留在镜像它们的那段代码旁边（`physics/engine.py`、`protocol/breaking.py`），因为把它们搬离抄录来源只会让物理更难核对。`tests/test_defaults.py` 钉住发包时序依赖的那几个值。
+- **作弊模拟默认关闭。** `connect(..., vclip=True)` 会让寻路穿过实体方块，`connect(..., anti_kick=True)` 会往周期性移动包里写入合成坐标。两者默认都是 `False`：它们等于告诉服务端没发生过的事，只适合自有服务器。
+- **日志分级。** `protobot.log` 是 print 风格且默认安静（只输出 `info`/`warn`/`error`）。`PROTOBOT_LOG=debug`（或 `protobot.set_log_level("debug")`）打开库内部诊断；`PROTOBOT_TRACE_SEND` / `PROTOBOT_TRACE_RECV` / `PROTOBOT_TRACE_POS` 三个变量把包与移动轨迹打在同一条通道上。
 - **正版与离线模式。** 离线模式保持零第三方依赖。若需连接开启 `online-mode=true` 的正版服务器，请安装 `protobot[online]`（引入 `cryptography`）。
 - **在线账号支持安全聊天。** ProtoBot 会获取账号的临时玩家证书、注册新的聊天会话、签署 `send_message()` 消息、维护 last-seen 确认窗口，并在连接期间刷新证书。离线模式仍使用无签名兼容路径；`send_command()` 继续使用普通命令包。
 - 物理预测以原版 26.2 默认值为基准；重度定制移动反作弊的服务器仍可能发出位置纠正。

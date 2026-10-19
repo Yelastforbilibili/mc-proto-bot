@@ -14,6 +14,9 @@ from .auth import (
     refresh_login,
 )
 from .client import AttributeModifierUpdate, AttributeUpdate, Bot, connect
+from . import constants, log
+from .log import get_level as get_log_level
+from .log import set_level as set_log_level
 from .actions import (
     ActionResult,
     Actions,
@@ -105,6 +108,10 @@ from .state import (
 from .world import BlockStateDefinition, BlockStateRegistry, World
 
 __all__ = [
+    constants,
+    get_log_level,
+    log,
+    set_log_level,
     "AABB",
     "AIR",
     "DEFAULT_BLOCK",

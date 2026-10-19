@@ -23,6 +23,18 @@ import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+from ..constants import (
+    AIM_INSIDE_OFFSET,
+    BLOCK_INTERACTION_RANGE,
+    BREAK_COOLDOWN_SECONDS,
+    CONFIRM_TIMEOUT_SECONDS,
+    DEFAULT_HOLD_SECONDS,
+    EARLY_RELEASE_TOLERANCE,
+    ENTITY_ATTACK_RANGE,
+    HOLD_MARGIN_SECONDS,
+    ROTATION_EPSILON,
+    TICK_SECONDS,
+)
 from ..physics import Vec3
 from ..protocol.codec import PacketWriter
 from ..protocol.entities import DEFAULT_HEIGHT, DEFAULT_WIDTH
@@ -49,21 +61,16 @@ INTERACT = 0
 INTERACT_ATTACK = 1
 INTERACT_AT = 2
 
-#: One client tick at 20 Hz, used to pace the hold-and-wait loops.
-TICK_SECONDS = 0.05
-
+#: One client tick at 20 Hz, used to pace the hold-and-wait loops.  The value
+#: lives in :mod:protobot.constants; this name stays for readability below.
 #: How much longer than the predicted break time a held button stays down
 #: before ``STOP`` goes out.  The prediction is what the server will use, so a
 #: round number would do -- but anti-cheat compares the stop against that
 #: prediction and cancels it when the two disagree by even a couple of ticks
 #: (Grim's ``FastBreak`` cancels once its balance passes a second, adding the
 #: difference each time).  A small margin keeps every stop on the slow side.
-HOLD_MARGIN_SECONDS = 0.15
-
 #: Hold used when the block's hardness is not in the table.  Long enough for
 #: everything hand-breakable, which is the only case a caller can still hit.
-DEFAULT_HOLD_SECONDS = 2.0
-
 #: How long a vanilla client waits after finishing a block before it starts the
 #: next one.  ``MultiPlayerGameMode`` sets ``destroyDelay = 5`` when a block
 #: breaks and refuses to start another dig until those five ticks pass, so a
@@ -71,8 +78,6 @@ DEFAULT_HOLD_SECONDS = 2.0
 #: is what anti-cheat counts as a fast break (Grim's ``FastBreak`` adds
 #: ``300ms - gap`` per block started within 275ms of a finish and flags once the
 #: balance passes a second).
-BREAK_COOLDOWN_SECONDS = 0.3
-
 #: A held button swings the arm once per client tick, not once per animation
 #: cycle: the vanilla client sends an animation packet every tick it is mining,
 #: which is what lets an anti-cheat (Grim's ``FastBreak``) treat the animation
@@ -219,8 +224,8 @@ class Actions:
         state = self.client.physics_state
         yaw = _continuous_yaw(state.yaw, yaw)
         if (
-            abs((state.yaw - yaw + 180.0) % 360.0 - 180.0) < 1e-4
-            and abs(state.pitch - pitch) < 1e-4
+            abs((state.yaw - yaw + 180.0) % 360.0 - 180.0) < ROTATION_EPSILON
+            and abs(state.pitch - pitch) < ROTATION_EPSILON
         ):
             return yaw, pitch
         if tick:
@@ -242,7 +247,7 @@ class Actions:
     def raycast(
         self,
         *,
-        max_distance: float = 4.5,
+        max_distance: float = BLOCK_INTERACTION_RANGE,
         origin: Vec3 | None = None,
         direction: Vec3 | None = None,
     ) -> BlockHit | None:
@@ -301,7 +306,7 @@ class Actions:
     def raycast_entity(
         self,
         *,
-        max_distance: float = 3.0,
+        max_distance: float = ENTITY_ATTACK_RANGE,
         origin: Vec3 | None = None,
         direction: Vec3 | None = None,
     ) -> EntityHit | None:
@@ -338,7 +343,7 @@ class Actions:
         return await self.look_at(center)
 
     async def attack_looked_at(
-        self, *, max_distance: float = 3.0, swing: bool = True
+        self, *, max_distance: float = ENTITY_ATTACK_RANGE, swing: bool = True
     ) -> ActionResult | None:
         """Aim at the entity under the crosshair and hit it.
 
@@ -716,7 +721,7 @@ class Actions:
         return BlockFace.NORTH if deltas[2] > 0 else BlockFace.SOUTH
 
     def pick_face(
-        self, position: tuple[int, int, int], *, max_distance: float = 4.5
+        self, position: tuple[int, int, int], *, max_distance: float = BLOCK_INTERACTION_RANGE
     ) -> tuple[BlockFace, Vec3] | None:
         """The face a vanilla client would click on ``position``, and its aim.
 
@@ -756,7 +761,7 @@ class Actions:
         tick: bool = True,
         hold: float | None = None,
         await_confirm: bool = True,
-        confirm_timeout: float = 0.75,
+        confirm_timeout: float = CONFIRM_TIMEOUT_SECONDS,
         send_stop: bool = True,
     ) -> ActionResult:
         """Break the block at ``position``, the way a held mouse button does.
@@ -824,7 +829,10 @@ class Actions:
         # An explicit hold shorter than the block needs is an early release.
         # Vanilla closes that with ABORT; sending STOP instead makes anti-cheat
         # cancel the packet and leaves the server's destroy state armed.
-        early = predicted is not None and release + 0.05 < predicted
+        early = (
+            predicted is not None
+            and release + EARLY_RELEASE_TOLERANCE < predicted
+        )
 
         # Vanilla will not start the next dig until five ticks after a block
         # breaks; going straight on is what anti-cheat calls a fast break.  The
@@ -1053,7 +1061,7 @@ class Actions:
         aim: bool = True,
         tick: bool = True,
         await_confirm: bool = True,
-        confirm_timeout: float = 0.75,
+        confirm_timeout: float = CONFIRM_TIMEOUT_SECONDS,
     ) -> ActionResult:
         """Place the held block *into* ``position``.
 
@@ -1242,7 +1250,7 @@ class Actions:
     async def dig_looked_at(
         self,
         *,
-        max_distance: float = 4.5,
+        max_distance: float = BLOCK_INTERACTION_RANGE,
         **kwargs,
     ) -> ActionResult:
         """Dig whatever the player is currently aiming at."""

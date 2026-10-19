@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from .auth import PlayerCertificate
 
+from .constants import ANTI_KICK_WIRE_OFFSET, VANILLA_ROTATION_EPSILON_SQUARED
+from .constants import MIN_TICK_GAP as _MIN_TICK_GAP
 from .errors import (
     ConnectionClosed,
     LoginRejected,
@@ -32,6 +34,7 @@ from .errors import (
 from .events import EventBus
 from .log import debug as log_debug
 from .log import error as log_error
+from .log import trace as log_trace
 from .log import warn as log_warn
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .navigation import (
@@ -366,7 +369,8 @@ _MAX_CONTAINER_SLOTS = 1024
 #: moves once per 20 Hz tick, and anti-cheat timer checks measure exactly that:
 #: Grim's Timer adds 50 ms per movement packet and flags a client that runs
 #: ahead of real time.  Bursts (aim right after a position packet) have to wait.
-MIN_TICK_GAP = 0.05
+#: See ``protobot.constants`` for the value and the rest of the tuning knobs.
+MIN_TICK_GAP = _MIN_TICK_GAP
 
 
 class _UnsupportedEntityMetadata(Exception):
@@ -439,10 +443,15 @@ class Bot:
         block_state_table: str | None = None,
         physics_engine: PhysicsEngine | None = None,
         physics_attributes: PhysicsAttributes | None = None,
-        vclip: bool = True,
+        # These two emulate a cheat client, not a vanilla one: ``vclip`` lets the
+        # planner route through solid blocks, and ``anti_kick`` writes a
+        # synthetic position into periodic movement packets.  Both are off by
+        # default; a bot that turns them on is telling the server something that
+        # did not happen and will be flagged wherever an anti-cheat is running.
+        vclip: bool = False,
         vclip_up_limit: float = 3.0,
         vclip_down_limit: float = 2.0,
-        anti_kick: bool = True,
+        anti_kick: bool = False,
         anti_kick_interval: float = 1.0,
     ) -> None:
         if not 1 <= len(username) <= 16:
@@ -833,11 +842,12 @@ class Bot:
     async def send_raw(self, packet_id: int, payload: bytes = b"") -> None:
         """Send a packet in the current state for advanced protocol use."""
         if _TRACE_SEND:
-            print(
+            # ``log_trace`` is the one place traces can be switched off; the
+            # environment variable only decides whether we build the string.
+            log_trace(
                 f"[send] {time.time():.4f}"
                 f" {_serverbound_name(self.version.packets, packet_id)}"
-                f" {len(payload)}B",
-                flush=True,
+                f" {len(payload)}B"
             )
         await self._connection.send_packet(packet_id, payload)
 
@@ -1176,11 +1186,17 @@ class Bot:
             # Repeating it is what anti-cheat flags as "sent duplicate slot id"
             # (Grim's BadPacketsA), and the server learns nothing from it.
             return
+        # The switch belongs to a tick: vanilla sends it with the input of the
+        # tick it happened in, right before that tick's movement packet.  A
+        # carried-item packet that sits alone until some later tick is what
+        # Grim's Post check flags ("held item change"), so flush it here.
+        await self.wait_tick_budget()
         await self.send_raw(
             self.version.packets.serverbound_set_carried_item,
             PacketWriter().write_short(slot).to_bytes(),
         )
         self.player.selected_hotbar_slot = slot
+        await self.tick()
 
     async def set_hotbar_slot(self, slot: int) -> None:
         """Alias for :meth:`select_hotbar_slot` used by inventory clients."""
@@ -1565,11 +1581,10 @@ class Bot:
         await self._begin_tick_packet()
         if _TRACE_SEND:
             state = self.physics_state
-            print(
+            log_trace(
                 f"[pos] {time.time():.4f} y={state.position.y:.4f}"
                 f" ground={int(bool(self.player.on_ground))}"
-                f" vy={state.velocity.y:.4f}",
-                flush=True,
+                f" vy={state.velocity.y:.4f}"
             )
         await self.send_raw(packet_id, payload)
 
@@ -1857,8 +1872,8 @@ class Bot:
             # immediately after flight starts, which can trigger strict
             # movement checks before the server has accepted the flight state.
             self._next_anti_kick = now + self.anti_kick_interval
-        elif current_y >= last_y or last_y - current_y < 0.03130:
-            packet_y = last_y - 0.03130
+        elif current_y >= last_y or last_y - current_y < ANTI_KICK_WIRE_OFFSET:
+            packet_y = last_y - ANTI_KICK_WIRE_OFFSET
         else:
             self._anti_kick_last_packet_y = current_y
         candidate = body.move(0.0, packet_y - current_y, 0.0)
@@ -1932,7 +1947,10 @@ class Bot:
             return False
         yaw_delta = yaw - self._last_sent_yaw
         pitch_delta = pitch - self._last_sent_pitch
-        return yaw_delta * yaw_delta + pitch_delta * pitch_delta <= 9.0e-6
+        return (
+            yaw_delta * yaw_delta + pitch_delta * pitch_delta
+            <= VANILLA_ROTATION_EPSILON_SQUARED
+        )
 
     async def end_tick(self) -> None:
         self._require_play()
@@ -2157,7 +2175,10 @@ class Bot:
                 # check flags.  Drop this tick's movement: the next tick starts
                 # from the teleported state, and the tick itself still ends.
                 if _TRACE_SEND:
-                    print(f"[tick] {time.monotonic():.3f} dropped movement (teleport race)", flush=True)
+                    log_trace(
+                        f"[tick] {time.monotonic():.3f} dropped movement"
+                        " (teleport race)"
+                    )
                 self._trace_position(controls)
                 await self.end_tick()
                 return self.physics_state
@@ -2238,14 +2259,11 @@ class Bot:
             if asyncio.get_running_loop().time() >= deadline:
                 raise TimeoutError("walk_to did not reach its target before timeout")
             state.yaw = math.degrees(math.atan2(-dx, dz))
-            # ``tick`` sends a position-only packet.  Vanilla movement input is
-            # interpreted using the server's current yaw, so advertise the new
-            # heading before advancing the local trajectory; otherwise a target
-            # that is not straight ahead would be simulated locally but moved in
-            # a different direction by the server.
-            await self.send_look(state.yaw, state.pitch)
+            # ``tick`` carries the new heading in the same movement packet as
+            # the step (see the ``turned`` branch there).  Sending a look packet
+            # first would be a second movement packet in the same tick, and the
+            # server would predict one step over two ticks.
             await self.tick(MovementInput(forward=1.0, sprint=sprint))
-            await asyncio.sleep(0.05)
 
     def plan_path(
         self,
@@ -3229,10 +3247,9 @@ class Bot:
                 packet = await self._connection.receive_packet(self.state)
                 await self.events.emit("packet", packet)
                 if _TRACE_RECV:
-                    print(
+                    log_trace(
                         f"[recv] {_clientbound_name(self.version.packets, packet.packet_id)}"
-                        f" {len(packet.payload)}B",
-                        flush=True,
+                        f" {len(packet.payload)}B"
                     )
                 await self.events.emit(f"packet:{self.state.value}:{packet.packet_id}", packet)
                 if self.state is ConnectionState.LOGIN:
@@ -5337,13 +5354,12 @@ class Bot:
         reader.expect_end()
         if _TRACE_POS:
             local = self.physics_state.position
-            print(
+            log_trace(
                 f"[tp] t={time.monotonic():.3f} id={teleport_id}"
                 f" pos=({values[0]:.4f},{values[1]:.4f},{values[2]:.4f})"
                 f" vel=({values[3]:.4f},{values[4]:.4f},{values[5]:.4f})"
                 f" rot=({packet_yaw:.3f},{packet_pitch:.3f}) rel=0x{relative:x}"
-                f" local=({local.x:.4f},{local.y:.4f},{local.z:.4f})",
-                flush=True,
+                f" local=({local.x:.4f},{local.y:.4f},{local.z:.4f})"
             )
 
         position = values[:3]
@@ -5523,10 +5539,11 @@ async def connect(
     block_state_table: str | None = None,
     physics_engine: PhysicsEngine | None = None,
     physics_attributes: PhysicsAttributes | None = None,
-    vclip: bool = True,
+    # Cheat emulation, off by default: see the note on ``Bot.__init__``.
+    vclip: bool = False,
     vclip_up_limit: float = 3.0,
     vclip_down_limit: float = 2.0,
-    anti_kick: bool = True,
+    anti_kick: bool = False,
     anti_kick_interval: float = 1.0,
 ) -> Bot:
     """Connect a bot (offline or online) and return it after the initial spawn position."""

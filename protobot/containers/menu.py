@@ -27,6 +27,9 @@ import math
 from typing import TYPE_CHECKING, Iterable, Mapping
 
 from ..actions import BlockFace
+from ..constants import CLICK_TIMEOUT_SECONDS
+from ..constants import POLL_SECONDS as _POLL_SECONDS
+from ..constants import QUIET_SECONDS as _QUIET_SECONDS
 from ..physics import Vec3
 from ..protocol.items import normalise_identifier
 from ..state import ContainerState, ItemStack
@@ -50,8 +53,10 @@ CLICK_MODES = {
     "quick_craft_all": 6,
 }
 
-#: How long a click may take to come back from the server.
-DEFAULT_CLICK_TIMEOUT = 1.0
+#: How long a click may take to come back from the server.  The values of the
+#: pacing knobs live in :mod:protobot.constants; the names stay here because the
+#: timing code reads them as module globals (tests patch them).
+DEFAULT_CLICK_TIMEOUT = CLICK_TIMEOUT_SECONDS
 
 #: How long the window has to stay unchanged before a click is considered
 #: finished.  A click produces several ``container_set_slot`` packets (the
@@ -60,11 +65,11 @@ DEFAULT_CLICK_TIMEOUT = 1.0
 #: Sending the next click while the previous one is still trickling in makes the
 #: local model lag one click behind, and a stale ``state_id`` then makes the
 #: server answer every click with a full resync.
-QUIET_SECONDS = 0.05
+QUIET_SECONDS = _QUIET_SECONDS
 
 #: Poll interval for the quiet detector; small enough not to add latency of its
 #: own, large enough not to spin.
-POLL_SECONDS = 0.005
+POLL_SECONDS = _POLL_SECONDS
 
 #: Assumed maximum stack size when picking a target slot.  The server has the
 #: final word: an over-full target simply does not accept the item, and the
