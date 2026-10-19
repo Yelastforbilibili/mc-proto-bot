@@ -85,10 +85,10 @@ def load_session_config(data: dict) -> SessionConfig:
         reconnect_delay=float(_get(session, "reconnect_delay", 5.0)),
         reconnect_max_attempts=_get(session, "reconnect_max_attempts", None),
         connect_timeout=float(_get(session, "connect_timeout", 30.0)),
-        vclip=bool(_get(navigation, "vclip", True)),
+        vclip=bool(_get(navigation, "vclip", False)),
         vclip_up_limit=float(_get(navigation, "vclip_up_limit", 3.0)),
         vclip_down_limit=float(_get(navigation, "vclip_down_limit", 2.0)),
-        anti_kick=bool(_get(navigation, "anti_kick", True)),
+        anti_kick=bool(_get(navigation, "anti_kick", False)),
         anti_kick_interval=float(_get(navigation, "anti_kick_interval", 1.0)),
     )
 
@@ -374,10 +374,10 @@ async def run_setup(config_path: Path) -> int:
             "reconnect_max_attempts": None,
         },
         "navigation": {
-            "vclip": True,
+            "vclip": False,
             "vclip_up_limit": 3.0,
             "vclip_down_limit": 2.0,
-            "anti_kick": True,
+            "anti_kick": False,
             "anti_kick_interval": 1.0,
         },
         "plugins": {"directory": "plugins", "disabled": [], "watch": True},

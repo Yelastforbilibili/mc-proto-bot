@@ -60,7 +60,6 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from pathlib import Path
 
 from protobot import Plugin, PluginSettings, log
 from protobot.protocol import PacketReader

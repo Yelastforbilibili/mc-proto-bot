@@ -24,7 +24,6 @@ from dataclasses import replace
 from typing import TYPE_CHECKING
 
 from ..constants import (
-    AIM_INSIDE_OFFSET,
     BLOCK_INTERACTION_RANGE,
     BREAK_COOLDOWN_SECONDS,
     CONFIRM_TIMEOUT_SECONDS,

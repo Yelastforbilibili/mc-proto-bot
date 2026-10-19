@@ -428,8 +428,10 @@ and the attempt that failed, and every layer emits events on `bot.events`
 (`action`, `goal_start`/`goal_done`, `task_start`/`task_step`/`task_done`).
 
 See [`docs/automation.md`](docs/automation.md) for the contracts and how to add a
-goal, and [`docs/protocol-verification.md`](docs/protocol-verification.md) for how
-the per-release payloads were verified.
+goal, [`docs/architecture.md`](docs/architecture.md) for how the bot itself is
+split into concerns and which one a new packet handler belongs to, and
+[`docs/protocol-verification.md`](docs/protocol-verification.md) for how the
+per-release payloads were verified.
 
 ## Bot CLI and plugin system
 

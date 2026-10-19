@@ -380,8 +380,9 @@ if not report.ok:
 尝试失败；每层都会在 `bot.events` 上发事件（`action`、`goal_start`/`goal_done`、
 `task_start`/`task_step`/`task_done`）。
 
-契约与自定义目标的写法见 [`docs/automation.md`](docs/automation.md)，各发布版数据包
-的验证过程见 [`docs/protocol-verification.md`](docs/protocol-verification.md)。
+契约与自定义目标的写法见 [`docs/automation.md`](docs/automation.md)，机器人本身如何按关注点
+拆分、新数据包处理器该放哪一层的见 [`docs/architecture.md`](docs/architecture.md)，
+各发布版数据包的验证过程见 [`docs/protocol-verification.md`](docs/protocol-verification.md)。
 
 ## 机器人 CLI 与插件系统
 

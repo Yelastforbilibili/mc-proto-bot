@@ -501,7 +501,7 @@ class FlightPathfinder:
         player_width: float = 0.6,
         player_height: float = 1.8,
         allow_diagonal: bool = True,
-        vclip: bool = True,
+        vclip: bool = False,
         vclip_up_limit: float = 3.0,
         vclip_down_limit: float = 2.0,
     ) -> None:

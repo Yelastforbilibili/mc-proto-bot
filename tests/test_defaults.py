@@ -1,4 +1,4 @@
-"""The tuning knobs live in one place, and the cheat emulation stays off.
+﻿"""The tuning knobs live in one place, and the cheat emulation stays off.
 
 These are defaults with a reason, so they get a test rather than a comment:
 somebody flipping one of them should see a red test that names the promise it
@@ -15,6 +15,8 @@ from protobot.actions import interactions
 from protobot.client import Bot, connect
 from protobot.containers import menu
 from protobot.goals import travel
+from protobot.navigation import FlightPathfinder
+from protobot.session import SessionConfig
 
 
 class ConstantsTests(unittest.TestCase):
@@ -63,6 +65,17 @@ class CheatDefaultsTests(unittest.TestCase):
         parameters = inspect.signature(Bot.__init__).parameters
         self.assertFalse(parameters["vclip"].default)
         self.assertFalse(parameters["anti_kick"].default)
+
+    def test_a_session_does_not_turn_the_cheats_back_on(self) -> None:
+        # ``SessionConfig`` is what the CLI builds, so a cheat that is off in
+        # ``Bot`` but on here would come back on the moment anyone used the CLI.
+        config = SessionConfig(host="127.0.0.1")
+        self.assertFalse(config.vclip)
+        self.assertFalse(config.anti_kick)
+
+    def test_the_flight_planner_does_not_vclip_by_default(self) -> None:
+        parameters = inspect.signature(FlightPathfinder.__init__).parameters
+        self.assertFalse(parameters["vclip"].default)
 
     def test_anti_kick_offset_is_documented_in_one_place(self) -> None:
         self.assertAlmostEqual(constants.ANTI_KICK_WIRE_OFFSET, 0.0313, places=6)

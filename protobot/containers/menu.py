@@ -24,7 +24,10 @@ from __future__ import annotations
 
 import asyncio
 import math
-from typing import TYPE_CHECKING, Iterable, Mapping
+from typing import (
+    TYPE_CHECKING,
+    Mapping,
+)
 
 from ..actions import BlockFace
 from ..constants import CLICK_TIMEOUT_SECONDS

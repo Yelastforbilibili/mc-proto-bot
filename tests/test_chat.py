@@ -142,8 +142,10 @@ class ChatAcknowledgementTests(unittest.IsolatedAsyncioTestCase):
             sent.append((packet_id, payload))
 
         bot.send_raw = capture  # type: ignore[method-assign]
-        with patch("protobot.client.time.time", return_value=1_700_000_000.125), patch(
-            "protobot.client.secrets.randbits", return_value=0x0102030405060708
+        # ``send_message`` lives in the connection concern, so the clock and the
+        # salt are patched where that code looks them up.
+        with patch("protobot.connection.time.time", return_value=1_700_000_000.125), patch(
+            "protobot.connection.secrets.randbits", return_value=0x0102030405060708
         ):
             await bot.send_message("signed")
 

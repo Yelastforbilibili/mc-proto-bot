@@ -42,10 +42,12 @@ class SessionConfig:
     reconnect_delay: float = 5.0  # seconds between attempts
     reconnect_max_attempts: int | None = None  # None = reconnect forever
     connect_timeout: float = 30.0  # passed to connect(timeout=...)
-    vclip: bool = True
+    # Cheat emulation is opt-in: it tells the server about movement that never
+    # happened, which is the opposite of what this library is for.
+    vclip: bool = False
     vclip_up_limit: float = 3.0
     vclip_down_limit: float = 2.0
-    anti_kick: bool = True
+    anti_kick: bool = False
     anti_kick_interval: float = 1.0
 
     def __post_init__(self) -> None:
