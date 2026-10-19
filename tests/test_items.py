@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from protobot.protocol.items import (
-    DATA_DIRECTORY,
     ItemTable,
     bundled_path,
     clear_cache,

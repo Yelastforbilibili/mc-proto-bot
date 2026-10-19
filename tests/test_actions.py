@@ -16,7 +16,6 @@ from protobot.actions import (
     ActionStatus,
     Actions,
     BlockFace,
-    EntityHit,
     UnsupportedAction,
     entity_bounds,
     look_angles,

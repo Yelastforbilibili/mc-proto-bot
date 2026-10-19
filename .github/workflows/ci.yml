@@ -1,0 +1,41 @@
+name: ci
+
+# Everything that can fail without a Minecraft server.  The in-game acceptance
+# suite is deliberately not here: it needs a Paper server, a server-side plugin
+# and an anti-cheat, so it runs through tools/ci_local.ps1 -Live on a machine
+# that has them (see docs/acceptance-suite.md).
+
+on:
+  push:
+    branches: ["main"]
+    tags-ignore: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: checks (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The library has no runtime dependencies, so there is nothing to install.
+      - name: Byte-compile
+        run: python -m compileall -q protobot tools tests
+
+      - name: Import hygiene
+        run: python tools/check_imports.py
+
+      - name: Unit tests
+        # -b buffers test output, so a green run is one block of dots.
+        run: python -m unittest discover -s tests -t . -p "test_*.py" -b

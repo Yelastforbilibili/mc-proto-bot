@@ -23,7 +23,7 @@ import re
 import sys
 from typing import Any
 
-from live_chest import _bridge, _command, _nbt, _place_chest, _unwrap
+from live_chest import _command, _nbt, _place_chest
 from protobot import connect
 
 DEFAULT_HOST = "127.0.0.1"

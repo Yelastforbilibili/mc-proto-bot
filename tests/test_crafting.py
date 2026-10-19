@@ -21,7 +21,7 @@ from protobot.crafting import Recipe, recipe_for
 from protobot.crafting.recipes import RECIPES, WOOD_RECIPES
 from protobot.events import EventBus
 from protobot.goals import CraftGoal, GoalRunner
-from protobot.goals.base import GoalError, GoalStatus
+from protobot.goals.base import GoalStatus
 from protobot.state import ItemStack
 
 # The fake windows below answer a click synchronously; the settle window that

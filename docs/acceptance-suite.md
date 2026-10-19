@@ -23,6 +23,23 @@ python tools/live_suite.py --run all
 Options: `--host --port --username --bridge --world --x --y --z` and `--list`
 (print the numbered scenarios without connecting).
 
+With `--run`, the last thing printed is a table with one row per scenario and
+the wall time it took, then the totals:
+
+```
+[suite] results
+  ✓ # 1    1.4s  dig/place·one block dug
+  ✓ # 2    1.1s  dig/place·one block placed
+  ...
+  ✗ #13   19.1s  navigation·far travel  (AssertionError: …)
+[suite] 22/23 passed in 231.2s
+[suite] no anti-cheat alerts
+```
+
+`tools/ci_local.ps1 -Live` runs the same thing as the last step of local CI, so
+the scenario table ends up next to the unit-test result instead of in a separate
+terminal.
+
 Then, in game chat as **any** player:
 
 | Say | What happens |
@@ -67,9 +84,27 @@ to a spam counter per message and removes one per tick, kicking above 200.
 ## How a scenario is isolated
 
 `Suite.reset()` runs before every scenario: close the window, clear the
-inventory, kill tagged mobs **and dropped items**, teleport back to the anchor.
-Dropped items matter: leftovers from an earlier scenario fly into the inventory
-as soon as the bot walks over them, which turns "dug three logs" into six.
+inventory, put the craft grid and the cursor back, kill tagged mobs **and
+dropped items**, wipe the plot, and teleport back to the anchor.
+
+Four of those are worth spelling out, because each one cost a debugging session:
+
+* **Every non-player entity within 16 blocks is killed**, not just the tagged
+  ones. A cow from the combat scenario wandered into the next scenario's
+  crosshair; a villager left a window open; a boat sat where the next structure
+  went. `execute positioned <anchor> run kill @e[type=!minecraft:player,distance=..16]`.
+* **The floor is put back** (`fill … grass_block` one layer below the anchor)
+  and everything above it is wiped, so a probe script or a failed run cannot
+  leave a stray block that changes what the next scenario is standing on.
+* **Time and weather are reset** (`time set day`, `weather clear`): a scenario
+  that waits for dusk and dies early would otherwise leave the next one in the
+  dark.
+* **The hotbar selection goes back to slot 0**, so "hold the pickaxe" starts from
+  a known slot rather than whatever the last scenario left behind.
+
+Dropped items matter most: leftovers from an earlier scenario fly into the
+inventory as soon as the bot walks over them, which turns "dug three logs" into
+six.
 
 Each scenario builds its own scene with commands (`setblock`, `summon`, `give`,
 `item replace`), then checks the server:
@@ -134,11 +169,16 @@ bot.events.on("death", suite.on_death)   # wires the same handler as live_suite.
 ## The result this document is written against
 
 ```
-python tools/live_suite.py --version 26.3 \
-    --server-log ..\Test26.3Server\logs\latest.log --run all
-[suite] 23/23 passed
-[suite] no anti-cheat alerts
+powershell -File .\tools\ci_local.ps1 -Live
+== summary
+  ok    byte-compile (protobot, tools, tests)           0.2s
+  ok    import hygiene (tools\check_imports.py)         0.5s
+  ok    unit tests (no server, no network)             44.3s
+  ok    acceptance suite (23 cases, GrimAC on)        232.7s
+  total 277.7s
+  all steps passed
 ```
 
-301 unit tests plus the 23 live scenarios; GrimAC 2.x with
-`alerts.print-to-console: true`, `experimental-checks: false`.
+316 unit tests plus the 23 live scenarios (`[suite] 23/23 passed`,
+`[suite] no anti-cheat alerts`); GrimAC 2.x with `alerts.print-to-console: true`,
+`experimental-checks: false`.

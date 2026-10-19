@@ -32,6 +32,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
 - **诊断 CLI**——针对本地服务器的在线回归检查与移动轨迹采集。
 - **游戏内验收套件**——`tools/live_suite.py` 在真服上自建场景，提供 23 个编号测试（挖掘、放置、全部容器、合成、导航、战斗、工具、带组件物品，以及三个混合端到端任务），任意玩家在聊天框发数字即可触发；每项判定都向服务端求证（`data get`），而不是看 bot 自己的模型。套件还会读服务端日志，任何一项触发了反作弊告警就算失败。见 [docs/acceptance-suite.md](docs/acceptance-suite.md) 与 [docs/anti-cheat.md](docs/anti-cheat.md)。
+- **一条命令跑完检查**——`.\tools\ci_local.ps1` 依次跑字节编译、import 卫生检查和单测（加 `-Live` 会再追加 23 项游戏内测试），结束时打印汇总表，任一环节失败就以非零退出码结束；`.github/workflows/ci.yml` 在每次 push 上跑同样的无服务器环节（Python 3.12 与 3.13）。
 
 ## 安装
 

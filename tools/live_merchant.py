@@ -33,7 +33,7 @@ from protobot import connect
 from protobot.containers import layout_for
 from protobot.physics import Vec3
 
-from live_chest import _bridge, _command, _nbt, _unwrap, _wait_inventory
+from live_chest import _command, _nbt, _wait_inventory
 
 OFFER = (
     '{VillagerData:{profession:"minecraft:farmer",level:2},'

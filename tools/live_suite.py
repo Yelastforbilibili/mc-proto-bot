@@ -31,11 +31,11 @@ import time
 import traceback
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from protobot import connect
-from protobot.actions import ActionStatus, BlockFace
+from protobot.actions import ActionStatus
 from protobot.constants import IDLE_TICK_SECONDS
 from protobot.crafting import recipe_for
 from protobot.goals import CraftGoal, GoalStatus, TravelGoal
@@ -353,6 +353,8 @@ class Suite:
         self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
         self.busy = False
         self.stop_requested = False
+        # One row per scenario that ran: case, passed, seconds, detail.
+        self.results: list[tuple[Case, bool, float, str]] = []
         self.own_uuid = getattr(bot, "uuid", None)
         self.username = getattr(bot, "username", "SuiteBot")
         self.last_said = 0.0
@@ -732,17 +734,41 @@ class Suite:
         # inventory the moment the bot walks over them, which makes "dig three
         # logs" read as six.
         self.command("kill @e[type=minecraft:item]")
-        # Scenarios build small structures, and a probe script or a failed run
-        # can leave blocks behind.  Wipe the plot above the floor so every run
-        # starts from the same flat ground.
         ax, ay, az = self.anchor
+        # Anything else a scenario spawned outlives it: a cow wanders into the
+        # crosshair of the next scenario, a villager re-opens a window, a boat
+        # sits where the next structure goes.  Only players are spared.
+        self.command(
+            f"execute positioned {ax} {ay} {az} run kill"
+            " @e[type=!minecraft:player,distance=..16]"
+        )
+        # Scenarios build small structures, and a probe script or a failed run
+        # can leave blocks behind.  Put the floor back and wipe everything above
+        # it, so every scenario starts from the same flat ground.
         if not os.environ.get("SUITE_NO_WIPE"):
+            self.command(
+                f"fill {ax - 12} {ay - 1} {az - 12} {ax + 12} {ay - 1} {az + 12}"
+                " minecraft:grass_block"
+            )
             self.command(
                 f"fill {ax - 12} {ay} {az - 12} {ax + 12} {ay + 5} {az + 12} minecraft:air"
             )
+        # Time and weather are scene state too: a scenario that waits for dusk
+        # and dies early would otherwise leave the next one in the dark.
+        self.command("time set day")
+        self.command("weather clear")
+        await self.select_slot(0)
         await self.teleport(
             (self.anchor[0] + 0.5, float(self.anchor[1]), self.anchor[2] + 0.5)
         )
+
+    async def select_slot(self, index: int) -> None:
+        """Put the hotbar selection back where the next scenario expects it."""
+
+        try:
+            await self.bot.select_hotbar_slot(index)
+        except Exception:
+            pass
 
     async def wait_entity(
         self,
@@ -978,7 +1004,7 @@ class Suite:
             await asyncio.sleep(0.02)
             try:
                 behind = time.monotonic() - (self.bot._last_tick_packet_time or 0.0)
-                if behind > 0.075:
+                if behind > IDLE_TICK_SECONDS:
                     await self.bot.tick()
             except asyncio.CancelledError:
                 raise
@@ -1015,6 +1041,7 @@ class Suite:
             await self.say(f"[#{item.number}] ✗ {item.title}：{detail} ({elapsed:.1f}s)")
             print(f"[{item.number}] failure: {detail}", flush=True)
         self.busy = False
+        self.results.append((item, outcome == "PASS", elapsed, detail))
         return outcome == "PASS"
 
     async def run_all(self) -> None:
@@ -1909,7 +1936,20 @@ async def main_async(args: argparse.Namespace) -> int:
                 ok = await suite.run_case(item)
                 if not ok:
                     failures += 1
-            print(f"[suite] {len(wanted) - failures}/{len(wanted)} passed", flush=True)
+            print("", flush=True)
+            print("[suite] results", flush=True)
+            for item, passed, seconds, detail in suite.results:
+                mark = "✓" if passed else "✗"
+                line = (
+                    f"  {mark} #{item.number:>2} {seconds:6.1f}s"
+                    f"  {item.category}·{item.title}"
+                )
+                if detail:
+                    line += f"  ({detail})"
+                print(line, flush=True)
+            total = sum(row[2] for row in suite.results)
+            print(f"[suite] {len(wanted) - failures}/{len(wanted)} passed"
+                  f" in {total:.1f}s", flush=True)
             alerts = suite.anti_cheat_lines()
             if alerts:
                 print(f"[suite] anti-cheat alerts: {len(alerts)}", flush=True)

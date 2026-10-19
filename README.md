@@ -32,6 +32,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
 - **Diagnostic CLI** — live regression checks and movement traces against a local server.
 - **In-game acceptance suite** — `tools/live_suite.py` builds its own scenes on a real server and runs 23 numbered scenarios (dig, place, every container, crafting, navigation, combat, tools, items with components, and three mixed end-to-end jobs) triggered from chat by any player typing a number; every check asks the server (`data get`) rather than the bot. The suite also reads the server log and fails a scenario that produced an anti-cheat alert. See [docs/acceptance-suite.md](docs/acceptance-suite.md) and [docs/anti-cheat.md](docs/anti-cheat.md).
+- **One command for the checks** — `.\tools\ci_local.ps1` runs byte-compilation, import hygiene and the unit suite (add `-Live` to append the 23 in-game scenarios) and prints a summary table with a non-zero exit code on failure; `.github/workflows/ci.yml` runs the same non-server gates on every push on Python 3.12 and 3.13.
 
 ## Installation
 

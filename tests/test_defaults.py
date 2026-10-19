@@ -1,4 +1,4 @@
-﻿"""The tuning knobs live in one place, and the cheat emulation stays off.
+"""The tuning knobs live in one place, and the cheat emulation stays off.
 
 These are defaults with a reason, so they get a test rather than a comment:
 somebody flipping one of them should see a red test that names the promise it
