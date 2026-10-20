@@ -30,7 +30,7 @@ from typing import (
 )
 
 from ..actions import BlockFace
-from ..constants import CLICK_TIMEOUT_SECONDS
+from ..constants import BLOCK_INTERACTION_RANGE, CLICK_TIMEOUT_SECONDS
 from ..constants import POLL_SECONDS as _POLL_SECONDS
 from ..constants import QUIET_SECONDS as _QUIET_SECONDS
 from ..physics import Vec3
@@ -148,6 +148,11 @@ class Menu:
     def __init__(self, bot, container_id: int | None = None) -> None:
         self.bot = bot
         self._container_id = container_id
+        #: Where the block that opened this menu stands, when it was a block.
+        #: ``live()`` uses it to notice a menu whose block was broken or
+        #: replaced while the window was open.
+        self.block_position: tuple[int, int, int] | None = None
+        self.block_identifier: str | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         try:
@@ -959,7 +964,12 @@ class Menu:
             face=face if face is not None else BlockFace.UP,
             cursor=cursor,
         )
-        return await self._wait_for_window(before, timeout=timeout)
+        menu = await self._wait_for_window(before, timeout=timeout)
+        # Remember what opened the window: ``live()`` re-reads this block to
+        # tell "still standing here" from "the block was broken or replaced".
+        menu.block_position = position
+        menu.block_identifier = self._block_identifier(x, y, z)
+        return menu
 
     async def open_entity(
         self,
@@ -974,6 +984,250 @@ class Menu:
         before = self._open_windows()
         await self.bot.actions.interact(entity_id, hand=hand, position=position)
         return await self._wait_for_window(before, timeout=timeout)
+
+    # -- specialised menus -----------------------------------------------
+    #
+    # Six menus are machines rather than storage: the enchanting table, the
+    # anvil, the grindstone, the loom, the smithing table and the stonecutter.
+    # They all share one shape -- put something into a named input slot, press
+    # a button or type a name, then take what the server produced out of the
+    # result slot -- so the helpers below are built from the same three parts.
+
+    def live(self, *, reach: float = BLOCK_INTERACTION_RANGE) -> None:
+        """Raise :class:`MenuNotOpen` when the window cannot be used any more.
+
+        Three things end a menu without the bot asking for it: the player dies,
+        the player walks away, and the block behind the menu gets broken or
+        replaced.  The server does close the window for the first two, but a
+        click sent into a window that is only half dead is a silent failure, so
+        check what the client already knows before clicking.
+        """
+
+        state = self.bot.containers.get(self.container_id)
+        if state is None or not state.is_open:
+            raise MenuNotOpen(
+                f"the server closed the window (container {self.container_id})"
+            )
+        player = self.bot.player
+        if getattr(player, "dead", False) or player.health <= 0.0:
+            raise MenuNotOpen("the player died while the window was open")
+        if self.block_position is None:
+            return
+        x, y, z = self.block_position
+        identifier = self._block_identifier(x, y, z)
+        if identifier != self.block_identifier:
+            raise MenuNotOpen(
+                f"the block at {self.block_position} is {identifier or 'gone'},"
+                f" not {self.block_identifier} any more"
+            )
+        position = self.bot.physics_state.position
+        gap = math.dist(
+            (x + 0.5, y + 0.5, z + 0.5), (position.x, position.y, position.z)
+        )
+        if gap > reach:
+            raise MenuNotOpen(
+                f"the player is {gap:.1f} blocks from {self.block_position},"
+                " so the server would refuse the menu"
+            )
+
+    def _block_identifier(self, x: int, y: int, z: int) -> str | None:
+        world = getattr(self.bot, "world", None)
+        registry = getattr(world, "block_states", None)
+        if world is None or registry is None:
+            return None
+        state_id = world.get_state_id(x, y, z)
+        if state_id is None or state_id < 0:
+            return None
+        try:
+            return getattr(registry.get(state_id), "name", None)
+        except Exception:  # pragma: no cover - a registry without a state
+            return None
+
+    async def button(self, index: int, *, timeout: float = 2.0) -> bool:
+        """Press a menu button: an enchant option, a stonecutter recipe, a pattern."""
+
+        self.live()
+        revision = self.state().slot_revision
+        await self.bot.click_container_button(index, container_id=self.container_id)
+        return await self.wait_for_update(revision, timeout=timeout)
+
+    async def rename(self, name: str, *, timeout: float = 2.0) -> bool:
+        """Type ``name`` into the anvil's name box and wait for the result slot."""
+
+        self.live()
+        revision = self.state().slot_revision
+        await self.bot.rename_container_item(name)
+        return await self.wait_for_update(revision, timeout=timeout)
+
+    async def _stock(
+        self, target: int | str, item: object, *, count: int = 1, timeout: float = 2.0
+    ) -> int:
+        """Move ``count`` of ``item`` from the player part into one menu slot."""
+
+        slot = self.layout.slot(target) if isinstance(target, str) else target
+        source = self.find(item, where="player", min_count=count)
+        if source is None:
+            raise ContainerError(
+                f"the inventory holds no {_identifier(item)} x{count} to put into"
+                f" slot {slot}"
+            )
+        moved = await self.move(source, slot, count=count, timeout=timeout)
+        if moved < count:
+            raise ClickRejected(
+                f"the server moved {moved} of {count} {_identifier(item)} into"
+                f" slot {slot}",
+                slot=slot,
+            )
+        return slot
+
+    async def _result(self, role: str = "result", *, timeout: float = 2.0) -> ItemStack:
+        """Take the produced stack out of the result slot and return it.
+
+        The slot can lag the button by a tick or two (the server recomputes the
+        output after it applies the click), so give it the full ``timeout``
+        before deciding that nothing was produced.
+        """
+
+        slot = self.layout.slot(role)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        produced = self.item(slot)
+        while produced.count <= 0 and loop.time() < deadline:
+            await asyncio.sleep(POLL_SECONDS)
+            produced = self.item(slot)
+        if produced.count <= 0:
+            raise ClickRejected(
+                f"the {role} slot is empty, so the server produced nothing", slot=slot
+            )
+        destination = self.free(None, where="player")
+        if destination is None:
+            raise ContainerError("the inventory has no free slot for the result")
+        moved = await self.move(slot, destination, timeout=timeout)
+        if moved <= 0:
+            raise ClickRejected(f"the server refused the {role} stack", slot=slot)
+        return self.item(destination)
+
+    async def enchant(
+        self,
+        item: object,
+        *,
+        lapis: bool = True,
+        option: int = 0,
+        timeout: float = 3.0,
+    ) -> ItemStack:
+        """Enchant ``item`` with one of the table's three offers, paying lapis.
+
+        Returns the stack as the server left it in the enchant slot, components
+        included -- which is the only place the actual enchantment shows up.
+        """
+
+        self.live()
+        if not 0 <= option <= 2:
+            raise ValueError("the enchanting table offers three options, 0 to 2")
+        slot = self.layout.slot("item")
+        holding = self.item(slot)
+        if holding.count and not _matches(holding, item):
+            raise ClickRejected(
+                f"the enchant slot already holds {holding.identifier}", slot=slot
+            )
+        if not holding.count:
+            await self._stock(slot, item, timeout=timeout)
+        if lapis:
+            lapis_slot = self.layout.slot("lapis")
+            if not self.item(lapis_slot).count:
+                await self._stock(lapis_slot, "minecraft:lapis_lazuli", timeout=timeout)
+        level = self.bot.player.experience_level
+        if not await self.button(option, timeout=timeout):
+            raise ClickRejected(
+                f"the table did not react to option {option}; the player is level"
+                f" {level} and the button is only live with enough levels and lapis",
+                slot=slot,
+            )
+        return self.item(slot)
+
+    async def anvil(
+        self,
+        item: object,
+        *,
+        material: object | None = None,
+        name: str | None = None,
+        timeout: float = 3.0,
+    ) -> ItemStack:
+        """Repair, combine or rename ``item`` and return the anvil's output."""
+
+        self.live()
+        first, second = self.layout.slots("input")
+        await self._stock(first, item, timeout=timeout)
+        if material is not None:
+            await self._stock(second, material, timeout=timeout)
+        if name is not None:
+            await self.rename(name, timeout=timeout)
+        return await self._result(timeout=timeout)
+
+    async def grindstone(
+        self, item: object, *, second: object | None = None, timeout: float = 3.0
+    ) -> ItemStack:
+        """Strip enchantments (and repair) on the grindstone."""
+
+        self.live()
+        first, other = self.layout.slots("input")
+        await self._stock(first, item, timeout=timeout)
+        if second is not None:
+            await self._stock(other, second, timeout=timeout)
+        return await self._result(timeout=timeout)
+
+    async def loom(
+        self,
+        banner: object,
+        *,
+        dye: object | None = None,
+        pattern_item: object | None = None,
+        pattern: int = 0,
+        timeout: float = 3.0,
+    ) -> ItemStack:
+        """Weave a pattern into ``banner``; ``pattern`` is the button to press."""
+
+        self.live()
+        await self._stock("banner", banner, timeout=timeout)
+        if dye is not None:
+            await self._stock("dye", dye, timeout=timeout)
+        if pattern_item is not None:
+            await self._stock("pattern", pattern_item, timeout=timeout)
+        if not await self.button(pattern, timeout=timeout):
+            raise ClickRejected(
+                f"the loom did not react to pattern {pattern}", slot=self.layout.slot("result")
+            )
+        return await self._result(timeout=timeout)
+
+    async def smithing(
+        self,
+        template: object,
+        base: object,
+        addition: object,
+        *,
+        timeout: float = 3.0,
+    ) -> ItemStack:
+        """Upgrade or trim ``base`` on the smithing table."""
+
+        self.live()
+        await self._stock("template", template, timeout=timeout)
+        await self._stock("base", base, timeout=timeout)
+        await self._stock("addition", addition, timeout=timeout)
+        return await self._result(timeout=timeout)
+
+    async def stonecutter(
+        self, item: object, *, recipe: int = 0, timeout: float = 3.0
+    ) -> ItemStack:
+        """Cut ``item`` into the shape behind button ``recipe``."""
+
+        self.live()
+        await self._stock("input", item, timeout=timeout)
+        if not await self.button(recipe, timeout=timeout):
+            raise ClickRejected(
+                f"the stonecutter did not react to recipe {recipe}",
+                slot=self.layout.slot("result"),
+            )
+        return await self._result(timeout=timeout)
 
     def _open_windows(self) -> set[int]:
         return {
@@ -1009,3 +1263,4 @@ def player_menu(bot) -> Menu:
     """The always-present player inventory window (container 0)."""
 
     return Menu(bot, PLAYER_CONTAINER_ID)
+

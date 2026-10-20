@@ -166,6 +166,12 @@ class PlayRouterMixin:
         elif ids.clientbound_set_health and packet.packet_id == ids.clientbound_set_health:
             await self._handle_set_health(packet.payload)
         elif (
+            ids.clientbound_set_experience
+            and packet.packet_id == ids.clientbound_set_experience
+        ):
+            self._handle_set_experience(packet.payload)
+            await self.events.emit("experience", self.player)
+        elif (
             ids.clientbound_player_info_update
             and packet.packet_id == ids.clientbound_player_info_update
         ):
@@ -1877,6 +1883,23 @@ class PlayRouterMixin:
         if health <= 0.0 and not self.player.dead:
             self.player.dead = True
             await self.events.emit("death", None)
+
+    def _handle_set_experience(self, payload: bytes) -> None:
+        """Mirror the experience bar, level and total the server reports.
+
+        Enchanting is gated on the level (``EnchantmentMenu`` refuses a button
+        whose cost is above it), so the library has to know the server's number
+        instead of tracking the XP it thinks it earned.
+        """
+
+        reader = PacketReader(payload)
+        progress = reader.read_float()
+        level = reader.read_varint()
+        total = reader.read_varint()
+        reader.expect_end()
+        self.player.experience_progress = progress
+        self.player.experience_level = level
+        self.player.experience_total = total
 
     async def _handle_player_combat_kill(self, payload: bytes) -> None:
         """Combat Death: the server telling the client to show the death

@@ -659,6 +659,21 @@ class MovementMixin:
         await self.send_raw(self.version.packets.serverbound_tick_end)
         self._position_sent_this_tick = False
 
+    async def close_tick(self) -> None:
+        """End the movement tick if one is still open.
+
+        Interactions are not movement packets, so they must not fall inside an
+        open tick: 26.3 marks a tick's end with ``client_tick_end``, and a
+        server (or an anti-cheat watching packet order) treats that marker as a
+        transaction.  An action sent after the movement packet but before its
+        end marker therefore looks like it arrived before the tick it belongs
+        to.  Closing first leaves the action in the gap between ticks, where
+        the next movement packet is what judges it.
+        """
+
+        if self.version.protocol >= 777 and self._position_sent_this_tick:
+            await self.end_tick()
+
     async def send_look(
         self,
         yaw: float,

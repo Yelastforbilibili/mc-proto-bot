@@ -422,6 +422,44 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin):
             writer.write_bool(True).write_raw(carried_item_data)
         await self.send_raw(self.version.packets.serverbound_container_click, writer.to_bytes())
 
+    async def click_container_button(
+        self, button: int, *, container_id: int | None = None
+    ) -> None:
+        """Press one of a menu's buttons.
+
+        Vanilla uses this for the three enchanting options, the stonecutter
+        recipe index and the loom pattern; the server validates the press
+        against the open menu, so the slot contents have to be in place first.
+        """
+
+        self._require_play()
+        if container_id is None:
+            active = self.active_container
+            if active is None:
+                raise RuntimeError("cannot press a menu button before the server opens one")
+            container_id = active.container_id
+        if not 0 <= button < (1 << 31):
+            raise ValueError("menu button must be a non-negative VarInt")
+        await self.send_raw(
+            self.version.packets.serverbound_container_button_click,
+            PacketWriter().write_varint(container_id).write_varint(button).to_bytes(),
+        )
+
+    async def rename_container_item(
+        self, name: str, *, container_id: int | None = None
+    ) -> None:
+        """Set the name in an anvil's (or smithing table's) text box."""
+
+        self._require_play()
+        if not isinstance(name, str):
+            raise TypeError("container item name must be a string")
+        if not name:
+            raise ValueError("an empty name clears the box; send the item name instead")
+        await self.send_raw(
+            self.version.packets.serverbound_rename_item,
+            PacketWriter().write_string(name).to_bytes(),
+        )
+
     async def close_container(self, container_id: int | None = None) -> None:
         """Ask the server to close the active container."""
 

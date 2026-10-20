@@ -25,14 +25,16 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **任务脚本层**——`bot.tasks` 把目标串成可重试的脚本：`Task` + `GoalStep`/`CallStep`/`WaitStep`，内置 `BreakBlocks`/`PlaceBlocks`；每步失败会写明是哪一步、第几次尝试，整条任务超时也记在报告里。
 - **容器交互层**——`bot.menu` 能打开服务端能开的任何界面（全部菜单类型，槽位布局由该版本的菜单注册表生成），并用真实点击搬东西：`deposit`、`withdraw`、`move`、`quick_move`、`swap_with_hotbar`、`throw`；每次点击都靠观察服务端的槽位更新来确认，而不是本地预测，进度条可按名字读（`data_value("cook_progress")`）。
 - **合成**——`bot.menu.craft(recipe)` 一格一格点满合成网格（背包里的 2×2，或目标自己走过去、右键打开工作台后的 3×3），取走产物再放回背包，所以 `CraftGoal` 可以直接说"八根木棍"，而服务端自己的背包就是证据；配方是显式描述（`Recipe`、`recipe_for`），不是爬来的配方库。
+- **会干活的机器，而不只是窗口**——需要按键或改名的界面都是一等公民：`enchant`（含附魔台选项序号）、`anvil`（改名或修复）、`grindstone`、`smithing`、`stonecutter`，另有原始的 `button(index)` 与 `rename(name)` 应付新出现的界面。`live()` 回答「用到一半失效」的三种原因——玩家死了、窗口被关、方块被拆或换掉——用 `MenuNotOpen` 指明是哪一种，脚本因此知道原因而不是卡住。见 `tools/live_suite.py` 的 24/25/27 号用例与 `tests/test_special_menus.py`。
+- **在游戏里看一个 bot**——`bot.register_as_bot()` 会发 `/botregister`，之后任意 op 用 `/see [名字]` 就能实时看它的槽位：要么开一个虚拟箱子（`/seepattern chest`），要么写进 op 自己的背包（`/seepattern inv`，`/see stop` 还回来）。实现在桥插件里，`GET /bots` 把会话暴露给测试，所以不用人工参与也能证明。见[桥仓库](https://github.com/Yelastforbilibili/mc-prototest-bridge)。
 - **带数据组件的物品**——受损的工具、附魔书、改过名的剑，末尾都是一段组件补丁，组件值没有长度前缀；解码器按该版本自己的组件 id（`protobot/data/components-*.json.gz`）精确跳过认得的组件（`damage`、`enchantments`、`custom_name`、`unbreakable` 等），认不得时宁可直接报"这一窗不可解"也不猜长度：真实测试里曾经把一瓶药水解成 `polished_sulfur_stairs`，后面每个槽位都错位。单栈包（光标、被点的槽位、玩家背包）则总是精确的，因为包尾就是它的长度。见 [docs/components.md](docs/components.md) 与 `tools/live_components.py`。
 - **硬度与工具选择**——硬度是协议里唯一不发包的方块属性，所以按版本单独发布（`protobot/data/breaking-*.json.gz`，由 `tools/gen_break_times.py` 从 minecraft-data 生成、再按名字对齐该版本自己的方块表）；`version.breaking.seconds("minecraft:stone", tool=...)` 给的是原版数值，`bot.actions.break_time(block)` 用当前手持物品算，`equip_tool`/`best_tool_for` 会挑热键栏里真正挖得动、而且最快的那把工具。`tools/live_tool.py` 在真服上验证：同样按住 0.4 秒，铁镐 0.45 秒挖掉石头，木镐只到 0.36 进度，服务端在松手后 0.7 秒才把它补完。
 - **模组加载器握手**——支持 Forge、NeoForge、Fabric 客户端模组声明，以及 Velocity modern forwarding。
 - **事件总线**——可订阅聊天、区块、实体、容器、血量/死亡、玩家加入/退出与原始数据包事件。
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
 - **诊断 CLI**——针对本地服务器的在线回归检查与移动轨迹采集。
-- **游戏内验收套件**——`tools/live_suite.py` 在真服上自建场景，提供 23 个编号测试（挖掘、放置、全部容器、合成、导航、战斗、工具、带组件物品，以及三个混合端到端任务），任意玩家在聊天框发数字即可触发；每项判定都向服务端求证（`data get`），而不是看 bot 自己的模型。套件还会读服务端日志，任何一项触发了反作弊告警就算失败。见 [docs/acceptance-suite.md](docs/acceptance-suite.md) 与 [docs/anti-cheat.md](docs/anti-cheat.md)。
-- **一条命令跑完检查**——`.\tools\ci_local.ps1` 依次跑字节编译、import 卫生检查和单测（加 `-Live` 会再追加 23 项游戏内测试），结束时打印汇总表，任一环节失败就以非零退出码结束；`.github/workflows/ci.yml` 在每次 push 上跑同样的无服务器环节（Python 3.12 与 3.13）。
+- **游戏内验收套件**——`tools/live_suite.py` 在真服上自建场景，提供 27 个编号测试（挖掘、放置、全部容器、按键驱动的机器、附魔台、观看一个 bot、容器失效、合成、导航、战斗、工具、带组件物品，以及三个混合端到端任务），任意玩家在聊天框发数字即可触发；每项判定都向服务端求证（`data get`），而不是看 bot 自己的模型。套件还会读服务端日志，任何一项触发了反作弊告警就算失败。见 [docs/acceptance-suite.md](docs/acceptance-suite.md) 与 [docs/anti-cheat.md](docs/anti-cheat.md)。
+- **一条命令跑完检查**——`.\tools\ci_local.ps1` 依次跑字节编译、import 卫生检查和单测（加 `-Live` 会再追加 27 项游戏内测试），结束时打印汇总表，任一环节失败就以非零退出码结束；`.github/workflows/ci.yml` 在每次 push 上跑同样的无服务器环节（Python 3.12 与 3.13）。
 
 ## 安装
 

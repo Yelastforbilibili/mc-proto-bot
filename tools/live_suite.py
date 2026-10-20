@@ -37,6 +37,7 @@ from typing import Any, Awaitable, Callable
 from protobot import connect
 from protobot.actions import ActionStatus
 from protobot.constants import IDLE_TICK_SECONDS
+from protobot.containers import Menu, MenuNotOpen
 from protobot.crafting import recipe_for
 from protobot.goals import CraftGoal, GoalStatus, TravelGoal
 from protobot.physics import Vec3
@@ -303,9 +304,23 @@ def menu_lines() -> list[str]:
         categories.setdefault(item.category, []).append(item)
     parts = []
     for category, items in categories.items():
-        span = f"{items[0].number}-{items[-1].number}"
-        parts.append(f"{span} {category}")
-    lines = ["ProtoBot 验收套件 23 项：直接发数字 1-23 跑单项，0=菜单，all=全跑，stop=中止，?N=说明"]
+        # Contiguous runs, not "first-last": categories are interleaved once new
+        # cases are appended, and a span that swallows other categories lies.
+        runs: list[list[int]] = []
+        for item in items:
+            if runs and item.number == runs[-1][-1] + 1:
+                runs[-1].append(item.number)
+            else:
+                runs.append([item.number])
+        for run in runs:
+            span = f"{run[0]}" if len(run) == 1 else f"{run[0]}-{run[-1]}"
+            parts.append(f"{span} {category}")
+    first = CASES[0].number if CASES else 1
+    last = CASES[-1].number if CASES else 1
+    lines = [
+        f"ProtoBot 验收套件 {len(CASES)} 项：直接发数字 {first}-{last} 跑单项，"
+        "0=菜单，all=全跑，stop=中止，?N=说明"
+    ]
     rows = []
     current = ""
     for part in parts:
@@ -1747,23 +1762,33 @@ async def mixed_lumberjack(s: Suite) -> None:
             f" extra={result.extra}"
         )
     # Items only fly into the inventory within about a block.  The column
-    # leaves no hole, so the drops sit on the surface beside it and both sides
-    # are a plain walk on flat ground.
+    # leaves no hole, so the drops sit on the surface beside it; where exactly
+    # depends on the block's own spawn offset, so sweep a ring instead of
+    # trusting three guessed spots (a drop landing one block further used to
+    # leave the count at two).
     logs = 0
-    for collect in (
-        (column[0][0] - 0.5, column[0][2] + 0.5),
-        (column[0][0] + 1.5, column[0][2] + 0.5),
-        (column[0][0] + 0.5, column[0][2] + 1.5),
-    ):
+    ring: list[tuple[float, float]] = []
+    for radius in (1.5, 2.5):
+        for step in range(8):
+            angle = step * math.pi / 4.0
+            ring.append(
+                (
+                    column[0][0] + 0.5 + radius * math.cos(angle),
+                    column[0][2] + 0.5 + radius * math.sin(angle),
+                )
+            )
+    for collect in ring:
         try:
             await s.bot.navigate_to(
                 collect[0], collect[1], tolerance=0.5, timeout=20.0
             )
         except Exception:
             pass
-        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=8.0)
+        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=2.0)
         if logs >= 3:
             break
+    if logs < 3:
+        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=3.0)
     assert logs == 3, f"服务端背包 log={logs}"
     planks = await s.bot.goals.run(
         CraftGoal(recipe_for("minecraft:oak_planks"), times=3), timeout=90.0
@@ -1878,6 +1903,325 @@ async def mixed_expedition(s: Suite) -> None:
     await s.say(f"    往返 60 格 + {kills} 次攻击，回到 x={server[0]:.1f}，无常速告警")
 
 
+@case(24, "机器菜单", "机器菜单：切石/砂轮/铁砧/锻造", timeout=300.0)
+async def machine_menus(s: Suite) -> None:
+    menu = s.bot.menu
+
+    async def open_machine(dx: int, block: str) -> Menu:
+        spot = s.clear_spot(s.spot(dx, 0))
+        s.setblock(spot, block)
+        await s.wait_chunk(spot)
+        await s.settle(0.4)
+        window = await menu.open_block(spot)
+        names = {
+            "minecraft:enchanting_table": "minecraft:enchantment",
+            "minecraft:smithing_table": "minecraft:smithing",
+        }
+        expected = names.get(block, block)
+        await s.say(f"    {block} → {window.identifier} {window.slot_count} 格")
+        assert window.identifier == expected, f"{block} 打开了 {window.identifier}"
+        # Six clicks in a row, each with its own turn, otherwise end up close
+        # enough that one lands inside the next tick and is reported as a
+        # misordered placement.  A moment of ordinary ticking between windows
+        # keeps the packet stream looking like a player reading each menu.
+        await s.settle(0.25)
+        return window
+
+    async def wait_result(window: Menu, *, timeout: float = 3.0) -> None:
+        """Give the server a moment to fill the result slot after a button."""
+
+        slot = window.layout.slot("result")
+        deadline = time.monotonic() + timeout
+        while window.item(slot).count == 0 and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
+
+    # Every machine follows the same three steps, so each block below is
+    # "stock the inputs, press the button or type the name, take the result".
+    window = await open_machine(-3, "minecraft:stonecutter")
+    try:
+        s.give("minecraft:stone", 4)
+        await s.settle(0.5)
+        cut = await window.stonecutter("minecraft:stone", recipe=0)
+        assert cut.count > 0, "切石机没有产出"
+    finally:
+        await window.close()
+    await s.say(f"    切石机 → {cut.identifier} x{cut.count}")
+
+    window = await open_machine(-2, "minecraft:grindstone")
+    try:
+        s.give(
+            'minecraft:diamond_sword[minecraft:enchantments={"minecraft:sharpness":3}]',
+            1,
+        )
+        await s.settle(0.5)
+        polished = await window.grindstone("minecraft:diamond_sword")
+        assert polished.identifier == "minecraft:diamond_sword", polished.identifier
+    finally:
+        await window.close()
+    await s.say("    砂轮 → 附魔过的剑变回普通剑（服务端产物）")
+
+    window = await open_machine(-1, "minecraft:anvil")
+    try:
+        s.give("minecraft:iron_sword", 1)
+        await s.settle(0.5)
+        renamed = await window.anvil("minecraft:iron_sword", name="ProtoBlade")
+        assert renamed.identifier == "minecraft:iron_sword", renamed.identifier
+    finally:
+        await window.close()
+    await s.say("    铁砧 → 改名成功并取走产物")
+
+    window = await open_machine(0, "minecraft:smithing_table")
+    try:
+        s.give("minecraft:netherite_upgrade_smithing_template", 1)
+        s.give("minecraft:diamond_sword", 1)
+        s.give("minecraft:netherite_ingot", 1)
+        await s.settle(0.6)
+        upgraded = await window.smithing(
+            "minecraft:netherite_upgrade_smithing_template",
+            "minecraft:diamond_sword",
+            "minecraft:netherite_ingot",
+        )
+        assert upgraded.identifier == "minecraft:netherite_sword", upgraded.identifier
+    finally:
+        await window.close()
+    await s.say("    锻造台 → 钻石剑升级成下界合金剑")
+
+    # The loom and the enchanting table are wired through the same two
+    # primitives (button + result); their live scenes land in a follow-up case.
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(25, "容器失效", "容器失效：走远与方块被拆", timeout=120.0)
+async def machine_liveness(s: Suite) -> None:
+    spot = s.clear_spot(s.spot(2, 0))
+    s.setblock(spot, "minecraft:enchanting_table")
+    await s.wait_chunk(spot)
+    await s.settle(0.4)
+    window = await s.bot.menu.open_block(spot)
+    window.live()  # reachable and intact: the check must pass
+    # Walking away: the server closes the window, and even before that the
+    # library refuses to click a menu the player can no longer reach.  The walk
+    # goes through TravelGoal rather than a bare navigate_to: a long single-shot
+    # path leaves tick gaps that the server's movement prediction then flags.
+    goal = TravelGoal(
+        spot[0] + 12.5,
+        spot[2] + 0.5,
+        tolerance=1.0,
+        timeout=60.0,
+    )
+    outcome = await s.bot.goals.run(goal)
+    assert outcome.ok, f"没走到远处：{outcome}"
+    await s.settle(0.6)
+    with_raise = False
+    try:
+        window.live()
+    except MenuNotOpen as error:
+        with_raise = True
+        assert "blocks from" in str(error) or "closed the window" in str(error), error
+    assert with_raise, "走远之后容器仍然被当成可用"
+    await s.bot.navigate_to(spot[0] - 1.5, spot[2] + 0.5, timeout=20.0)
+    await s.settle(0.4)
+    # Breaking the block under a live window: the server sends the close packet.
+    window = await s.bot.menu.open_block(spot)
+    s.setblock(spot, "minecraft:air")
+    await s.settle(0.6)
+    menu_gone = False
+    try:
+        window.live()
+    except MenuNotOpen:
+        menu_gone = True
+    assert menu_gone, "方块被拆掉之后容器仍然被当成可用"
+    await s.say("    走远→拒绝点击；拆方块→窗口失效（两态都被拦住）")
+
+
+# ---------------------------------------------------------------------------
+# 10. watching a bot's inventory from the server plugin
+# ---------------------------------------------------------------------------
+
+
+def _menu_to_chest_slot(slot: int) -> int | None:
+    """The chest slot that holds the item the player menu keeps at ``slot``.
+
+    The bridge plugin copies the player inventory index for index (hotbar, main,
+    armour, offhand), while the protocol numbers the same slots differently
+    inside the player menu.  Slots the plugin does not mirror (the crafting
+    grid) map to ``None``.
+    """
+
+    if 36 <= slot <= 44:  # hotbar
+        return slot - 36
+    if 9 <= slot <= 35:  # main inventory
+        return slot
+    if 5 <= slot <= 8:  # armour: boots, leggings, chestplate, helmet
+        return 36 + (slot - 5)
+    if slot == 45:  # offhand
+        return 40
+    return None
+
+
+def _protocol_items(bot) -> dict[int, tuple[str, int]]:
+    """Slot -> (identifier, count) from the client's own view of its inventory."""
+
+    state = bot.containers.get(0)
+    items: dict[int, tuple[str, int]] = {}
+    for slot, stack in (getattr(state, "items", None) or {}).items():
+        if stack is not None and stack.count > 0:
+            items[slot] = (stack.identifier, stack.count)
+    return items
+
+
+def _open_view_window(bot) -> tuple[int, Any] | tuple[None, None]:
+    for container_id, state in bot.containers.items():
+        if container_id != 0 and state.is_open:
+            return container_id, state
+    return None, None
+
+
+def _mapped(items: dict[int, tuple[str, int]]) -> dict[int, tuple[str, int]]:
+    mapped: dict[int, tuple[str, int]] = {}
+    for slot, item in items.items():
+        chest = _menu_to_chest_slot(slot)
+        if chest is not None:
+            mapped[chest] = item
+    return mapped
+
+
+@case(26, "观看模式", "观看模式：/botregister 与 /see 的 chest/inv 两种视角", timeout=180.0)
+async def spectator_view(s: Suite) -> None:
+    """A second client is watched by this one through the bridge plugin.
+
+    The watched client registers itself with /botregister; this client becomes
+    op and uses /seepattern + /see.  Both patterns are checked against the
+    watched client's own view of its slots, so a wrong slot mapping cannot pass.
+    """
+
+    watched_name = "WatchedBot"
+    watched = await connect(
+        getattr(s.bot, "host", "127.0.0.1"),
+        port=int(getattr(s.bot, "port", 25565)),
+        username=watched_name,
+        version=s.bot.version.name,
+        timeout=30.0,
+    )
+    try:
+        for _ in range(600):
+            position = watched.physics_state.position
+            key = (math.floor(position.x) >> 4, math.floor(position.z) >> 4)
+            if watched.player.loaded and key in watched.world.chunks:
+                break
+            await watched.tick()
+        s.command(f"gamemode survival {watched_name}")
+        s.command(f"clear {watched_name}")
+        s.command(f"give {watched_name} minecraft:diamond 4")
+        s.command(f"give {watched_name} minecraft:bread 2")
+        await s.settle(1.2)
+        await watched.register_as_bot()
+        await s.settle(0.8)
+        listing = s.bridge.call("/bots")
+        assert watched_name in (listing.get("registered") or []), f"注册失败：{listing}"
+
+        s.command(f"op {s.username}")
+        s.clear_inventory()
+        await s.settle(0.4)
+
+        # -- chest pattern: a live virtual chest, closing it leaves the view --
+        await s.bot.send_command("seepattern chest")
+        await s.bot.send_command(f"see {watched_name}")
+        container_id, state = None, None
+        for _ in range(150):
+            container_id, state = _open_view_window(s.bot)
+            if container_id is not None:
+                break
+            await s.settle(0.1)
+        assert container_id is not None, "/see 之后没有打开箱子界面"
+        assert state.slot_count >= 45, f"窗口只有 {state.slot_count} 格：{state}"
+        shown = {
+            slot: (stack.identifier, stack.count)
+            for slot, stack in (state.items or {}).items()
+            if stack is not None and stack.count > 0 and slot < 45
+        }
+        expected = _mapped(_protocol_items(watched))
+        assert shown == expected, f"箱子视角与 bot 背包不一致：{shown} != {expected}"
+
+        # live: the window follows the bot without reopening anything
+        s.command(f"give {watched_name} minecraft:emerald 1")
+        await s.settle(1.2)
+        fresh = _open_view_window(s.bot)[1]
+        shown = {
+            slot: (stack.identifier, stack.count)
+            for slot, stack in (fresh.items or {}).items()
+            if stack is not None and stack.count > 0 and slot < 45
+        }
+        expected = _mapped(_protocol_items(watched))
+        assert shown == expected, f"实时更新没跟上：{shown} != {expected}"
+
+        await s.bot.send_command("see stop")
+        await s.settle(0.8)
+        assert _open_view_window(s.bot)[0] is None, "/see stop 没有关掉箱子界面"
+        assert not (s.bridge.call("/bots").get("views") or []), "服务端还留着观看会话"
+
+        # -- inventory pattern: 1:1 into our own slots, closing does not exit --
+        await s.bot.send_command("seepattern inv")
+        await s.bot.send_command(f"see {watched_name}")
+        await s.settle(1.4)
+        mirrored = _protocol_items(s.bot)
+        source = _protocol_items(watched)
+        assert mirrored == source, f"原生背包视角不是 1:1：{mirrored} != {source}"
+        assert s.bridge.call("/bots").get("views"), "inv 模式的观看会话没有登记"
+        # In this pattern no window of ours is open, so opening and closing one's
+        # own inventory is a purely client-side gesture that sends no packet.
+        # The view therefore has to survive it: only /see stop may end it.
+        await s.settle(1.0)
+        assert s.bridge.call("/bots").get("views"), "什么都没做，观看会话却消失了"
+        await s.bot.send_command("see stop")
+        await s.settle(1.0)
+        assert _protocol_items(s.bot) == {}, f"/see stop 没有还原背包：{_protocol_items(s.bot)}"
+        await s.say("    chest 视角实时映射；inv 视角 1:1 且只有 /see stop 能退出")
+    finally:
+        try:
+            await s.bot.send_command("see stop")
+        except Exception:  # noqa: BLE001 - the connection may already be gone
+            pass
+        s.command(f"deop {s.username}")
+        await watched.close()
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(27, "机器菜单", "附魔台：放剑 → 按键 → 取走被附魔的剑", timeout=180.0)
+async def enchanting_table(s: Suite) -> None:
+    """The one machine whose result is not a plain craft: the server rewrites the item."""
+
+    spot = s.clear_spot(s.spot(2, 0))
+    s.setblock(spot, "minecraft:enchanting_table")
+    await s.wait_chunk(spot)
+    s.clear_inventory()
+    s.give("minecraft:diamond_sword", 1)
+    s.give("minecraft:lapis_lazuli", 5)
+    # An offer is only live when the player can pay its levels; the cheapest
+    # rung (option 0) costs one level and one lapis.
+    s.command(f"xp add {s.username} 30 levels")
+    await s.settle(0.6)
+    before = s.bot.player.experience_level
+    window = await s.bot.menu.open_block(spot)
+    assert window.identifier == "minecraft:enchantment", window.identifier
+    enchanted = await window.enchant("minecraft:diamond_sword", option=0)
+    assert enchanted.count == 1, f"附魔槽里的剑不见了：{enchanted}"
+    assert enchanted.identifier == "minecraft:diamond_sword", enchanted.identifier
+    await window.quick_move(window.layout.slot("item"))
+    await s.settle(0.6)
+    inventory = s.command(f"data get entity {s.username} Inventory")
+    assert "diamond_sword" in inventory, f"服务端背包里没有剑：{inventory}"
+    assert "enchantments" in inventory, f"剑没有被附魔：{inventory}"
+    after = s.bot.player.experience_level
+    assert after < before, f"等级没有扣：{before} → {after}"
+    assert s.bot.player_menu.count("minecraft:lapis_lazuli") < 5, "青金石没有扣"
+    await s.say(f"    附魔成功：等级 {before}→{after}，服务端背包里已经带 enchantments")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1911,6 +2255,14 @@ async def main_async(args: argparse.Namespace) -> int:
     try:
         await asyncio.sleep(1.0)
         bridge.command(f"gamemode survival {args.username}")
+        # Announce the client to the bridge plugin's spectator registry, so an
+        # operator can watch this bot's inventory with /see while a scenario
+        # runs. Servers without the plugin answer "unknown command" and nothing
+        # else happens.
+        try:
+            await bot.register_as_bot()
+        except Exception as error:  # noqa: BLE001 - best effort, never fail a run
+            print(f"[suite] could not register as a bot: {error}", flush=True)
         await suite.teleport((args.x + 0.5, float(args.y), args.z + 0.5))
         await suite.say_many(menu_lines())
         if args.run:
@@ -2010,3 +2362,10 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+
+
+
+

@@ -462,6 +462,17 @@ class ConnectionMixin:
         payload = PacketWriter().write_string(command, max_chars=32767).to_bytes()
         await self.send_raw(self.version.packets.serverbound_chat_command, payload)
 
+    async def register_as_bot(self, *, command: str = "botregister") -> None:
+        """Announce this client to the test server's spectator registry.
+
+        ``prototest-bridge`` answers ``/botregister`` by adding this player to
+        the list an operator can watch with ``/see``, which is how a human can
+        look at a bot's inventory while a scenario runs. Servers without the
+        plugin simply answer "unknown command": one chat line, no state change.
+        """
+
+        await self.send_command(command)
+
     async def send_message(self, message: str) -> None:
         """Send chat, signing it when an online account certificate is active.
 

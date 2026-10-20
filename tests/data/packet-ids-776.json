@@ -18,6 +18,7 @@
     "clientbound_custom_payload": 24,
     "clientbound_damage_event": 25,
     "clientbound_disconnect": 32,
+    "clientbound_entity_position_sync": 35,
     "clientbound_game_event": 38,
     "clientbound_hurt_animation": 42,
     "clientbound_keep_alive": 44,
@@ -43,6 +44,7 @@
     "clientbound_set_entity_data": 99,
     "clientbound_set_entity_motion": 101,
     "clientbound_set_equipment": 102,
+    "clientbound_set_experience": 103,
     "clientbound_set_health": 104,
     "clientbound_set_held_slot": 105,
     "clientbound_set_passengers": 107,
@@ -64,6 +66,7 @@
     "serverbound_chunk_batch_received": 11,
     "serverbound_client_command": 12,
     "serverbound_configuration_acknowledged": 16,
+    "serverbound_container_button_click": 17,
     "serverbound_container_click": 18,
     "serverbound_container_close": 19,
     "serverbound_container_slot_state_changed": 20,
@@ -82,6 +85,7 @@
     "serverbound_pong": 45,
     "serverbound_position": 30,
     "serverbound_position_look": 31,
+    "serverbound_rename_item": 48,
     "serverbound_set_carried_item": 53,
     "serverbound_set_creative_mode_slot": 56,
     "serverbound_swing": 63,
@@ -92,5 +96,5 @@
   },
   "protocol": 776,
   "source": "reports:packets.json",
-  "version": "generated"
+  "version": "26.2"
 }

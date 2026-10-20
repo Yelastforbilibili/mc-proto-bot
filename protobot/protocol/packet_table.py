@@ -99,6 +99,8 @@ CLIENTBOUND_FIELDS: dict[str, tuple[str | tuple[str, ...] | None, str | None]] =
     "clientbound_transfer": ("transfer", "transfer"),
     "clientbound_sound": ("sound", "sound_effect"),
     "clientbound_set_health": ("set_health", "update_health"),
+    #: Experience bar, level and total.  Enchanting is gated on the level.
+    "clientbound_set_experience": ("set_experience", "experience"),
     # Combat/kill signals, and the tab-list packets behind player_join.
     "clientbound_player_combat_kill": ("player_combat_kill", "death_combat_event"),
     "clientbound_player_info_update": ("player_info_update", "player_info"),
@@ -185,6 +187,12 @@ SERVERBOUND_FIELDS: dict[str, tuple[str | tuple[str, ...] | None, str | None]] =
     # --- inventory ------------------------------------------------------
     "serverbound_container_click": ("container_click", "window_click"),
     "serverbound_container_close": ("container_close", "close_window"),
+    #: A menu button: enchanting option, stonecutter recipe, loom pattern.
+    "serverbound_container_button_click": (
+        "container_button_click",
+        ("enchant_item", "window_button_click"),
+    ),
+    "serverbound_rename_item": ("rename_item", "name_item"),
     "serverbound_set_carried_item": ("set_carried_item", "held_item_slot"),
     "serverbound_set_creative_mode_slot": (
         "set_creative_mode_slot",

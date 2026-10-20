@@ -124,6 +124,15 @@ class PlayPacketIds:
     clientbound_set_held_slot: int = 0
     #: Furnace/brewing/enchanting progress bars.
     clientbound_container_set_data: int = 0
+    #: Menu buttons: the enchanting option, the stonecutter recipe, the loom
+    #: pattern.  26.x calls it ``container_button_click``; minecraft-data still
+    #: calls it ``enchant_item`` because that was its only use for years.
+    serverbound_container_button_click: int = 0
+    #: The anvil's rename box, sent as its own packet before the result click.
+    serverbound_rename_item: int = 0
+    #: Experience bar/level/total.  Enchanting is gated on the level, so the
+    #: library mirrors what the server says instead of guessing.
+    clientbound_set_experience: int = 0
     #: The item held on the cursor.  Releases that have this packet carry the
     #: cursor here instead of in a ``container_set_slot`` with slot ``-1``.
     clientbound_set_cursor_item: int = 0
@@ -468,6 +477,8 @@ _PLAY_772 = PlayPacketIds(
     clientbound_transfer=0x7A,
     clientbound_sound=0x6E,
     clientbound_set_health=0x61,
+    clientbound_entity_position_sync=0x1F,
+    clientbound_set_experience=0x60,
     clientbound_player_combat_kill=0x3D,
     clientbound_player_info_update=0x3F,
     clientbound_player_info_remove=0x3E,
@@ -517,7 +528,9 @@ _PLAY_772 = PlayPacketIds(
     serverbound_use_item=0x40,
     serverbound_container_slot_state_changed=0x13,
     serverbound_container_click=0x11,
+    serverbound_container_button_click=0x10,
     serverbound_container_close=0x12,
+    serverbound_rename_item=0x2F,
     serverbound_set_carried_item=0x34,
     serverbound_set_creative_mode_slot=0x37,
     serverbound_chat=0x08,
@@ -572,7 +585,9 @@ _PLAY_774 = PlayPacketIds(
     serverbound_chat_session_update=0x09,
     serverbound_custom_payload=0x15,
     serverbound_container_click=0x11,
+    serverbound_container_button_click=0x10,
     serverbound_container_close=0x12,
+    serverbound_rename_item=0x2F,
     serverbound_configuration_acknowledged=0x0F,
     serverbound_keep_alive=0x1B,
     serverbound_move_vehicle=0x21,
@@ -608,6 +623,8 @@ _PLAY_774 = PlayPacketIds(
     # even though the release data has always carried them.
     clientbound_sound=0x73,
     clientbound_set_health=0x66,
+    clientbound_entity_position_sync=0x23,
+    clientbound_set_experience=0x65,
     clientbound_player_combat_kill=0x42,
     clientbound_player_info_update=0x44,
     clientbound_player_info_remove=0x43,
@@ -617,6 +634,8 @@ _PLAY_774 = PlayPacketIds(
 _PLAY_775_776 = PlayPacketIds(
     clientbound_sound=0x75,  # 116/117/119 = sound_entity/sound/stop_sound
     clientbound_set_health=0x68,  # 104: Float health, VarInt food, Float saturation
+    clientbound_entity_position_sync=0x23,
+    clientbound_set_experience=0x67,
     clientbound_player_combat_kill=0x44,  # 68: VarInt entity id + death message
     serverbound_client_command=0x0C,  # 12: one VarInt, 0 = perform respawn
     # Interaction ids, from the 26.1 reports/packets.json.  26.1, 26.1.1 and
@@ -686,7 +705,9 @@ _PLAY_775_776 = PlayPacketIds(
     serverbound_chat_session_update=0x0A,
     serverbound_custom_payload=0x16,
     serverbound_container_click=0x12,
+    serverbound_container_button_click=0x11,
     serverbound_container_close=0x13,
+    serverbound_rename_item=0x30,
     serverbound_configuration_acknowledged=0x10,
     serverbound_keep_alive=0x1C,
     serverbound_move_vehicle=0x22,
@@ -731,6 +752,7 @@ _PLAY_777 = PlayPacketIds(
     clientbound_add_transient_block=0x25,
     clientbound_entity_position_sync=0x23,
     clientbound_set_health=0x6A,
+    clientbound_set_experience=0x69,
     clientbound_player_combat_kill=0x45,
     serverbound_client_command=0x0C,
     clientbound_player_info_remove=0x46,
@@ -780,7 +802,9 @@ _PLAY_777 = PlayPacketIds(
     serverbound_chat_session_update=0x0A,
     serverbound_custom_payload=0x16,
     serverbound_container_click=0x12,
+    serverbound_container_button_click=0x11,
     serverbound_container_close=0x13,
+    serverbound_rename_item=0x31,
     serverbound_configuration_acknowledged=0x10,
     serverbound_keep_alive=0x1C,
     serverbound_move_vehicle=0x22,

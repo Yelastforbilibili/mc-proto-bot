@@ -171,6 +171,16 @@ class Actions:
 
     async def _send(self, field: str, action: str, payload: bytes) -> int:
         packet_id = self._packet_id(field, action)
+        close = getattr(self.client, "close_tick", None)
+        if close is not None:
+            # A 26.3 client closes its movement tick with ``client_tick_end``,
+            # and the server treats that packet as a transaction.  An action
+            # that slips in after the movement packet but before that end
+            # marker is read as "sent before this tick", which anti-cheat
+            # reports as Post for that action.  Closing first puts every action
+            # in the gap between two ticks, where the next movement packet --
+            # not a transaction -- is what judges it.
+            await close()
         await self.client.send_raw(packet_id, payload)
         return packet_id
 

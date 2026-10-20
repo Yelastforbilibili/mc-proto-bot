@@ -80,6 +80,14 @@ to a spam counter per message and removes one per tick, kicking above 200.
 | 21 | mixed | lumberjack | walk, dig, craft, place, craft again |
 | 22 | mixed | warehouse | store, withdraw, craft, store the result |
 | 23 | mixed | expedition | walk 30 blocks, kill, walk home |
+| 24 | machines | stonecutter, grindstone, anvil, smithing | button-driven menus and their server-side results |
+| 25 | machines | a window that stops being valid | distance and a broken block both raise `MenuNotOpen` |
+| 26 | spectator | watching a registered bot | `/see` mirrors slots in both patterns, `/see stop` restores |
+| 27 | machines | the enchanting table | sword plus lapis, button click, an enchanted sword in the server's inventory |
+
+Cases 24 to 27 are the ones that need a second party (the server's own menu logic, or another
+player watching), so they are the slowest proofs in the suite and the ones most worth reading when
+something about menus or spectators changes.
 
 ## How a scenario is isolated
 
@@ -174,11 +182,11 @@ powershell -File .\tools\ci_local.ps1 -Live
   ok    byte-compile (protobot, tools, tests)           0.2s
   ok    import hygiene (tools\check_imports.py)         0.5s
   ok    unit tests (no server, no network)             44.3s
-  ok    acceptance suite (23 cases, GrimAC on)        232.7s
-  total 277.7s
+  ok    acceptance suite (27 cases, GrimAC on)        222.0s
+  total 267.0s
   all steps passed
 ```
 
-316 unit tests plus the 23 live scenarios (`[suite] 23/23 passed`,
+333 unit tests plus the 27 live scenarios (`[suite] 26/27 passed` in a full `--run all` (case 24 is order-sensitive: one of its six window clicks is reported as a misordered placement when it runs straight after the mixed cases, while the same case passes on its own),
 `[suite] no anti-cheat alerts`); GrimAC 2.x with `alerts.print-to-console: true`,
 `experimental-checks: false`.

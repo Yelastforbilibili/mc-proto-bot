@@ -214,6 +214,11 @@ class PlayerState:
     saturation: float = 5.0
     #: True after a death signal, cleared by the respawn packet.
     dead: bool = False
+    #: Experience, mirrored from ``clientbound_set_experience``.  Enchanting is
+    #: gated on the level, so a caller wants the server's number, not a guess.
+    experience_progress: float = 0.0
+    experience_level: int = 0
+    experience_total: int = 0
     pose: str = "standing"
     crouching: bool = False
     swimming: bool = False
