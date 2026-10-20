@@ -2140,7 +2140,15 @@ async def spectator_view(s: Suite) -> None:
         await s.bot.send_command("see stop")
         await s.settle(0.8)
         assert _open_view_window(s.bot)[0] is None, "/see stop 没有关掉箱子界面"
-        assert not (s.bridge.call("/bots").get("views") or []), "服务端还留着观看会话"
+        # The window closes on our side at once; the plugin's bookkeeping runs on
+        # its own tick, so give it a moment before calling the session leaked.
+        views: list = [1]
+        for _ in range(20):
+            views = s.bridge.call("/bots").get("views") or []
+            if not views:
+                break
+            await s.settle(0.1)
+        assert not views, f"服务端还留着观看会话：{views}"
 
         # -- inventory pattern: 1:1 into our own slots, closing does not exit --
         await s.bot.send_command("seepattern inv")
