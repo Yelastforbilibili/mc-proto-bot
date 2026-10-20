@@ -154,6 +154,28 @@ class PickupMixin:
     def _has_room(self: Bot, stacks: int = 1) -> bool:
         return self.player_menu.free() is not None or stacks <= 0
 
+    def _cannot_take(self: Bot, name: str) -> bool:
+        """The inventory can no longer hold ``name``, not even by topping up.
+
+        An empty slot is the easy case.  Without one a drop still lands if a
+        slot that already holds the item is below its stack limit, because the
+        server merges it into that stack.  When the inventory is full *and*
+        every matching stack is at the limit (unstackable items count as one),
+        nothing can arrive -- so this raises instead of leaving the drop on the
+        floor while the caller waits for a count that never grows.
+        """
+
+        menu = self.player_menu
+        if menu.free() is not None:
+            return False
+        matching = [
+            stack for stack in menu.slots().values() if stack.identifier == name
+        ]
+        if not matching:
+            return True
+        limit = 64
+        return all(stack.count >= limit for stack in matching)
+
     # ------------------------------------------------------------------
     # the action
     # ------------------------------------------------------------------
@@ -223,8 +245,11 @@ class PickupMixin:
             if not candidates:
                 break
             _, entity_id, name, amount, x, y, z = candidates[0]
-            if self.player_menu.free() is None and self._inventory_count(name) < wanted.get(name, 10**9):
-                report.reason = "the inventory is full"
+            if self._cannot_take(name):
+                report.reason = (
+                    f"the inventory is full and every stack of {name} is at its"
+                    " limit, so the drop cannot be taken"
+                )
                 report.seconds = time.monotonic() - started
                 self._finish(report, wanted, baseline)
                 raise InventoryFull(report.reason, report)

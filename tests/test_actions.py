@@ -323,6 +323,8 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_place_block_places_above_the_clicked_block(self) -> None:
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 64, 0): 5}))
+        # Stand aside: a block cannot be placed where the player is standing.
+        bot.physics_state.position = Vec3(2.5, 64.0, 0.5)
         bot.on_tick = lambda: bot.world.set_state_id(0, 65, 0, 12)
         result = await Actions(bot).place_block((0, 65, 0), face=BlockFace.UP)
         self.assertEqual(result.status, ActionStatus.CONFIRMED)
@@ -333,11 +335,31 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reader.read_position(), (0, 64, 0))  # clicked block
         self.assertEqual(reader.read_varint(), int(BlockFace.UP))
 
+    async def test_place_block_refuses_the_block_under_the_player(self) -> None:
+        # The fake player floats at (0.6, 40.0, 0.6), so an ordinary destination
+        # is not under it; standing in the middle of (0, 64, 0) makes the flat
+        # slab at its feet overlap its own body.
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 63, 0): 5}))
+        bot.physics_state.position = Vec3(0.5, 64.0, 0.5)
+        result = await Actions(bot).place_block((0, 64, 0))
+        self.assertEqual(result.status, ActionStatus.REJECTED)
+        self.assertIn("overlaps the player", result.evidence)
+        self.assertEqual(bot.sent, [])
+
+    async def test_place_block_allows_a_block_beside_the_player(self) -> None:
+        bot = _FakeBot(get_version("26.3"), _FakeWorld({(2, 63, 0): 5}))
+        bot.physics_state.position = Vec3(0.5, 64.0, 0.5)
+        bot.on_tick = lambda: bot.world.set_state_id(2, 64, 0, 12)
+        result = await Actions(bot).place_block((2, 64, 0))
+        self.assertNotEqual(result.status, ActionStatus.REJECTED)
+
     async def test_place_block_turns_inside_a_movement_packet(self) -> None:
         # Anti-cheat ray-traces the rotation of the tick a click arrives in, so
         # a turn that travels in a bare look packet is one tick behind.  The
         # rotation has to ride in a movement packet (position_and_rotation).
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 64, 0): 5}))
+        # Stand aside: a block cannot be placed where the player is standing.
+        bot.physics_state.position = Vec3(2.5, 64.0, 0.5)
         bot.on_tick = lambda: bot.world.set_state_id(0, 65, 0, 12)
         await Actions(bot).place_block((0, 65, 0), face=BlockFace.UP)
         self.assertEqual(len(bot.turns), 1)
@@ -604,6 +626,9 @@ class FaceChoiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_place_block_rejects_when_no_neighbour_is_visible(self) -> None:
         bot = _FakeBot(get_version("26.3"))
+        # Stand away from the destination: the body check is a different refusal
+        # and must not be what this test ends up measuring.
+        bot.physics_state.position = Vec3(2.5, 64.0, 0.5)
         result = await Actions(bot).place_block((0, 65, 0))
         self.assertEqual(result.status, ActionStatus.REJECTED)
         self.assertIn("visible", result.evidence)

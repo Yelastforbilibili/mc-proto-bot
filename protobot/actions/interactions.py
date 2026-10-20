@@ -169,19 +169,33 @@ class Actions:
     def _sequence(self) -> int:
         return self.client.take_sequence()
 
-    async def _send(self, field: str, action: str, payload: bytes) -> int:
-        packet_id = self._packet_id(field, action)
+    async def _open_action_tick(self) -> None:
+        """End the previous tick, then wait until the next one is due.
+
+        Grim queues an action packet only while the current tick has already
+        sent its movement packet, and reports that queue when the tick ends.
+        Ending the tick first makes the action invisible to the queue; the
+        movement packet the caller sends afterwards starts a clean tick.
+        """
+
         close = getattr(self.client, "close_tick", None)
         if close is not None:
-            # A 26.3 client closes its movement tick with ``client_tick_end``,
-            # and the server treats that packet as a transaction.  An action
-            # that slips in after the movement packet but before that end
-            # marker is read as "sent before this tick", which anti-cheat
-            # reports as Post for that action.  Closing first puts every action
-            # in the gap between two ticks, where the next movement packet --
-            # not a transaction -- is what judges it.
             await close()
+        await self.client.wait_tick_budget()
+
+    async def _send(self, field: str, action: str, payload: bytes) -> int:
+        """Send one action packet, then let the caller close the tick.
+
+        Grim's ``Post`` check queues the action packets that arrive *after* a
+        tick's movement packet and reports the first of them when the tick ends
+        before another movement packet clears the queue.  The safe order is
+        therefore action first, then the movement packet -- which is what every
+        caller here does -- and never a tick end in between.
+        """
+
+        packet_id = self._packet_id(field, action)
         await self.client.send_raw(packet_id, payload)
+        return packet_id
         return packet_id
 
     async def _emit(self, result: ActionResult) -> ActionResult:
@@ -418,7 +432,7 @@ class Actions:
                 # would leave the animation queued alone for 50 ms, which
                 # GrimAC's Post check reports as "did not send animation then
                 # tick" once a transaction arrives in that gap.
-                await self.client.wait_tick_budget()
+                await self._open_action_tick()
                 await self._swing_packet()
                 await self.client.tick()
             elif swing:
@@ -624,6 +638,26 @@ class Actions:
     # ------------------------------------------------------------------
     # the face a client can actually click
     # ------------------------------------------------------------------
+    def _inside_player(self, position: tuple[int, int, int]) -> bool:
+        """Whether the block at ``position`` would overlap the player.
+
+        The player is 0.6 wide and 1.8 tall standing in the middle of its
+        position, so a block overlapping that box cannot be placed: the server
+        refuses it and the client would end up inside solid ground.
+        """
+
+        x, y, z = position
+        feet = self.client.physics_state.position
+        half = 0.3
+        return (
+            x < feet.x + half
+            and x + 1.0 > feet.x - half
+            and z < feet.z + half
+            and z + 1.0 > feet.z - half
+            and y < feet.y + 1.8
+            and y + 1.0 > feet.y
+        )
+
     def block_box(self, position: tuple[int, int, int]) -> tuple[Vec3, Vec3]:
         """The world box of the block at ``position``, low and high corners.
 
@@ -909,7 +943,7 @@ class Actions:
             # client that is still holding the button sends it: animation, stop,
             # movement.  Wait out the tick budget so the movement follows at once
             # instead of leaving the pair queued for a transaction to find.
-            await self.client.wait_tick_budget()
+            await self._open_action_tick()
             packets.append(await self._swing_packet())
             packets.append(
                 await self._send(
@@ -1085,6 +1119,23 @@ class Actions:
         started = time.monotonic()
         world = self.client.world
         state_before = world.get_state_id(*position)
+        if self._inside_player(position):
+            # A block cannot appear where the player is standing: the server
+            # rejects the placement, and a client that insisted would be stuck
+            # inside a solid block.  Refuse instead of sending it.
+            return await self._emit(
+                ActionResult(
+                    action="place_block",
+                    status=ActionStatus.REJECTED,
+                    position=position,
+                    state_before=state_before,
+                    elapsed=time.monotonic() - started,
+                    evidence=(
+                        f"{position} overlaps the player's own body, so the block"
+                        " cannot be placed there"
+                    ),
+                )
+            )
         if state_before != 0:
             return await self._emit(
                 ActionResult(
