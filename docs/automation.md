@@ -76,6 +76,13 @@ counts strikes as its own retries and fails with "no progress" once they run
 out, so a door that will not open or a hole the bot keeps falling into ends the
 goal instead of spinning forever.
 
+`navigate_to` sends one movement packet per 50 ms tick and sprints by default
+(5.6 m/s instead of 4.3), because that is what a player crossing ground does.
+`tick_interval` is an *extra* pause on top of that pacing: leaving it at 0 is
+what keeps the walk at exactly 20 Hz, while a positive value stretches every
+step and makes the bot walk slower than vanilla (measured 5.5 vs 3.8 blocks per
+second over 20 blocks). `TravelGoal(..., sprint=False)` turns the sprint off.
+
 ```python
 from protobot import TravelGoal
 

@@ -35,12 +35,12 @@ class NavigatorMixin:
         *,
         y: float | None = None,
         tolerance: float = 0.3,
-        sprint: bool = False,
+        sprint: bool = True,
         timeout: float = 60.0,
         max_nodes: int = 4096,
         max_drop: float = 3.0,
         replans: int = 3,
-        tick_interval: float = 0.05,
+        tick_interval: float = 0.0,
         allow_diagonal: bool = True,
     ) -> PhysicsState:
         """Plan and execute a route using ordinary player input and physics.
@@ -48,6 +48,13 @@ class NavigatorMixin:
         Server corrections or dynamic block changes can invalidate a route.
         Progress is monitored per waypoint and the route is replanned up to
         ``replans`` times before a :class:`NavigationTimeout` is raised.
+
+        ``sprint`` is on by default because a player travelling a distance
+        sprints: 5.612 m/s instead of 4.317 m/s, with the same 20 Hz packet
+        cadence.  ``tick_interval`` is an optional extra pause *on top of* the
+        tick pacing the client already does; leaving it at 0 keeps the walk at
+        exactly one tick per 50 ms (a positive value stretches every step, so
+        the bot walks slower than vanilla while still looking legal).
         """
 
         self._require_play()

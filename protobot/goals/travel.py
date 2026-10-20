@@ -150,6 +150,7 @@ class TravelGoal(Goal):
         segment_seconds: float = SEGMENT_SECONDS,
         stuck_seconds: float = 3.0,
         max_strikes: int = 3,
+        sprint: bool = True,
     ) -> None:
         super().__init__()
         self.x = float(x)
@@ -158,6 +159,7 @@ class TravelGoal(Goal):
         self.tolerance = tolerance
         self.timeout = timeout
         self.segment_seconds = segment_seconds
+        self.sprint = sprint
         self.watchdog = StuckWatchdog(seconds=stuck_seconds, limit=max_strikes)
         self._deadline: float | None = None
         self._segments = 0
@@ -255,6 +257,7 @@ class TravelGoal(Goal):
                     y=self.y,
                     tolerance=max(self.tolerance * 0.5, 0.3),
                     timeout=self.segment_seconds,
+                    sprint=self.sprint,
                 ),
                 timeout=self.segment_seconds + 5.0,
             )

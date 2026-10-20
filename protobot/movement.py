@@ -124,6 +124,12 @@ class MovementMixin:
             self._set_physics_flying(True)
             self.physics_state.on_ground = False
         if send_input:
+            # Input and sprint-state packets belong to the tick that is about to
+            # be closed by the movement packet below.  Send them inside that
+            # tick's budget, otherwise the packet sits alone for up to 50 ms and
+            # Grim's Post check flags it as "entity action" queued without a
+            # movement.
+            await self.wait_tick_budget()
             input_values = {
                 "forward": controls.forward > 0,
                 "backward": controls.forward < 0,
