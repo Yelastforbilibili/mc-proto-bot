@@ -1761,34 +1761,15 @@ async def mixed_lumberjack(s: Suite) -> None:
             f" pick={s.bot.actions.pick_face(position)}"
             f" extra={result.extra}"
         )
-    # Items only fly into the inventory within about a block.  The column
-    # leaves no hole, so the drops sit on the surface beside it; where exactly
-    # depends on the block's own spawn offset, so sweep a ring instead of
-    # trusting three guessed spots (a drop landing one block further used to
-    # leave the count at two).
-    logs = 0
-    ring: list[tuple[float, float]] = []
-    for radius in (1.5, 2.5):
-        for step in range(8):
-            angle = step * math.pi / 4.0
-            ring.append(
-                (
-                    column[0][0] + 0.5 + radius * math.cos(angle),
-                    column[0][2] + 0.5 + radius * math.sin(angle),
-                )
-            )
-    for collect in ring:
-        try:
-            await s.bot.navigate_to(
-                collect[0], collect[1], tolerance=0.5, timeout=20.0
-            )
-        except Exception:
-            pass
-        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=2.0)
-        if logs >= 3:
-            break
-    if logs < 3:
-        logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=3.0)
+    # Drops fly out of the block with a small random offset, so walking to
+    # guessed spots was a lottery.  The library now enumerates the dropped
+    # items the server actually told us about (entity metadata carries the
+    # stack) and walks to each one until the inventory agrees.
+    report = await s.bot.pick_up(
+        items=["minecraft:oak_log"], count=3, radius=8.0, allow_loss=-1, timeout=45.0
+    )
+    assert report.ok, f"没捡齐：{report.describe()}；{report.reason}"
+    logs = await s.wait_server_count("minecraft:oak_log", 3, timeout=3.0)
     assert logs == 3, f"服务端背包 log={logs}"
     planks = await s.bot.goals.run(
         CraftGoal(recipe_for("minecraft:oak_planks"), times=3), timeout=90.0

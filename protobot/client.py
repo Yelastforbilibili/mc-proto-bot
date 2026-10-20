@@ -28,6 +28,7 @@ from .events import EventBus
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .movement import MovementMixin
 from .navigator import NavigatorMixin
+from .pickup import PickupMixin
 from .physics import BoatPhysicsEngine, PhysicsAttributes, PhysicsEngine, PhysicsState
 from .play.router import PlayRouterMixin
 from .protocol.codec import PacketWriter
@@ -58,7 +59,7 @@ from .support import (  # re-exported: these were module-level names here before
 )
 from .world import BlockStateRegistry, World
 
-class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin):
+class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, PickupMixin):
     """An offline-mode Minecraft bot.
 
     ``start`` opens the socket and starts the protocol task. ``wait_ready`` waits
