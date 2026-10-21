@@ -355,17 +355,19 @@ class PayloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_place_block_turns_inside_a_movement_packet(self) -> None:
         # Anti-cheat ray-traces the rotation of the tick a click arrives in, so
-        # a turn that travels in a bare look packet is one tick behind.  The
-        # rotation has to ride in a movement packet (position_and_rotation).
+        # the turn belongs to a tick's movement packet: ``turn_to`` writes the
+        # view and lets ``tick()`` carry it, rather than sending a look packet of
+        # its own (which would claim "I did not move" while the player slides).
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 64, 0): 5}))
         # Stand aside: a block cannot be placed where the player is standing.
         bot.physics_state.position = Vec3(2.5, 64.0, 0.5)
         bot.on_tick = lambda: bot.world.set_state_id(0, 65, 0, 12)
         await Actions(bot).place_block((0, 65, 0), face=BlockFace.UP)
-        self.assertEqual(len(bot.turns), 1)
-        yaw, pitch = bot.turns[0]
+        yaw, pitch = bot.physics_state.yaw, bot.physics_state.pitch
         self.assertNotEqual((yaw, pitch), (0.0, 0.0))
-        self.assertEqual(bot.looks[-1], bot.turns[-1])
+        # No look-only packet; the rotation rides in the tick's movement packet.
+        self.assertEqual(bot.looks, [])
+        self.assertGreaterEqual(bot.ticks, 1)
 
     async def test_place_block_rejects_occupied_destination(self) -> None:
         bot = _FakeBot(get_version("26.3"), _FakeWorld({(0, 65, 0): 3}))

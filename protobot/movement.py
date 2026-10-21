@@ -41,6 +41,31 @@ class MovementMixin:
     ) -> PhysicsState:
         """Advance the local player by one 20 Hz tick.
 
+        The body runs under a lock because one tick is one movement packet: a
+        goal, an action and a caller's own loop can all ask for a tick, and two
+        of them running at once would advance the physics twice and then report
+        that as a single step, which the server reads as a position that does
+        not match its prediction.
+        """
+
+        async with self._tick_lock:
+            return await self._tick_once(
+                controls,
+                send_input=send_input,
+                send_position=send_position,
+                _navigation_tick=_navigation_tick,
+            )
+
+    async def _tick_once(
+        self,
+        controls: MovementInput | None = None,
+        *,
+        send_input: bool = True,
+        send_position: bool = True,
+        _navigation_tick: bool = False,
+    ) -> PhysicsState:
+        """The tick itself, called with ``_tick_lock`` held.
+
         The deterministic physics state is updated first, then the ordinary
         serverbound movement/input packets are emitted.  Callers that want to
         drive their own trajectory can pass ``send_position=False`` and use the
@@ -221,6 +246,7 @@ class MovementMixin:
         self._set_movement_flags(on_ground, horizontal_collision)
         self.player.x, self.player.y, self.player.z = x, y, z
         self.physics_state.position = Vec3(x, y, z)
+        self._last_sent_position = (x, y, z)
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
         packet_y = self._anti_kick_wire_y(y)
@@ -251,6 +277,7 @@ class MovementMixin:
         self.player.x, self.player.y, self.player.z = x, y, z
         self.player.yaw, self.player.pitch = yaw, pitch
         self.physics_state.position = Vec3(x, y, z)
+        self._last_sent_position = (x, y, z)
         self.physics_state.yaw, self.physics_state.pitch = yaw, pitch
         self.physics_state.on_ground = self.player.on_ground
         self.physics_state.horizontal_collision = self.player.horizontal_collision
@@ -658,6 +685,31 @@ class MovementMixin:
         self._require_play()
         await self.send_raw(self.version.packets.serverbound_tick_end)
         self._position_sent_this_tick = False
+        await self._flush_pongs()
+
+    async def _flush_pongs(self) -> None:
+        """Answer the pings that arrived while an action owned the tick.
+
+        A pong is where an anti-cheat judges the packets queued ahead of it, and
+        only a movement packet clears that queue.  Sending the answer the moment
+        the ping arrives would therefore let it fall between an action's swing
+        and the movement packet of the same tick, so the swing looks out of
+        order.  The answers go out here, when the tick has just closed.
+        """
+
+        pending = self._pong_pending
+        if not pending:
+            return
+        values = list(pending)
+        pending.clear()
+        for value in values:
+            try:
+                await self.send_raw(
+                    self.version.packets.serverbound_pong,
+                    PacketWriter().write_int(value).to_bytes(),
+                )
+            except Exception:  # noqa: BLE001 - the tick outlived the connection
+                return
 
     async def close_tick(self) -> None:
         """End the movement tick if one is still open.

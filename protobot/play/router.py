@@ -144,7 +144,23 @@ class PlayRouterMixin:
             reader = PacketReader(packet.payload)
             value = reader.read_int()
             reader.expect_end()
-            await self.send_raw(ids.serverbound_pong, PacketWriter().write_int(value).to_bytes())
+            # A pong is the transaction an anti-cheat judges the packets queued
+            # before it at, and only a movement packet clears that queue.  An
+            # action sits in the gap between the last movement packet and its own
+            # tick's movement packet for a moment (swing now, move next), so a
+            # pong answered there makes the swing look out of order.  Hold the
+            # answer until that tick has gone out -- and keep the answers in the
+            # order the pings arrived, because jumping that queue is a check of
+            # its own.
+            holding = bool(self._pong_pending) or time.monotonic() < getattr(
+                self, "_action_busy_until", 0.0
+            )
+            if holding:
+                self._pong_pending.append(value)
+            else:
+                await self.send_raw(
+                    ids.serverbound_pong, PacketWriter().write_int(value).to_bytes()
+                )
         elif packet.packet_id == ids.clientbound_player_chat:
             await self._handle_player_chat(packet.payload)
         elif packet.packet_id == ids.clientbound_profileless_chat:

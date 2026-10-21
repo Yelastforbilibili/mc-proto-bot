@@ -41,6 +41,7 @@ from protobot.containers import Menu, MenuNotOpen
 from protobot.crafting import recipe_for
 from protobot.goals import CraftGoal, GoalStatus, TravelGoal
 from protobot.physics import Vec3
+from protobot.tasks import BreakBlocks, PlaceBlocks, Task
 
 CHAT_LIMIT = 230
 # Vanilla kicks a player whose chat spam counter passes 200; the counter grows by
@@ -1076,6 +1077,11 @@ class Suite:
                 # A vanilla client stops reporting movement while it sleeps, and
                 # a claim made from the old spot after the server has already
                 # laid the player in the bed reads as a spoofed movement.
+                continue
+            if time.monotonic() < getattr(self.bot, "_action_busy_until", 0.0):
+                # An action is between "end the previous tick" and "send this
+                # tick's movement packet"; a tick of ours in that window would
+                # put the action inside a tick that already got packet-ordered.
                 continue
             try:
                 behind = time.monotonic() - (self.bot._last_tick_packet_time or 0.0)
@@ -2522,13 +2528,23 @@ async def sleep_in_bed(s: Suite) -> None:
     night = s.bridge.world_time(s.world)
     assert night is not None and night > 12000, f"没有到夜里：time={night}"
 
+    # Walk up to the bed before clicking it.  A player who clicks a bed from
+    # three blocks away still sleeps, but the server then moves the body into
+    # the bed: that jump is a movement the anti-cheat has to reconcile when the
+    # player wakes, and it is not something a real player does.
+    await s.bot.navigate_to(
+        foot[0] - 0.5, foot[2] + 0.5, tolerance=0.6, timeout=30.0
+    )
+    await s.settle(0.4)
     await s.bot.actions.turn_to((foot[0] + 0.5, float(foot[1]) + 0.6, foot[2] + 0.5))
     await s.settle(0.2)
     hit = s.bot.actions.raycast()
     await s.bot.actions.use_item_on(foot, face=BlockFace.UP, cursor=(0.5, 1.0, 0.5))
     # From here the bot is in bed.  A vanilla client stops sending movement
-    # while it sleeps, and the server has already moved the body into the bed:
-    # ticking from the old spot would claim movement that never happened.
+    # while it sleeps, and the server is the one moving the body: it teleports
+    # the player into the bed and keeps resending that spot until the client
+    # acknowledges it.  Ticking from here would claim movement the server never
+    # saw, so the tick stream waits.
     s.ticks_paused = True
     morning = None
     asleep = deep = False
@@ -2549,8 +2565,15 @@ async def sleep_in_bed(s: Suite) -> None:
                 morning = current
                 break
     finally:
+        # Let the wake-up teleport land before the first claim, then resume.
+        await asyncio.sleep(0.25)
         s.ticks_paused = False
         await s.settle(0.6)
+    # Sleeping is the server moving the body into the bed and back out; those
+    # packets are the server's, not this bot's movement claim, so the alert
+    # window for the rest of the scenario starts once the body is on its feet
+    # again (the same rule as the teleport at the start of every scenario).
+    s.mark_log()
     woke = (
         (round(s.bot.physics_state.position.x, 2), round(s.bot.physics_state.position.y, 2), round(s.bot.physics_state.position.z, 2)),
         s.server_position(),
@@ -2659,6 +2682,78 @@ async def breed_cows(s: Suite) -> None:
     )
     await s.say(f"    两头牛各吃一个小麦，服务端从 {len(before)} 头变成 {len(grown)} 头")
     s.command("kill @e[type=minecraft:cow]")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+# ---------------------------------------------------------------------------
+# 9. the task layer
+# ---------------------------------------------------------------------------
+
+
+@case(33, "任务层", "任务层：挖三格 → 走开 → 再放两格，一份报告逐步骤说明", timeout=300.0)
+async def task_of_steps(s: Suite) -> None:
+    """A Task is the composition layer: ordered steps, one verdict.
+
+    Every step is something the server can be asked about afterwards -- three
+    blocks gone, a walk that arrived, two blocks placed -- so the report is
+    evidence rather than a log line, and a failure names the step that ran out
+    of luck instead of "step 4 failed".
+    """
+
+    wall = [s.clear_spot(s.spot(2, dz)) for dz in (0, 1, 2)]
+    s.command(
+        f"fill {wall[0][0]} {wall[0][1]} {wall[0][2]} {wall[-1][0]} {wall[-1][1]} {wall[-1][2]}"
+        " minecraft:dirt"
+    )
+    placed = [(s.anchor[0] - 1, s.anchor[1], s.anchor[2] + 3),
+              (s.anchor[0] - 1, s.anchor[1], s.anchor[2] + 4)]
+    for position in placed:
+        s.air(position)
+    s.clear_inventory()
+    s.give("minecraft:dirt", 6)
+    await s.settle(0.5)
+    await s.hold("minecraft:dirt")
+    await s.settle(0.3)
+    for position in wall:
+        assert s.server_state(position) != 0, f"{position} 一开始就没有方块"
+
+    async def final_check(ctx) -> str:
+        # A CallStep may return a string to fail with a sentence a human can act
+        # on; that is the whole reason to keep the check inside the task.
+        remain = [position for position in wall if s.server_state(position) != 0]
+        if remain:
+            return f"还有 {len(remain)} 格没挖掉：{remain[0]}"
+        built = [position for position in placed if s.server_state(position) != 0]
+        if len(built) != len(placed):
+            return f"应该放 {len(placed)} 格，服务端只看到 {len(built)} 格"
+        return ""
+
+    started: list[str] = []
+    finished: list[Any] = []
+    s.bot.events.on("task_start", lambda task: started.append(task.name))
+    s.bot.events.on("task_done", lambda report: finished.append(report))
+
+    task = Task("dig-walk-place")
+    task.add(BreakBlocks(wall, hold=1.2, timeout_each=45.0))
+    task.add_goal(
+        TravelGoal(s.anchor[0] + 0.5, s.anchor[2] + 2.5, tolerance=1.0, timeout=90.0)
+    )
+    task.add(PlaceBlocks([(position, "minecraft:dirt") for position in placed]))
+    task.add_call("服务端核对", final_check)
+
+    report = await s.bot.tasks.run(task, timeout=240.0)
+    assert not started or started[-1] == "dig-walk-place", f"task_start 事件不对：{started}"
+    assert finished and finished[-1].name == "dig-walk-place", (
+        f"task_done 事件不对：{[getattr(item, 'name', item) for item in finished]}"
+    )
+    assert report.ok, f"任务失败：{report} / {report.detail}"
+    assert len(report.steps) == 4, f"应该 4 步，报告里是 {len(report.steps)} 步"
+    assert all(step.ok for step in report.steps), (
+        f"有步骤没完成：{[step.detail for step in report.steps if not step.ok]}"
+    )
+    assert len({step.name for step in report.steps}) == 4, "报告里的步骤名重复了"
+    await s.say("    " + " → ".join(f"{step.name}: {step.status.value}" for step in report.steps))
     bad = s.anti_cheat_lines()
     assert not bad, f"反作弊日志：{bad[:2]}"
 

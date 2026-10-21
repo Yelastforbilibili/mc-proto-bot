@@ -34,8 +34,8 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Event bus** — subscribe to chat, chunk, entity, container, health/death, join/leave, and raw packet events.
 - **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
 - **Diagnostic CLI** — live regression checks and movement traces against a local server.
-- **In-game acceptance suite** — `tools/live_suite.py` builds its own scenes on a real server and runs 32 numbered scenarios (dig, place, every container, the button-driven machines, the enchanting table, watching a bot, container invalidation, crafting, navigation, combat, tools, items with components, buckets, boats, minecarts, sleeping, breeding and three mixed end-to-end jobs) triggered from chat by any player typing a number; every check asks the server (`data get`) rather than the bot. The suite also reads the server log and fails a scenario that produced an anti-cheat alert. See [docs/acceptance-suite.md](docs/acceptance-suite.md) and [docs/anti-cheat.md](docs/anti-cheat.md).
-- **One command for the checks** — `.\tools\ci_local.ps1` runs byte-compilation, import hygiene and the unit suite (add `-Live` to append the 32 in-game scenarios) and prints a summary table with a non-zero exit code on failure; `.github/workflows/ci.yml` runs the same non-server gates on every push on Python 3.12 and 3.13.
+- **In-game acceptance suite** — `tools/live_suite.py` builds its own scenes on a real server and runs 33 numbered scenarios (dig, place, every container, the button-driven machines, the enchanting table, watching a bot, container invalidation, crafting, navigation, combat, tools, items with components, buckets, boats, minecarts, sleeping, breeding and three mixed end-to-end jobs) triggered from chat by any player typing a number; every check asks the server (`data get`) rather than the bot. The suite also reads the server log and fails a scenario that produced an anti-cheat alert. See [docs/acceptance-suite.md](docs/acceptance-suite.md) and [docs/anti-cheat.md](docs/anti-cheat.md).
+- **One command for the checks** — `.\tools\ci_local.ps1` runs byte-compilation, import hygiene and the unit suite (add `-Live` to append the 33 in-game scenarios) and prints a summary table with a non-zero exit code on failure; `.github/workflows/ci.yml` runs the same non-server gates on every push on Python 3.12 and 3.13.
 
 ## Installation
 
@@ -54,6 +54,44 @@ python -m pip install -e ".[tui]"
 # Or with uv
 uv sync --extra online --extra tui
 ```
+
+## What it supports today
+
+A map before the detail. **Supported** means: there is an API, there are unit
+tests, and at least one scenario in the in-game suite proves the *server* did it.
+
+| Area | Status | Where |
+| --- | --- | --- |
+| 26.3 end to end — handshake, login, configuration, play, chunks, entities, chat, transfers | Supported | `protobot/connection.py`, `protobot/play/router.py` |
+| 1.21.8 / 1.21.11 / 26.1 / 26.1.1 / 26.1.2 / 26.2 | Data tables (packet ids, items, blocks, menus, entities, breaking, components) plus unit tests; no end-to-end run | `protobot/protocol/versions.py` |
+| Physics — walking, sprinting, jumping, swimming, sneaking, boats, spectator flight | Supported | `protobot/physics/engine.py`, `protobot/movement.py` |
+| Navigation — A\* over decoded chunks, replanning, trips past the view distance | Supported | `protobot/navigator.py`, `protobot/goals/travel.py` |
+| Actions — dig, place, use item (bucket, boat, snowball), use item on (chest, rail, bed), attack, interact (feed, mount), swing, drop, pick up | Supported | `protobot/actions/`, `protobot/pickup.py` |
+| Containers — every menu type, click-level moves, progress data, machine verbs (`enchant`, `anvil`, `grindstone`, `smithing`, `stonecutter`) | Supported | `protobot/containers/` |
+| Crafting — explicit recipe descriptions, 2×2 and 3×3 | Supported | `protobot/crafting/recipes.py`, `containers/menu.py` |
+| Goals, tasks, long trips | Supported | `protobot/goals/`, `protobot/tasks/` |
+| Items carrying data components | Partial — decodes the components it ships tables for and refuses an ambiguous slot list instead of guessing | `protobot/protocol/stacks.py` |
+| Online mode (Mojang/Microsoft auth, signed chat) | Supported | `protobot/auth.py` |
+| Anti-cheat-shaped packet ordering (GrimAC as the referee) | 33 in-game scenarios, zero alerts | `docs/anti-cheat.md` |
+
+### Not implemented yet
+
+- **Resource packs.** A server with `require-resource-pack=true` kicks a client
+  that never answers `ClientboundResourcePackPushPacket`; nothing sends that
+  answer today, so those servers are out of reach.
+- **Scoreboard, boss bars, titles, action bars.** The packets are decoded for a
+  few of them and no state is kept.
+- **Riding.** Boat and minecart *physics* exist and placing them works, but there
+  is no "mount / steer / dismount" API (the movement packets are implemented
+  without a caller).
+- **Signs and block-entity text.** The block entity data is decoded, there is no
+  editor for it.
+- **Automatic respawn.** Deliberate: the library leaves death and respawn to the
+  caller or a server-side plugin (`plugins/respawn.py` ships as an example).
+- **A second release with end-to-end proof.** 1.21.8–26.2 have tables and unit
+  tests, not a live run.
+- **A recipe database.** Recipes are declared by the caller (`Recipe`,
+  `recipe_for`); there is no scraped recipe book.
 
 ## Quick start
 
@@ -76,6 +114,62 @@ async def main():
 
 asyncio.run(main())
 ```
+
+### A tour of the whole library
+
+[`examples/tour.py`](examples/tour.py) is a runnable script that walks through
+every layer in order and prints what the *server* answered at each step: read the
+data tables, walk with a goal, dig one block with an action, pick the drop up,
+put the block back, then do the same thing again as one `Task`. Start there; it
+is the shortest path from "it connects" to "it plays".
+
+The shape of a real script, all the way up:
+
+```python
+import asyncio
+from protobot import connect
+from protobot.goals import BreakBlockGoal, ReachGoal, SequenceGoal
+from protobot.tasks import BreakBlocks, PlaceBlocks, Task
+
+async def main():
+    bot = await connect("127.0.0.1", username="Builder", version="26.3")
+    await bot.wait_world()
+
+    # 1. one action, confirmed by the server's own block update
+    result = await bot.actions.dig((10, -60, 4))
+    print(result.status, result.evidence)
+
+    # 2. a window: open it, move items, let the server confirm every click
+    chest = await bot.menu.open_block((12, -60, 4))
+    await chest.deposit("minecraft:oak_log", count=8)
+
+    # 3. intent: walk there, then break that block
+    report = await bot.goals.run(
+        SequenceGoal(ReachGoal(20.5, 4.5, tolerance=1.0), BreakBlockGoal((20, -60, 4))),
+        timeout=90,
+    )
+    print(report.status, report.elapsed)
+
+    # 4. a script: the same steps with retries and a per-step report
+    task = Task("tidy")
+    task.add(BreakBlocks([(24, -60, 4), (25, -60, 4)], hold=1.5))
+    task.add(PlaceBlocks([((24, -60, 4), "minecraft:oak_log")]))
+    done = await bot.tasks.run(task, timeout=180)
+    print(done)                       # "tidy: 2/2 steps in 12.41s"
+
+    await bot.close()
+
+asyncio.run(main())
+```
+
+Each layer is usable on its own and each one reports a reason instead of
+guessing: an action says `CONFIRMED`, `UNCONFIRMED`, `REJECTED` or `SENT`; a goal
+only finishes when the decoded world says it is done; a task names the step and
+the attempt that failed. The contracts live in
+[`docs/architecture.md`](docs/architecture.md),
+[`docs/automation.md`](docs/automation.md) and
+[`docs/containers.md`](docs/containers.md); the full index is
+[`docs/README.md`](docs/README.md).
 
 ### Walking and pathfinding
 

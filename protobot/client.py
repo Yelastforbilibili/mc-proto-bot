@@ -261,6 +261,21 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, Picku
         self._menu = None
         self._layout_cache = {}
         self._last_seen_messages = _LastSeenMessagesTracker()
+        # One tick is one movement packet.  Goals, actions and a caller's own
+        # loop can all ask for one at the same time, and two bodies running at
+        # once would advance the physics twice and report it as a single step --
+        # a position the server cannot predict.  ``_action_busy_until`` tells a
+        # caller-side tick loop to stay out of a tick an action has reserved.
+        self._tick_lock = asyncio.Lock()
+        # The position of the last position-carrying packet, so a rotation that
+        # does not move the player can go out as a rotation-only packet, the way
+        # vanilla sends it.
+        self._last_sent_position: tuple[float, float, float] | None = None
+        self._action_busy_until = 0.0
+        # Pongs held back while an action is between its swing and the movement
+        # packet of the same tick; they go out once that tick is closed, because
+        # a pong is the moment an anti-cheat judges the packets queued before it.
+        self._pong_pending: list[int] = []
 
     @property
     def active_container(self) -> ContainerState | None:

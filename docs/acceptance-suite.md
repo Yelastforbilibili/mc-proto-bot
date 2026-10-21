@@ -89,6 +89,7 @@ to a spam counter per message and removes one per tick, kicking above 200.
 | 30 | items | minecarts | a minecart on a rail, a minecart entity on the server |
 | 31 | items | sleeping | a bed entered at night, the server rolls the clock over |
 | 32 | items | breeding | wheat to two cows, a third cow on the server |
+| 33 | tasks | a task of steps | one Task runs dig → walk → place → a server check, and the report names every step |
 
 Cases 24 to 27 are the ones that need a second party (the server's own menu logic, or another
 player watching), so they are the slowest proofs in the suite and the ones most worth reading when
@@ -193,12 +194,12 @@ powershell -File .\tools\ci_local.ps1 -Live
   ok    byte-compile (protobot, tools, tests)           0.2s
   ok    import hygiene (tools\check_imports.py)         0.5s
   ok    unit tests (no server, no network)             49.7s
-  ok    acceptance suite (32 cases, GrimAC on)        267.1s
+  ok    acceptance suite (33 cases, GrimAC on)        267.1s
   total 317.5s
   all steps passed
 ```
 
-342 unit tests plus the 32 live scenarios (`[suite] 32/32 passed`,
+342 unit tests plus the 33 live scenarios (`[suite] 33/33 passed`,
 `[suite] no anti-cheat alerts`); GrimAC 2.x with `alerts.print-to-console: true`,
 `experimental-checks: false`.
 

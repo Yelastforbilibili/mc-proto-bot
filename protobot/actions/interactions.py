@@ -179,6 +179,15 @@ class Actions:
         """
 
         close = getattr(self.client, "close_tick", None)
+        # Reserve this tick for the action: a caller's own tick loop (the
+        # acceptance suite runs one to fill the gaps made by its HTTP calls)
+        # must not slip a movement packet in between the close and the action,
+        # because the action would then be queued inside that tick and reported
+        # by the next transaction as a misordered packet.
+        try:
+            self.client._action_busy_until = time.monotonic() + 0.08
+        except AttributeError:
+            pass
         if close is not None:
             await close()
         await self.client.wait_tick_budget()
@@ -251,20 +260,20 @@ class Actions:
             and abs(state.pitch - pitch) < ROTATION_EPSILON
         ):
             return yaw, pitch
-        if tick:
-            # Run the physics of a tick first: the on-ground flag that rides
-            # along in the next movement packet has to be the fresh one.
-            await self.client.tick()
+        # Set the view and let the tick that was going to run anyway carry it:
+        # ``tick`` sees the changed angles and sends position *and* rotation in
+        # one packet.  A packet of its own would be a second movement claim in
+        # the same tick, and while the player is still sliding to a stop that
+        # claim says "I did not move" where the server predicts the slide.
+        state.yaw, state.pitch = yaw, pitch
+        if not tick:
+            await self.client.send_look(yaw, pitch)
+            return yaw, pitch
+        await self.client.tick()
+        # A second tick with the aim already in place, so the server's last two
+        # rotations agree when the click arrives.
         await self.client.wait_tick_budget()
-        stand = self.client.physics_state.position
-        await self.client.send_position_and_rotation(
-            stand.x, stand.y, stand.z, yaw, pitch
-        )
-        if tick:
-            # And one more tick with the aim in place, so both the rotation of
-            # this tick and the one before it point the same way.
-            await self.client.wait_tick_budget()
-            await self.client.tick()
+        await self.client.tick()
         return yaw, pitch
 
     def raycast(
@@ -612,7 +621,11 @@ class Actions:
 
         started = time.monotonic()
         packets: list[int] = []
-        await self.client.wait_tick_budget()
+        # Aiming leaves a movement packet behind, and that tick stays open until
+        # its ``client_tick_end``.  An action sent inside that tick is queued
+        # after the movement and reported by the transaction as a misordered
+        # packet, so close it first and act in the gap.
+        await self._open_action_tick()
         if self.profile.attack_packet:
             packets.append(
                 await self._send(
@@ -917,11 +930,10 @@ class Actions:
         # that goes with the button going down, then the movement packet that
         # closes the tick.  Grim's PacketOrderB reads exactly this -- an
         # interaction has to be followed by an animation -- and NoSwingBreak
-        # wants an animation in the same tick as the break.  Waiting for the
-        # tick budget first puts the whole triple in the same flush: aiming has
-        # just sent a movement packet, and a start that sits in the queue on its
-        # own is what Grim's Post reports as "player digging".
-        await self.client.wait_tick_budget()
+        # wants an animation in the same tick as the break.  The tick the aim
+        # opened is closed first, so the start does not sit inside a tick that
+        # already carried a movement packet.
+        await self._open_action_tick()
         packets = [
             await self._send(
                 "serverbound_player_action",
@@ -948,7 +960,11 @@ class Actions:
         # the stop arrived and cancels the packet (Grim's ``FastBreak``), which
         # leaves the server's destroy state armed and its crack stages climbing
         # for everyone watching.
-        closing = codes.abort if early else codes.stop
+        #
+        # A block that is already gone is the other case for ABORT: the stop
+        # would name a block the server no longer has, which reads as "digging
+        # something that cannot be broken" (Grim's ``AirLiquidBreak``).
+        closing = codes.abort if early or broke else codes.stop
         if send_stop:
             # The break goes out in a tick that started with a swing, the way a
             # client that is still holding the button sends it: animation, stop,
@@ -1059,8 +1075,9 @@ class Actions:
         # The click belongs to a tick, and the tick has to be closed straight
         # away: a placement that is still queued when a transaction lands is
         # what Grim's Post reports ("player block placement"), the same way a
-        # stray rollback of the arm swing gets reported as "punch".
-        await self.client.wait_tick_budget()
+        # stray rollback of the arm swing gets reported as "punch".  Closing the
+        # tick the aim opened keeps the click in the gap between ticks.
+        await self._open_action_tick()
         packet_id = await self._send("serverbound_use_item_on", "use_item_on", payload)
         # Vanilla swings the arm when the hand uses an item on a block, so the
         # placement has an animation behind it just like a break does.

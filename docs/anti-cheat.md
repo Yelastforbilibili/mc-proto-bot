@@ -80,8 +80,11 @@ of the tick the click arrived in.  Three things had to change to satisfy it:
 - the aim is the centre of the clicked face, the point a real crosshair sits on,
   not the centre of the block that is about to appear -- a ray to the destination
   passes *over* the clicked box and the trace misses;
-- the turn travels in a movement packet (`position_and_rotation`), never in a
-  bare look packet, so the aim is part of a tick;
+- the turn travels in the movement packet of the tick it belongs to, never in a
+  bare look packet: `turn_to` sets the view and lets the next `tick()` carry it,
+  so the aim is part of a tick and no second, empty movement claim is made (a
+  look packet while the player is still sliding to a stop claims "I did not move"
+  where the server predicts the slide, which is `Simulation`);
 - physics runs for one tick before that packet, so it carries current flags.
 
 `GroundSpoof` flags a movement packet that claims "not on ground" while the
@@ -121,6 +124,32 @@ decays) at the start of a walk that came right after a burst of `/setblock`
 calls.  `Suite.keep_ticking()` fills those gaps: it ticks whenever the last
 movement packet is more than 75 ms old, exactly like a client that is not doing
 anything else.
+
+## 7. Answer pings where the tick allows, and in order
+
+A pong is the transaction an anti-cheat judges the packets queued before it at.
+Grim's `GrimProcessor.isTransaction` counts exactly two packets --
+`ServerboundPongPacket` and `ServerboundWindowConfirmationPacket` -- and `Post`
+clears its per-tick queue only on a movement packet:
+
+```
+movement  -> post.clear(); sentFlying = true
+pong      -> if (sentFlying && !post.isEmpty()) flag(post.getFirst())
+action    -> queued, but only while sentFlying
+```
+
+So the safe order inside a tick is animation, movement, and *then* anything else;
+a pong that arrives in the moment between an action's swing and that tick's
+movement packet makes the swing look like it arrived out of order:
+
+```
+Grim » SuiteBot 触发了 Post (x8) punch v26.3
+```
+
+`Bot._pong_pending` holds the answer while an action owns the tick
+(`_action_busy_until`) and `end_tick()` flushes it once the movement packet has
+gone out.  The answers leave in the order the pings arrived: answering a newer
+ping first is `TransactionOrder` ("skipped=1"), a check of its own.
 
 ## What this document is not about
 
