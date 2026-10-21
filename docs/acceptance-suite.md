@@ -84,10 +84,21 @@ to a spam counter per message and removes one per tick, kicking above 200.
 | 25 | machines | a window that stops being valid | distance and a broken block both raise `MenuNotOpen` |
 | 26 | spectator | watching a registered bot | `/see` mirrors slots in both patterns, `/see stop` restores |
 | 27 | machines | the enchanting table | sword plus lapis, button click, an enchanted sword in the server's inventory |
+| 28 | items | buckets | water and lava poured on a solid top face, the server's block changes |
+| 29 | items | boats | an oak boat placed on water, a boat entity on the server |
+| 30 | items | minecarts | a minecart on a rail, a minecart entity on the server |
+| 31 | items | sleeping | a bed entered at night, the server rolls the clock over |
+| 32 | items | breeding | wheat to two cows, a third cow on the server |
 
 Cases 24 to 27 are the ones that need a second party (the server's own menu logic, or another
 player watching), so they are the slowest proofs in the suite and the ones most worth reading when
 something about menus or spectators changes.
+
+Cases 28 to 32 are the *use* half of the item system: each one asserts an effect the server owns
+(a block that changed, an entity that exists, a clock that moved, a mob that appeared) rather than
+something the client can claim. They also pin down where vanilla puts the work: a bucket has only
+`use` (the client sends the block click and then the use *in the same tick*), a bed only needs an
+empty hand at night, and breeding needs mobs that kept their AI.
 
 ## How a scenario is isolated
 
@@ -181,12 +192,18 @@ powershell -File .\tools\ci_local.ps1 -Live
 == summary
   ok    byte-compile (protobot, tools, tests)           0.2s
   ok    import hygiene (tools\check_imports.py)         0.5s
-  ok    unit tests (no server, no network)             44.3s
-  ok    acceptance suite (27 cases, GrimAC on)        222.0s
-  total 267.0s
+  ok    unit tests (no server, no network)             49.7s
+  ok    acceptance suite (32 cases, GrimAC on)        267.1s
+  total 317.5s
   all steps passed
 ```
 
-333 unit tests plus the 27 live scenarios (`[suite] 26/27 passed` in a full `--run all` (case 24 is order-sensitive: one of its six window clicks is reported as a misordered placement when it runs straight after the mixed cases, while the same case passes on its own),
+342 unit tests plus the 32 live scenarios (`[suite] 32/32 passed`,
 `[suite] no anti-cheat alerts`); GrimAC 2.x with `alerts.print-to-console: true`,
 `experimental-checks: false`.
+
+Two scenarios live in a state the server controls rather than the bot: case 31
+kills the night only when the sleeping player is the last one awake, so with an
+operator connected it asserts what the bot owns instead (the bed accepted it and
+`SleepTimer` reached 100) and says so in chat. Case 26 needs a second client to
+watch the first one.

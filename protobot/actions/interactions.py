@@ -522,8 +522,15 @@ class Actions:
         *,
         hand: str | int = "main_hand",
         position: Vec3 | None = None,
+        tick: bool = True,
     ) -> ActionResult:
-        """Right click an entity."""
+        """Right click an entity.
+
+        The click and its swing belong to one movement tick, exactly like an
+        attack: a vanilla client sends interact, animation and then that tick's
+        movement packet, and an interact left alone in a tick is what the
+        anti-cheat's packet-order check calls out.
+        """
 
         started = time.monotonic()
         hand_code = _hand(hand)
@@ -539,13 +546,17 @@ class Actions:
                 .write_varint(hand_code)
                 .to_bytes()
             )
+        await self._open_action_tick()
         packet_id = await self._send("serverbound_interact", "interact", payload)
+        swing_id = await self._swing_packet(hand)
+        if tick:
+            await self.client.tick()
         return await self._emit(
             ActionResult(
                 action="interact",
                 status=ActionStatus.SENT,
                 entity_id=entity_id,
-                packets=(packet_id,),
+                packets=(packet_id, swing_id),
                 elapsed=time.monotonic() - started,
             )
         )
@@ -1263,6 +1274,44 @@ class Actions:
             self.profile.codes.release_use_item,
             position=position,
             face=face,
+        )
+
+    async def use_item(
+        self,
+        *,
+        hand: str | int = "main_hand",
+        tick: bool = True,
+    ) -> ActionResult:
+        """Right-click with the held item, aimed by the current rotation.
+
+        This is the packet a vanilla client sends when the crosshair is *not* on
+        a block, and also when it *is*: a block click that the block declines
+        (``InteractionResult.PASS``) is followed by this one in the same tick.
+        Buckets are the reason that matters -- ``BucketItem`` only implements
+        ``use``, so pouring water is entirely this packet, and the server does
+        its **own** ray from the player's eye with the rotation sent here.  Aim
+        first, then call it.
+        """
+
+        started = time.monotonic()
+        state = self.client.physics_state
+        await self._open_action_tick()
+        sequence = await self.client.use_item(
+            hand=hand, yaw=state.yaw, pitch=state.pitch
+        )
+        packet_id = self._packet_id("serverbound_use_item", "use_item")
+        swing_id = await self._swing_packet(hand)
+        if tick:
+            await self.client.tick()
+        return await self._emit(
+            ActionResult(
+                action="use_item",
+                status=ActionStatus.SENT,
+                sequence=sequence,
+                packets=(packet_id, swing_id),
+                elapsed=time.monotonic() - started,
+                extra={"hand": _hand(hand), "yaw": state.yaw, "pitch": state.pitch},
+            )
         )
 
     async def drop_item(

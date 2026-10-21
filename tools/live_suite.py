@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from protobot import connect
-from protobot.actions import ActionStatus
+from protobot.actions import ActionStatus, BlockFace
 from protobot.constants import IDLE_TICK_SECONDS
 from protobot.containers import Menu, MenuNotOpen
 from protobot.crafting import recipe_for
@@ -124,6 +124,46 @@ class Bridge:
         payload = self.call("/players")
         players = payload.get("players")
         return players if isinstance(players, list) else []
+
+    def entities(
+        self,
+        world: str,
+        *,
+        x: float = 0.0,
+        y: float = 0.0,
+        z: float = 0.0,
+        radius: float = 16.0,
+    ) -> list[dict[str, Any]]:
+        """Loaded entities the server has around a point.
+
+        The bridge reads them from the server's own entity list, so this is the
+        authority for "did the boat appear": the client's entity map can lag a
+        packet behind, the server's list cannot.
+        """
+
+        payload = self.call(
+            "/entities",
+            query={"world": world, "x": x, "y": y, "z": z, "radius": radius},
+        )
+        entities = payload.get("entities")
+        return entities if isinstance(entities, list) else []
+
+    def entities_of(self, world: str, kind: str, **around: Any) -> list[dict[str, Any]]:
+        return [
+            entity
+            for entity in self.entities(world, **around)
+            if kind in str(entity.get("type"))
+        ]
+
+    def world_time(self, world: str) -> int | None:
+        """The world's day time, which is how a skipped night is visible."""
+
+        payload = self.call("/worlds")
+        for entry in payload.get("worlds") or []:
+            if entry.get("name") == world:
+                value = entry.get("time")
+                return int(value) if isinstance(value, (int, float)) else None
+        return None
 
     def events(self, *, since: int = 0, limit: int = 400) -> list[dict[str, Any]]:
         payload = self.call("/events", query={"since": since, "limit": limit})
@@ -370,6 +410,8 @@ class Suite:
         self.stop_requested = False
         # One row per scenario that ran: case, passed, seconds, detail.
         self.results: list[tuple[Case, bool, float, str]] = []
+        # Set while the bot is asleep: vanilla clients send no movement then.
+        self.ticks_paused = False
         self.own_uuid = getattr(bot, "uuid", None)
         self.username = getattr(bot, "username", "SuiteBot")
         self.last_said = 0.0
@@ -464,6 +506,19 @@ class Suite:
 
     def command(self, command: str) -> str:
         return self.bridge.command(command)
+
+    def command_quiet(self, command: str) -> str:
+        """Run a command whose answer we do not care about.
+
+        The bridge answers 500 for commands that *return a value* (``gamerule``,
+        ``time query``).  The command itself still runs, so a scene that only
+        wants the side effect should not fail on the answer.
+        """
+
+        try:
+            return self.command(command)
+        except urllib.error.HTTPError:
+            return ""
 
     def setblock(self, position: tuple[int, int, int], block: str) -> None:
         self.bridge.setblock(self.world, position, block)
@@ -1017,6 +1072,11 @@ class Suite:
 
         while not self.bot.closed.is_set():
             await asyncio.sleep(0.02)
+            if self.ticks_paused:
+                # A vanilla client stops reporting movement while it sleeps, and
+                # a claim made from the old spot after the server has already
+                # laid the player in the bed reads as a spoofed movement.
+                continue
             try:
                 behind = time.monotonic() - (self.bot._last_tick_packet_time or 0.0)
                 if behind > IDLE_TICK_SECONDS:
@@ -1039,6 +1099,10 @@ class Suite:
         self.mark_log()
         try:
             await self.reset()
+            # The window starts once the scene is clean: teleporting a bot out
+            # of the previous scene is infrastructure, and a correction packet
+            # during it would otherwise be charged to the case that follows.
+            self.mark_log()
             await asyncio.wait_for(item.run(self), timeout=item.timeout)
         except asyncio.CancelledError:
             outcome, detail = "STOP", "已中止"
@@ -2207,6 +2271,394 @@ async def enchanting_table(s: Suite) -> None:
     assert after < before, f"等级没有扣：{before} → {after}"
     assert s.bot.player_menu.count("minecraft:lapis_lazuli") < 5, "青金石没有扣"
     await s.say(f"    附魔成功：等级 {before}→{after}，服务端背包里已经带 enchantments")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(28, "新能力", "桶：水桶与岩浆桶倒在实心方块顶上", timeout=180.0)
+async def bucket_liquids(s: Suite) -> None:
+    """Buckets are poured with the *item use* packet, not the block click.
+
+    ``BucketItem`` only overrides ``use`` (the right-click item path), so the
+    block click a vanilla client sends first is declined by the block and the
+    server does nothing; the client then follows it with ``ServerboundUseItem``
+    in the same tick, and *that* is what pours (the server runs its own ray from
+    the eye, so the aim has to be right before either packet).
+    """
+
+    floor = s.clear_spot(s.spot(2, 0))
+    above = (floor[0], floor[1] + 1, floor[2])
+    s.setblock(floor, "minecraft:stone")
+    s.air(above)
+    await s.wait_chunk(floor)
+    await s.settle(0.4)
+    s.clear_inventory()
+    await s.settle(0.4)
+
+    for item, liquid in (
+        ("minecraft:water_bucket", "minecraft:water"),
+        ("minecraft:lava_bucket", "minecraft:lava"),
+    ):
+        s.give(item, 1)
+        await s.settle(0.5)
+        await s.hold(item)
+        await s.settle(0.4)
+        selected = s.command(f"data get entity {s.username} SelectedItem")
+        assert item.split(":")[-1] in selected, f"手上不是 {item}：{selected}"
+        await s.bot.actions.turn_to(
+            (floor[0] + 0.5, floor[1] + 1.0, floor[2] + 0.5)
+        )
+        # Vanilla order: the block click first (which the bucket declines), and
+        # the item use right after it in the same tick.
+        await s.bot.actions.use_item_on(
+            floor, face=BlockFace.UP, cursor=(0.5, 1.0, 0.5), tick=False
+        )
+        await s.bot.actions.use_item()
+        deadline = time.monotonic() + 6.0
+        placed = ""
+        while time.monotonic() < deadline:
+            placed = s.bridge.block_type(s.world, above)
+            if placed == liquid:
+                break
+            await s.settle(0.1)
+        assert placed == liquid, (
+            f"{liquid} 没有出现在 {above}：现在那里是 {placed or '未知'}"
+            f"（手上的还是 {selected}）"
+        )
+        # The bucket is empty afterwards, which is what a vanilla client sees.
+        emptied = await s.wait_server_count("minecraft:bucket", 1, timeout=4.0)
+        assert emptied >= 1, f"倒完 {item} 之后背包里没有空桶"
+        # Put the cell back to air for the next round; a flowing liquid would
+        # otherwise keep replacing itself and hide the second pour.
+        s.setblock(above, "minecraft:air")
+        s.clear_inventory()
+        await s.settle(0.5)
+
+    # Scooping is the same packet pointed at the liquid: the bucket fills and
+    # the liquid disappears, which is the other half of the vanilla behaviour.
+    # The block click still names the *solid* block behind the liquid -- a
+    # client's block pick skips fluids, and naming the liquid itself claims a
+    # placement against air.
+    s.setblock(above, "minecraft:water")
+    await s.settle(0.5)
+    s.give("minecraft:bucket", 1)
+    await s.settle(0.4)
+    await s.hold("minecraft:bucket")
+    await s.settle(0.3)
+    await s.bot.actions.turn_to(
+        (above[0] + 0.5, above[1] + 0.6, above[2] + 0.5)
+    )
+    await s.bot.actions.use_item_on(
+        floor, face=BlockFace.UP, cursor=(0.5, 1.0, 0.5), tick=False
+    )
+    await s.bot.actions.use_item()
+    filled = await s.wait_server_count("minecraft:water_bucket", 1, timeout=6.0)
+    assert filled >= 1, "空桶没有舀起水"
+    scooped = ""
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        scooped = s.bridge.block_type(s.world, above)
+        if scooped != "minecraft:water":
+            break
+        await s.settle(0.1)
+    assert scooped != "minecraft:water", f"水没有被舀走：{above} 还是水"
+    await s.say("    水桶/岩浆桶倒出、空桶回收、舀水都由服务端确认")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(29, "新能力", "船：橡木船放进水里，服务端真的多了一条船", timeout=180.0)
+async def boat_in_water(s: Suite) -> None:
+    """A boat is placed by the item-use packet aimed at a water surface.
+
+    ``BoatItem`` only overrides ``use``, and the server casts its own ray from
+    the eye, so the aim has to sit on the water's top face before the packet
+    goes out.  The proof is server side: a ``minecraft:oak_boat`` entity the
+    server lists, and the boat gone from the hand.
+    """
+
+    centre = s.clear_spot(s.spot(3, 1))
+    # The water sits in the feet-level cell, its floor one lower, and a stone
+    # rim keeps it from running: the surface ends up level with the bot's feet.
+    level = centre[1]
+    pool: list[tuple[int, int, int]] = []
+    for dx in range(-1, 2):
+        for dz in (-1, 0, 1):
+            water = (centre[0] + dx, level, centre[2] + dz)
+            s.setblock((water[0], level - 1, water[2]), "minecraft:stone")
+            s.setblock(water, "minecraft:water")
+            s.air((water[0], level + 1, water[2]))
+            pool.append(water)
+    for dx in range(-2, 3):
+        for dz in (-2, 2):
+            s.setblock((centre[0] + dx, level, centre[2] + dz), "minecraft:stone")
+    for dz in range(-1, 2):
+        for dx in (-2, 2):
+            s.setblock((centre[0] + dx, level, centre[2] + dz), "minecraft:stone")
+    await s.wait_chunk(pool[4])
+    await s.settle(0.6)
+    s.clear_inventory()
+    s.give("minecraft:oak_boat", 1)
+    await s.settle(0.6)
+    await s.hold("minecraft:oak_boat")
+    await s.settle(0.3)
+    held = s.command(f"data get entity {s.username} SelectedItem")
+    assert "oak_boat" in held, f"手上不是船：{held}"
+
+    surface = (float(centre[0]) + 0.5, float(level + 1), float(centre[2]) + 0.5)
+    await s.bot.actions.turn_to(surface)
+    await s.settle(0.3)
+    hit = s.bot.actions.raycast()
+    assert hit is not None, "眼睛没有指向水面"
+    await s.bot.actions.use_item()
+
+    around = {
+        "x": float(centre[0]) + 0.5,
+        "y": float(level) + 0.5,
+        "z": float(centre[2]) + 0.5,
+        "radius": 6.0,
+    }
+    boats: list[dict[str, Any]] = []
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        boats = s.bridge.entities_of(s.world, "boat", **around)
+        if boats:
+            break
+        await s.settle(0.1)
+    assert boats, (
+        f"服务端没有出现船（瞄准点 {surface}，脚下 {s.bot.physics_state.position}，"
+        f"射线 {hit}，附近实体 "
+        f"{[entity.get('type') for entity in s.bridge.entities(s.world, **around)]}）"
+    )
+    boat = boats[0]
+    assert level <= float(boat.get("y") or 0) <= level + 2.0, (
+        f"船没有落在水面上：y={boat.get('y')}，水面 y={level + 1}"
+    )
+    assert s.server_count("minecraft:oak_boat") == 0, "船放下之后手上还留着一只"
+    await s.say(f"    船落在 {boat.get('type')} y={float(boat.get('y') or 0):.2f}（服务端列表）")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(30, "新能力", "矿车：铁轨上放矿车，服务端多一辆车", timeout=180.0)
+async def minecart_on_rail(s: Suite) -> None:
+    """A minecart is the block click: ``MinecartItem.useOn`` places the entity."""
+
+    rail = s.clear_spot(s.spot(2, 0))
+    s.command(f"setblock {rail[0]} {rail[1]} {rail[2]} minecraft:rail")
+    s.air((rail[0], rail[1] + 1, rail[2]))
+    await s.wait_chunk(rail)
+    await s.settle(0.5)
+    s.clear_inventory()
+    s.give("minecraft:minecart", 1)
+    await s.settle(0.5)
+    await s.hold("minecraft:minecart")
+    await s.settle(0.3)
+    await s.bot.actions.turn_to((rail[0] + 0.5, float(rail[1]) + 1.0, rail[2] + 0.5))
+    await s.bot.actions.use_item_on(
+        rail, face=BlockFace.UP, cursor=(0.5, 1.0, 0.5)
+    )
+    around = {
+        "x": rail[0] + 0.5,
+        "y": rail[1] + 1.0,
+        "z": rail[2] + 0.5,
+        "radius": 4.0,
+    }
+    carts: list[dict[str, Any]] = []
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        carts = s.bridge.entities_of(s.world, "minecart", **around)
+        if carts:
+            break
+        await s.settle(0.1)
+    assert carts, (
+        f"铁轨上没有出现矿车（附近实体 "
+        f"{[entity.get('type') for entity in s.bridge.entities(s.world, **around)]}）"
+    )
+    assert s.server_count("minecraft:minecart") == 0, "矿车放下之后手上还留着一辆"
+    await s.say(f"    矿车出现在 {rail} 的铁轨上（服务端列表）")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(31, "新能力", "睡觉：夜里点床，服务端把夜晚跳过", timeout=180.0)
+async def sleep_in_bed(s: Suite) -> None:
+    """Lying down is a block click with an empty hand, and the night skip proves it.
+
+    The click has to be worth something on the server: with one player online the
+    default ``playersSleepingPercentage`` is met, so a real sleep rolls the world
+    clock over to morning.  An empty hand matters because 26.3 routes the click
+    through ``useWithoutItem`` only when there is nothing to place.
+    """
+
+    base = s.clear_spot(s.spot(2, 2))
+    # A bed is two blocks standing in the feet-level cells: foot at the spot,
+    # head one to the south.  Both need a floor under them, and neither may sit
+    # under the player -- sleeping in a bed you are standing inside is refused.
+    foot = base
+    head = (base[0], base[1], base[2] + 1)
+    s.setblock((foot[0], foot[1] - 1, foot[2]), "minecraft:stone")
+    s.setblock((head[0], head[1] - 1, head[2]), "minecraft:stone")
+    s.command(
+        f"setblock {foot[0]} {foot[1]} {foot[2]} "
+        "minecraft:red_bed[part=foot,facing=south]"
+    )
+    s.command(
+        f"setblock {head[0]} {head[1]} {head[2]} "
+        "minecraft:red_bed[part=head,facing=south]"
+    )
+    s.air((foot[0], foot[1] + 1, foot[2]), (head[0], head[1] + 1, head[2]))
+    await s.wait_chunk(foot)
+    if s.bridge.block_type(s.world, foot) != "minecraft:red_bed":
+        raise AssertionError(
+            f"床没有放下：{foot} 是 {s.bridge.block_type(s.world, foot)}，"
+            f"床头是 {s.bridge.block_type(s.world, head)}"
+        )
+    s.command("time set 18000")
+    s.command("weather clear")
+    await s.settle(0.6)
+    s.clear_inventory()
+    await s.settle(0.4)
+    night = s.bridge.world_time(s.world)
+    assert night is not None and night > 12000, f"没有到夜里：time={night}"
+
+    await s.bot.actions.turn_to((foot[0] + 0.5, float(foot[1]) + 0.6, foot[2] + 0.5))
+    await s.settle(0.2)
+    hit = s.bot.actions.raycast()
+    await s.bot.actions.use_item_on(foot, face=BlockFace.UP, cursor=(0.5, 1.0, 0.5))
+    # From here the bot is in bed.  A vanilla client stops sending movement
+    # while it sleeps, and the server has already moved the body into the bed:
+    # ticking from the old spot would claim movement that never happened.
+    s.ticks_paused = True
+    morning = None
+    asleep = deep = False
+    deadline = time.monotonic() + 20.0
+    try:
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            if not deep:
+                # "The bed accepted me" and "I slept long enough for the night
+                # to count" are two different vanilla facts: ``sleeping_pos``
+                # appears when the bed is entered, ``SleepTimer`` only caps at
+                # 100 after five seconds of staying in it.
+                nbt = s.command(f"data get entity {s.username}")
+                asleep = asleep or "sleeping_pos" in nbt
+                deep = deep or re.search(r"SleepTimer:\s*100s", nbt) is not None
+            current = s.bridge.world_time(s.world)
+            if current is not None and current < 1000:
+                morning = current
+                break
+    finally:
+        s.ticks_paused = False
+        await s.settle(0.6)
+    woke = (
+        (round(s.bot.physics_state.position.x, 2), round(s.bot.physics_state.position.y, 2), round(s.bot.physics_state.position.z, 2)),
+        s.server_position(),
+    )
+    assert asleep, (
+        f"床没有接受这次点击：脚 {s.bot.physics_state.position}，准星 {hit}，"
+        f"床 {foot}={s.bridge.block_type(s.world, foot)}"
+    )
+    # A skip is the strongest proof of the same fact: the server only rolls the
+    # clock over once a sleeper has sat in the bed past the vanilla threshold,
+    # and it wakes the player on the same tick -- so SleepTimer may never be
+    # caught at 100 by a poll that runs every 0.3 s.
+    assert deep or morning is not None, (
+        f"人躺下了但没睡够五个游戏秒：脚 {s.bot.physics_state.position}，"
+        f"准星 {hit}，床 {foot}={s.bridge.block_type(s.world, foot)}，"
+        f"SleepTimer 没到 100（time={s.bridge.world_time(s.world)}）"
+    )
+    # The clock only rolls over once every active player is asleep, so with an
+    # operator connected the night legitimately stays dark.  What belongs to
+    # this bot is that the bed accepted it and that it slept past the vanilla
+    # threshold; the rollover is asserted whenever the bot is alone.
+    others = [p for p in s.bridge.players() if p.get("name") != s.username]
+    if others:
+        await s.say(
+            f"    线上还有 {len(others)} 名玩家，原版不会跳过夜晚；"
+            "已确认入睡且 SleepTimer=100"
+        )
+    else:
+        assert morning is not None, (
+            f"只有我一个人在线，夜晚却没被跳过：床 {foot}，"
+            f"time 一直停在 {s.bridge.world_time(s.world)}"
+        )
+        await s.say(f"    夜里点床 → 服务端把时间跳到 {morning}")
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}（醒来时我们 {woke[0]}，服务端 {woke[1]}）"
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(32, "新能力", "繁殖：两头牛各喂小麦，生出小牛", timeout=180.0)
+async def breed_cows(s: Suite) -> None:
+    """Feeding two cows makes a third one, and the server counts all three.
+
+    The cows keep their brains: the mating goal needs a tick loop, so ``NoAI``
+    animals never breed however many wheat they eat.
+    """
+
+    base = s.clear_spot(s.spot(2, 0))
+    spots = [(base[0], base[1], base[2]), (base[0] + 1, base[1], base[2])]
+    s.command("kill @e[type=minecraft:cow]")
+    for spot in spots:
+        s.air(spot)
+    await s.settle(0.3)
+    for spot in spots:
+        s.command(
+            f"summon minecraft:cow {spot[0] + 0.5} {spot[1]} {spot[2] + 0.5} "
+            '{Tags:["breed"],PersistenceRequired:1b,Silent:1b,Invulnerable:1b}'
+        )
+    await s.settle(1.0)
+    around = {
+        "x": float(base[0]) + 0.5,
+        "y": float(base[1]),
+        "z": float(base[2]) + 0.5,
+        "radius": 12.0,
+    }
+    before = s.bridge.entities_of(s.world, "cow", **around)
+    assert len(before) >= 2, f"两头牛没召出来：{before}"
+
+    s.clear_inventory()
+    s.give("minecraft:wheat", 8)
+    await s.settle(0.6)
+    await s.hold("minecraft:wheat")
+    await s.settle(0.3)
+    wheat_before = s.server_count("minecraft:wheat")
+    cow_type = s.bot.version.entities.entity_id("minecraft:cow")
+    targets = [
+        entity_id
+        for entity_id, entity in s.bot.entities.items()
+        if entity.type_id == cow_type
+    ]
+    fed = 0
+    for entity_id in targets:
+        entity = s.bot.entities[entity_id]
+        await s.bot.actions.turn_to((entity.x, entity.y + 0.7, entity.z))
+        await s.settle(0.2)
+        await s.bot.actions.interact(entity_id)
+        fed += 1
+        if fed >= 2:
+            break
+        await s.settle(0.5)
+    assert fed >= 2, f"只点到 {fed} 头牛"
+    await s.settle(0.5)
+    wheat_after = s.server_count("minecraft:wheat")
+    assert wheat_after == wheat_before - 2, (
+        f"小麦没有各被吃一个：{wheat_before} → {wheat_after}"
+    )
+
+    grown: list[dict[str, Any]] = []
+    deadline = time.monotonic() + 20.0
+    while time.monotonic() < deadline:
+        await s.settle(1.0)
+        grown = s.bridge.entities_of(s.world, "cow", **around)
+        if len(grown) > len(before):
+            break
+    assert len(grown) > len(before), (
+        f"没有生小牛：喂食前 {len(before)} 头，现在 {len(grown)} 头"
+    )
+    await s.say(f"    两头牛各吃一个小麦，服务端从 {len(before)} 头变成 {len(grown)} 头")
+    s.command("kill @e[type=minecraft:cow]")
     bad = s.anti_cheat_lines()
     assert not bad, f"反作弊日志：{bad[:2]}"
 
