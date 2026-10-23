@@ -24,6 +24,7 @@ from protobot.containers import (
     player_menu,
 )
 from protobot.containers import menu as menu_module
+from protobot.expectation import ExpectationStatus
 from protobot.physics import Vec3
 from protobot.protocol.versions import get_version
 from protobot.state import ContainerState, ItemStack
@@ -506,6 +507,32 @@ class ClickTests(unittest.TestCase):
         self.assertGreater(self.menu.revision, revision)
         self.assertEqual(self.menu.slot_revision, revision)
         self.assertFalse(asyncio.run(self.menu.wait_for_update(revision, timeout=0.05)))
+
+    def test_a_landed_click_is_recorded_as_done(self) -> None:
+        revision = self.menu.slot_revision
+        self.server.set(3, DIRT, 7)
+        self.assertTrue(asyncio.run(self.menu.wait_for_update(revision, timeout=0.2)))
+        self.assertIsNotNone(self.menu.last_outcome)
+        assert self.menu.last_outcome is not None  # for type checkers
+        self.assertIs(self.menu.last_outcome.status, ExpectationStatus.DONE)
+
+    def test_a_closed_window_ends_the_wait_with_a_reason(self) -> None:
+        # Death, walking away or a broken block closes the window server-side.
+        # Polling until the timeout made that look like a slow server; the wait
+        # now goes through the expectation loop, which can say why it stopped.
+        revision = self.menu.slot_revision
+        self.server.state.is_open = False
+        self.assertFalse(asyncio.run(self.menu.wait_for_update(revision, timeout=0.2)))
+        assert self.menu.last_outcome is not None
+        self.assertIs(self.menu.last_outcome.status, ExpectationStatus.INVALIDATED)
+        self.assertIn("closed window", self.menu.last_outcome.detail)
+
+    def test_a_window_that_closes_while_settling_says_so(self) -> None:
+        self.server.state.is_open = False
+        self.assertFalse(asyncio.run(self.menu.wait_until_quiet(timeout=0.05)))
+        assert self.menu.last_outcome is not None
+        self.assertIs(self.menu.last_outcome.status, ExpectationStatus.INVALIDATED)
+        self.assertIn("closed window", self.menu.last_outcome.detail)
 
     def test_quick_move_and_swap_and_throw(self) -> None:
         self.server.set(0, DIRT, 16)

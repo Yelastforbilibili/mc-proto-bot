@@ -33,6 +33,7 @@ from ..actions import BlockFace
 from ..constants import BLOCK_INTERACTION_RANGE, CLICK_TIMEOUT_SECONDS
 from ..constants import POLL_SECONDS as _POLL_SECONDS
 from ..constants import QUIET_SECONDS as _QUIET_SECONDS
+from ..expectation import ExpectationStatus, Outcome, wait_for_expectation
 from ..physics import Vec3
 from ..protocol.items import normalise_identifier
 from ..state import ContainerState, ItemStack
@@ -153,6 +154,11 @@ class Menu:
         #: replaced while the window was open.
         self.block_position: tuple[int, int, int] | None = None
         self.block_identifier: str | None = None
+        #: Why the last wait ended, in the same shape actions report.  ``None``
+        #: until the first :meth:`wait_for_update`; a closed window or a dead
+        #: player shows up as ``INVALIDATED`` with the reason instead of a
+        #: silent ``False``.
+        self.last_outcome: Outcome | None = None
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         try:
@@ -473,16 +479,19 @@ class Menu:
             container_id = self.container_id
         window = QUIET_SECONDS if quiet is None else quiet
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + max(timeout, window)
+        started = loop.time()
+        deadline = started + max(timeout, window)
         state = self.bot.containers.get(container_id)
         if state is None:
+            self.last_outcome = self._closed_outcome(container_id, started)
             return False
         last = state.slot_revision
         changed_at = loop.time()
         while loop.time() < deadline:
             await asyncio.sleep(POLL_SECONDS if window > POLL_SECONDS else max(window, POLL_SECONDS))
             state = self.bot.containers.get(container_id)
-            if state is None:
+            if state is None or not state.is_open:
+                self.last_outcome = self._closed_outcome(container_id, started)
                 return False
             if state.slot_revision != last:
                 last = state.slot_revision
@@ -491,6 +500,19 @@ class Menu:
             if window <= 0 or loop.time() - changed_at >= window:
                 return True
         return False
+
+    def _closed_outcome(self, container_id: int, started: float) -> Outcome:
+        """The ``INVALIDATED`` outcome for a window the server took away."""
+
+        return Outcome(
+            ExpectationStatus.INVALIDATED,
+            name=f"menu quiet (window {container_id})",
+            detail=(
+                f"the server closed window {container_id} while waiting for it "
+                "to settle"
+            ),
+            elapsed=max(0.0, asyncio.get_running_loop().time() - started),
+        )
 
     async def wait_for_update(
         self,
@@ -505,19 +527,40 @@ class Menu:
         ``revision``: a furnace or a brewing stand sends ``container_set_data``
         several times a second, and treating that as "the click landed" would
         report a move before the slot update it was waiting for had arrived.
+
+        The wait runs through the shared expectation loop, so a window that the
+        server closed underneath us (death, walking away, the block broken) ends
+        the wait with ``INVALIDATED`` and a reason on :attr:`last_outcome`
+        instead of polling until the timeout.
         """
 
         if container_id is None:
             container_id = self.container_id
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while True:
+
+        def changed() -> bool:
             state = self.bot.containers.get(container_id)
-            if state is not None and state.slot_revision != revision:
-                return True
-            if loop.time() >= deadline:
-                return False
-            await asyncio.sleep(POLL_SECONDS)
+            return state is not None and state.slot_revision != revision
+
+        def unusable() -> str | None:
+            state = self.bot.containers.get(container_id)
+            if state is None or not state.is_open:
+                return (
+                    f"the server closed window {container_id} while waiting for "
+                    "the click to land"
+                )
+            return None
+
+        outcome = await wait_for_expectation(
+            self.bot,
+            changed,
+            valid=unusable,
+            timeout=timeout,
+            name=f"menu update (window {container_id})",
+            tick=False,
+            poll=_POLL_SECONDS,
+        )
+        self.last_outcome = outcome
+        return outcome.ok
 
     async def pickup(self, slot: int, *, button: int = 0, **kwargs) -> bool:
         """Left click (``button=0``) or right click (``button=1``) a slot."""
@@ -1003,20 +1046,33 @@ class Menu:
         check what the client already knows before clicking.
         """
 
+        reason = self.invalid_reason(reach=reach)
+        if reason is not None:
+            raise MenuNotOpen(reason)
+
+    def invalid_reason(self, *, reach: float = BLOCK_INTERACTION_RANGE) -> str | None:
+        """Why this window can no longer be used, or ``None`` while it can.
+
+        The same four facts ``live()`` raises about, offered as a value: waits
+        hand it to :func:`~protobot.expectation.wait_for_expectation` as the
+        ``valid=`` hook, so a window that dies mid-click ends the wait as
+        ``INVALIDATED`` with this sentence rather than running out the clock.
+        """
+
         state = self.bot.containers.get(self.container_id)
         if state is None or not state.is_open:
-            raise MenuNotOpen(
+            return (
                 f"the server closed the window (container {self.container_id})"
             )
         player = self.bot.player
         if getattr(player, "dead", False) or player.health <= 0.0:
-            raise MenuNotOpen("the player died while the window was open")
+            return "the player died while the window was open"
         if self.block_position is None:
-            return
+            return None
         x, y, z = self.block_position
         identifier = self._block_identifier(x, y, z)
         if identifier != self.block_identifier:
-            raise MenuNotOpen(
+            return (
                 f"the block at {self.block_position} is {identifier or 'gone'},"
                 f" not {self.block_identifier} any more"
             )
@@ -1025,10 +1081,11 @@ class Menu:
             (x + 0.5, y + 0.5, z + 0.5), (position.x, position.y, position.z)
         )
         if gap > reach:
-            raise MenuNotOpen(
+            return (
                 f"the player is {gap:.1f} blocks from {self.block_position},"
                 " so the server would refuse the menu"
             )
+        return None
 
     def _block_identifier(self, x: int, y: int, z: int) -> str | None:
         world = getattr(self.bot, "world", None)

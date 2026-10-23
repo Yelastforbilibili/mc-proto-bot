@@ -309,6 +309,35 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(bot.buttons, [])
 
+    async def test_invalid_reason_is_none_while_the_window_works(self) -> None:
+        bot = MachineBot()
+        server = _open(bot, "minecraft:enchantment", menu_type_id=13)
+        menu = Menu(bot, server.state.container_id)
+        menu.block_position = (2, 64, 0)
+        menu.block_identifier = "minecraft:enchanting_table"
+        bot.world = WorldStub({(2, 64, 0): "minecraft:enchanting_table"})
+        self.assertIsNone(menu.invalid_reason())
+
+    async def test_invalid_reason_explains_a_dead_player(self) -> None:
+        # The value form of ``live()`` is what waits hand to the expectation
+        # loop, so it must name the same facts without raising.
+        bot = MachineBot(health=0.0)
+        server = _open(bot, "minecraft:enchantment", menu_type_id=13)
+        menu = Menu(bot, server.state.container_id)
+        self.assertIn("died", menu.invalid_reason() or "")
+        with self.assertRaises(MenuNotOpen) as caught:
+            menu.live()
+        self.assertEqual(menu.invalid_reason(), str(caught.exception))
+
+    async def test_invalid_reason_explains_a_block_that_changed(self) -> None:
+        bot = MachineBot()
+        server = _open(bot, "minecraft:enchantment", menu_type_id=13)
+        menu = Menu(bot, server.state.container_id)
+        menu.block_position = (2, 64, 0)
+        menu.block_identifier = "minecraft:enchanting_table"
+        bot.world = WorldStub({(2, 64, 0): "minecraft:oak_planks"})
+        self.assertIn("minecraft:oak_planks", menu.invalid_reason() or "")
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

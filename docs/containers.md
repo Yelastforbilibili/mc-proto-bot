@@ -195,6 +195,29 @@ client mirrors the window's player-side slots back into `bot.player.inventory`
 through the layout, which keeps `bot.get_inventory_item()` honest for the whole
 time a chest or a villager stays open.
 
+### Why a window stopped working
+
+A window dies without the caller asking: the player dies, walks out of reach, or
+the block behind it gets broken or replaced. Two ways to ask about that:
+
+```python
+menu.invalid_reason()       # None while usable, otherwise a sentence
+menu.live()                # same check, raises MenuNotOpen(reason)
+```
+
+The waits hand that same sentence to `protobot.expectation`, so a window that
+closes mid-click ends the wait as `INVALIDATED` instead of polling until the
+timeout:
+
+```python
+await menu.pickup(13)                  # True / False, as before
+menu.last_outcome.status               # DONE, or INVALIDATED + reason
+menu.last_outcome.describe()           # "invalidated after 0.004s (the server closed window 1 ...)"
+```
+
+`wait_until_quiet` records the same outcome when the window disappears while a
+click is still settling, which used to look like a slow server.
+
 ## Items this protocol cannot decode
 
 An item carrying *added* data components is not self-delimiting on the wire, so a
