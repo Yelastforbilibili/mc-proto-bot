@@ -1259,8 +1259,16 @@ class PlayRouterMixin:
         if entity is not None:
             entity.velocity_x, entity.velocity_y, entity.velocity_z = velocity
         if entity_id == self.session.entity_id:
-            self.player.velocity_x, self.player.velocity_y, self.player.velocity_z = velocity
-            self.physics_state.velocity = Vec3(*velocity)
+            # A vanilla client applies this impulse in the next tick it runs and
+            # never has to reconcile it with a tick that is already in flight.
+            # Our reader and our tick loop are separate tasks, so the impulse can
+            # land after the physics step but before that tick's movement packet
+            # goes out; the epoch tells _tick_once to recompute rather than claim
+            # a position that ignores the knockback.
+            if self.knockback:
+                self._motion_epoch += 1
+                self.player.velocity_x, self.player.velocity_y, self.player.velocity_z = velocity
+                self.physics_state.velocity = Vec3(*velocity)
         await self.events.emit("entity_motion", entity_id, velocity, entity)
 
     async def _handle_swing_animation(self, payload: bytes) -> None:

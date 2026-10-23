@@ -97,6 +97,13 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, Picku
         block_state_table: str | None = None,
         physics_engine: PhysicsEngine | None = None,
         physics_attributes: PhysicsAttributes | None = None,
+        # Whether an incoming knockback impulse moves the local predictor.  A
+        # vanilla client never switches this off: the server computes the
+        # impulse, sends it in one packet, and the client applies it on the
+        # next tick, which is what every prediction check expects to see.  The
+        # switch exists for callers that drive movement themselves and would
+        # rather not have an impulse fight their own pathing.
+        knockback: bool = True,
         # These two emulate a cheat client, not a vanilla one: ``vclip`` lets the
         # planner route through solid blocks, and ``anti_kick`` writes a
         # synthetic position into periodic movement packets.  Both are off by
@@ -211,6 +218,13 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, Picku
         if physics_engine is not None and physics_attributes is not None:
             raise ValueError("pass either physics_engine or physics_attributes, not both")
         self.physics = physics_engine or PhysicsEngine(physics_attributes)
+        if not isinstance(knockback, bool):
+            raise TypeError("knockback must be a bool")
+        self.knockback = knockback
+        # Bumped whenever the server sends this player a velocity.  A tick that
+        # was already computed from the old velocity must not claim a position
+        # that ignores the impulse; see ``MovementMixin._tick_once``.
+        self._motion_epoch = 0
         if not isinstance(vclip, bool):
             raise TypeError("vclip must be a bool")
         if not all(
@@ -825,6 +839,7 @@ async def connect(
     block_state_table: str | None = None,
     physics_engine: PhysicsEngine | None = None,
     physics_attributes: PhysicsAttributes | None = None,
+    knockback: bool = True,
     # Cheat emulation, off by default: see the note on ``Bot.__init__``.
     vclip: bool = False,
     vclip_up_limit: float = 3.0,
@@ -864,6 +879,7 @@ async def connect(
         block_state_table=block_state_table,
         physics_engine=physics_engine,
         physics_attributes=physics_attributes,
+        knockback=knockback,
         vclip=vclip,
         vclip_up_limit=vclip_up_limit,
         vclip_down_limit=vclip_down_limit,

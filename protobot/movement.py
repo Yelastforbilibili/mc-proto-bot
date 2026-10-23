@@ -9,6 +9,8 @@ goes through the same tick budget, which is what keeps the server's prediction
 from __future__ import annotations
 
 import asyncio
+import copy
+import dataclasses
 import math
 import time
 
@@ -127,34 +129,25 @@ class MovementMixin:
             self._set_local_flying(True)
             await self._send_flying_state()
         was_flying = self.physics_state.flying
+        if send_input or send_position:
+            # Wait for this tick's slot *before* running the physics, not after
+            # it.  A movement packet has to leave 50 ms after the previous one,
+            # and that sleep used to sit between the physics step and the send:
+            # an impulse that arrived during the sleep was written into the
+            # local velocity, but the packet that followed still described the
+            # pre-impulse step.  An anti-cheat sandwiches the knockback packet
+            # between two transactions and expects the very next movement to
+            # carry it, so that gap reads as "did not take the knockback".
+            await self.wait_tick_budget()
         position_serial = self._position_update_serial
-        self.physics.tick(self.physics_state, controls, self.world)
-        velocity = self.physics_state.velocity
-        self.player.velocity_x = velocity.x
-        self.player.velocity_y = velocity.y
-        self.player.velocity_z = velocity.z
-        if self.physics_state.flying != was_flying:
-            if self._force_flight_active:
-                # Vanilla physics can turn flight off after touching ground;
-                # forced navigation keeps the local predictor airborne without
-                # changing or synchronizing the server abilities flags.
-                self._set_physics_flying(True)
-            else:
-                self.player.abilities.flying = self.physics_state.flying
-                await self._send_flying_state()
-        if self._force_flight_active:
-            # A ground collision must not make the next navigation tick enter
-            # the walking branch.  The server receives an airborne movement
-            # flag below; keep the predictor in that same state as well.
-            self._set_physics_flying(True)
-            self.physics_state.on_ground = False
+        motion_epoch = self._motion_epoch
+        state_before = self._snapshot_physics_state()
+        await self._advance_physics(controls, was_flying)
         if send_input:
             # Input and sprint-state packets belong to the tick that is about to
-            # be closed by the movement packet below.  Send them inside that
-            # tick's budget, otherwise the packet sits alone for up to 50 ms and
-            # Grim's Post check flags it as "entity action" queued without a
-            # movement.
-            await self.wait_tick_budget()
+            # be closed by the movement packet below.  Sending them inside that
+            # same budget keeps them from sitting alone, where Grim's Post check
+            # flags them as an "entity action" queued without a movement.
             input_values = {
                 "forward": controls.forward > 0,
                 "backward": controls.forward < 0,
@@ -170,6 +163,23 @@ class MovementMixin:
             await self._sync_input(**input_values)
             await self._sync_sprinting(self.physics_state.sprinting)
         if send_position:
+            if self._motion_epoch != motion_epoch:
+                # The server decided this player's velocity after the step
+                # above -- a knockback.  Recompute the tick from the pre-tick
+                # state so the packet below carries the impulse, which is what a
+                # vanilla client does: it applies the velocity between ticks and
+                # then moves.  Without this the packet describes a step that
+                # ignored an impulse the server had already sent, and a
+                # prediction check measures the difference as a displacement it
+                # cannot explain.
+                impulse = self.physics_state.velocity
+                self._restore_physics_state(state_before)
+                # The impulse is new information that arrived after the snapshot;
+                # it belongs to the replayed tick, not to the one being undone.
+                self.physics_state.velocity = impulse
+                await self._advance_physics(
+                    controls, was_flying, announce_flying=False
+                )
             state = self.physics_state
             if self._position_update_serial != position_serial:
                 # An authoritative teleport landed while this tick was being
@@ -232,6 +242,57 @@ class MovementMixin:
             )
         await self.end_tick()
         return self.physics_state
+
+    async def _advance_physics(
+        self,
+        controls: MovementInput,
+        was_flying: bool,
+        *,
+        announce_flying: bool = True,
+    ) -> None:
+        """Run one step of the vanilla physics and mirror it onto the player.
+
+        Split out of :meth:`_tick_once` because a knockback can arrive between
+        the step and the movement packet, and the step then has to be replayed
+        from the pre-tick state (see ``_snapshot_physics_state``).
+        """
+
+        self.physics.tick(self.physics_state, controls, self.world)
+        velocity = self.physics_state.velocity
+        self.player.velocity_x = velocity.x
+        self.player.velocity_y = velocity.y
+        self.player.velocity_z = velocity.z
+        if self.physics_state.flying != was_flying:
+            if self._force_flight_active:
+                # Vanilla physics can turn flight off after touching ground;
+                # forced navigation keeps the local predictor airborne without
+                # changing or synchronizing the server abilities flags.
+                self._set_physics_flying(True)
+            else:
+                self.player.abilities.flying = self.physics_state.flying
+                if announce_flying:
+                    await self._send_flying_state()
+        if self._force_flight_active:
+            # A ground collision must not make the next navigation tick enter
+            # the walking branch.  The server receives an airborne movement
+            # flag below; keep the predictor in that same state as well.
+            self._set_physics_flying(True)
+            self.physics_state.on_ground = False
+
+    def _snapshot_physics_state(self) -> PhysicsState:
+        """Copy the physics state so one step can be undone and replayed."""
+
+        state = self.physics_state
+        snapshot = copy.copy(state)
+        snapshot.status_effects = copy.deepcopy(state.status_effects)
+        snapshot.attribute_values = dict(state.attribute_values)
+        return snapshot
+
+    def _restore_physics_state(self, snapshot: PhysicsState) -> None:
+        """Write a snapshot back into the live state, keeping its identity."""
+
+        for field in dataclasses.fields(PhysicsState):
+            setattr(self.physics_state, field.name, getattr(snapshot, field.name))
 
     async def send_position(
         self,

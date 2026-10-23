@@ -188,3 +188,33 @@ Notes for anyone repeating this:
   `failed <check>` instead, which is why the marker list carries both.
 - The suite's own chat lines quote alerts, so they are filtered out by looking
   for the chat log level and the `<name>` prefix.
+
+## 7. Knockback has to ride in the movement packet that follows it
+
+An impulse arrives as `ClientboundSetEntityMotionPacket`, and a movement
+prediction check sandwiches it between two transactions: the packet before the
+impulse and the packet after it.  The claim in between is expected to include
+the impulse, with no room left for "I will apply it next tick".
+
+A vanilla client satisfies this for free: packets are handled between ticks, so
+an impulse is in `deltaMovement` before the next tick runs.  Our reader task and
+tick loop are separate coroutines, so the same impulse can land in the middle of
+a tick -- after the physics step, before that tick's movement packet goes out.
+That packet then describes a step computed before the impulse existed, and the
+difference is reported as `Simulation` (and, on the knockback check itself,
+`AntiKB`), often with a setback teleport that throws the bot back where it stood.
+
+Two guards keep the tick self-consistent:
+
+- `_tick_once` waits for its packet slot *before* running the physics.  The wait
+  used to sit between the physics step and the send, which is exactly the window
+  an impulse needs to slip into.
+- `_handle_set_entity_motion` bumps `self._motion_epoch`.  If the epoch moved
+  while a tick was in flight, `_tick_once` restores the pre-tick snapshot, keeps
+  the freshly arrived velocity and replays the step, so the packet it sends is
+  the one that includes the impulse.
+
+`connect(knockback=False)` turns the path off: impulses are then dropped instead
+of applied, and a tick that overlaps one is not replayed.  Vanilla clients never
+disable it; the switch exists for callers that drive movement themselves (a
+pathfinder that must not be pushed off its lane, for example).
