@@ -98,6 +98,37 @@ class SprintNeedsForwardTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(bot.physics_state.sprinting)
 
+    async def test_a_hungry_player_cannot_sprint(self) -> None:
+        bot, sent = _make_bot()
+        bot.player.food = 6
+
+        await bot._tick_once(MovementInput(forward=1.0, sprint=True))
+
+        # Vanilla asks FoodData.hasEnoughFood (food > 6) before it keeps the
+        # sprint of a walking player; the server will not accelerate a hungry
+        # one, so claiming it would make every step 1.3 times too long.
+        self.assertFalse(bot.physics_state.sprinting)
+        self.assertNotIn(_START_SPRINTING_COMMAND, _command_payloads(bot, sent))
+        self.assertEqual(_input_flags(bot, sent)[-1], bot._input_flags(True, False, False, False, False, False, False))
+
+    async def test_one_bite_of_food_is_enough_to_sprint(self) -> None:
+        bot, _ = _make_bot()
+        bot.player.food = 7
+
+        await bot._tick_once(MovementInput(forward=1.0, sprint=True))
+
+        self.assertTrue(bot.physics_state.sprinting)
+
+    async def test_flight_bypasses_the_food_rule(self) -> None:
+        bot, _ = _make_bot()
+        bot.player.food = 0
+        bot.physics_state.allow_flying = True
+
+        await bot._tick_once(MovementInput(forward=1.0, sprint=True))
+
+        # Player.hasEnoughFoodToDoExhaustiveManoeuvres is ``food > 6 || mayfly``.
+        self.assertTrue(bot.physics_state.sprinting)
+
 
 if __name__ == "__main__":
     unittest.main()

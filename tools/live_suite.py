@@ -801,6 +801,15 @@ class Suite:
         await self.close_menu()
         await self.empty_player_grid()
         self.clear_inventory()
+        # Hunger is world state that outlives a case: a long navigation drains
+        # the food bar, and a vanilla client refuses to sprint at six or less.
+        # Grim's ``SprintA`` then cancels every movement packet, which reads as
+        # "could not reach" in an unrelated scenario later in the run.  The
+        # saturation effect eats for the player, so this tops the bar back up.
+        self.command(f"effect give {self.username} minecraft:saturation 1 9 true")
+        fed = time.monotonic() + 2.0
+        while self.bot.player.food <= 6 and time.monotonic() < fed:
+            await asyncio.sleep(0.05)
         self.command(f"kill @e[tag={TAG}]")
         # Drops from earlier runs lie around the test area and fly into the
         # inventory the moment the bot walks over them, which makes "dig three

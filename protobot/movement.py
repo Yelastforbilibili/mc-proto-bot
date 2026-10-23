@@ -152,6 +152,16 @@ class MovementMixin:
             # such tick, which is what ``navigate_to`` used to do whenever it
             # paused inside a waypoint's tolerance.
             controls = dataclasses.replace(controls, sprint=False)
+        if controls.sprint and not self._can_sprint():
+            # Vanilla's ``LocalPlayer.isSprintingPossible`` asks
+            # ``Player.hasEnoughFoodToDoExhaustiveManoeuvres`` for a walking
+            # player, which is ``FoodData.hasEnoughFood`` (``foodLevel > 6``) or
+            # ``abilities.mayfly``.  Grim checks the same thing and reports
+            # ``SprintA (hunger=6)``; more importantly the server will not
+            # accelerate a hungry player, so a client that keeps the bit claims a
+            # step 1.3 times too long and is set back on every single tick --
+            # which looks like the bot walking into an invisible wall.
+            controls = dataclasses.replace(controls, sprint=False)
         if (
             self._navigation_claimed
             or self._navigation_active
@@ -555,6 +565,19 @@ class MovementMixin:
             PacketWriter().write_unsigned_byte(flags).to_bytes(),
         )
         self._last_sent_input_flags = flags
+
+    def _can_sprint(self) -> bool:
+        """Whether a vanilla client would allow the sprint flag right now.
+
+        Only the conditions a client can decide on its own: enough food for the
+        manoeuvre (``FoodData.hasEnoughFood``: food level above six) or the
+        flight ability that bypasses it.  The rest of
+        ``LocalPlayer.isSprintingPossible`` (a vehicle that can sprint, shallow
+        water, mobility restriction) does not apply to a walking bot, and the
+        wall case is handled by the physics itself.
+        """
+
+        return self.player.food > 6 or self.physics_state.allow_flying
 
     async def _sync_input(
         self,
