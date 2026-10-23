@@ -57,6 +57,7 @@
     "clientbound_unload_chunk": 33,
     "clientbound_update_attributes": 124,
     "clientbound_update_mob_effect": 125,
+    "clientbound_update_time": 106,
     "serverbound_chat": 8,
     "serverbound_chat_ack": 5,
     "serverbound_chat_command": 6,

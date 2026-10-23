@@ -21,7 +21,7 @@ import asyncio
 import math
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from ..constants import (
     BLOCK_INTERACTION_RANGE,
@@ -34,6 +34,7 @@ from ..constants import (
     ROTATION_EPSILON,
     TICK_SECONDS,
 )
+from ..expectation import ExpectationStatus, Outcome, wait_for_expectation
 from ..physics import Vec3
 from ..protocol.codec import PacketWriter
 from ..protocol.entities import DEFAULT_HEIGHT, DEFAULT_WIDTH
@@ -134,6 +135,9 @@ class Actions:
         self.client = client
         #: When the last dig stopped, for :data:`BREAK_COOLDOWN_SECONDS`.
         self._last_break = 0.0
+        #: Why the last wait ended -- ``DONE``, ``TIMEOUT``, ``INVALIDATED`` or
+        #: ``FAILED`` -- so a caller can report the reason instead of guessing.
+        self.last_outcome: Outcome | None = None
 
     # ------------------------------------------------------------------
     # plumbing
@@ -406,6 +410,8 @@ class Actions:
         seconds: float,
         tick: bool,
         swing: bool = False,
+        valid: Callable[[], str | None] | None = None,
+        name: str = "action",
     ) -> bool:
         """Tick the client until ``until()`` is true or ``seconds`` elapse.
 
@@ -421,14 +427,14 @@ class Actions:
         advanced -- and it also closes its per-tick packet queue on the movement
         packet, so an animation sent after the movement is still queued when the
         next transaction arrives, which it reports as ``Post``.
+
+        ``valid`` is the invalidation question: return a reason string and the
+        wait stops at once (see :mod:`protobot.expectation`).  The outcome of the
+        last wait is kept on :attr:`last_outcome` so a caller can report *why* an
+        action did not land instead of only that it did not.
         """
 
-        deadline = time.monotonic() + seconds
-        while True:
-            if until():
-                return True
-            if time.monotonic() >= deadline:
-                return False
+        async def step() -> None:
             # The swing goes out *before* this tick's movement packet: a vanilla
             # client sends its input (attack/use/dig animation) and then closes
             # the tick with the position packet, which is the packet GrimAC uses
@@ -455,6 +461,19 @@ class Actions:
                 await self.client.tick()
             else:
                 await asyncio.sleep(TICK_SECONDS)
+
+        outcome = await wait_for_expectation(
+            self.client,
+            until,
+            valid=valid,
+            timeout=seconds,
+            name=name,
+            tick=False,  # ``step`` already ticks exactly once per poll
+            before_tick=step,
+            poll=0.0,  # ``step`` owns the pacing; this only yields to the loop
+        )
+        self.last_outcome = outcome
+        return outcome.ok
 
     # ------------------------------------------------------------------
     # arm / entity actions
@@ -950,9 +969,34 @@ class Actions:
         def changed() -> bool:
             return world.get_state_id(x, y, z) != state_before
 
+        def replaced() -> str | None:
+            """Why this dig cannot finish: the block is not the block we started on.
+
+            A break is a change too, so only a *replacement* counts: the target
+            turning into air (or becoming unloaded, ``-1``) is the success path
+            and is handled by ``changed``.  Anything else means the world moved
+            on -- somebody placed a different block, or the server reset it --
+            and waiting out the whole timeout would report a bare timeout.
+            """
+
+            current = world.get_state_id(x, y, z)
+            if current <= 0 or current == state_before:
+                return None
+            return (
+                f"{self.block_name(current)} now occupies {position}; it was "
+                f"{self.block_name(state_before)} when the dig started"
+            )
+
         # ``_settle`` swings and then ticks, so the annotation above belongs to
         # the tick this call opens: start, animation, movement.
-        broke = await self._settle(changed, seconds=release, tick=tick, swing=True)
+        broke = await self._settle(
+            changed,
+            seconds=release,
+            tick=tick,
+            swing=True,
+            valid=replaced,
+            name=f"dig {position}",
+        )
 
         # An early release is an abort, not a stop.  A real client only sends
         # STOP once its prediction says the block broke -- and it has to be
@@ -1191,6 +1235,9 @@ class Actions:
                 )
             )
         clicked, face = click
+        # The face we are about to click belongs to this block; if it stops
+        # being this block, the click cannot land and the wait says so.
+        clicked_state = world.get_state_id(*clicked)
         if aim:
             # Turn the way a vanilla client turns: the new rotation rides in a
             # movement packet (position_and_rotation), not in a bare look
@@ -1204,10 +1251,31 @@ class Actions:
         def changed() -> bool:
             return world.get_state_id(*position) != state_before
 
+        def invalidated() -> str | None:
+            """Why the placement cannot land any more: the clicked block is gone.
+
+            A placement is a click on a neighbour's face.  If that neighbour
+            stops being the block we clicked -- somebody dug it, or a piston
+            moved it -- the click no longer means anything, so waiting for the
+            target to change would just burn the timeout.
+            """
+
+            current = world.get_state_id(*clicked)
+            if current == -1 or current == clicked_state:
+                return None
+            return (
+                f"the block clicked at {clicked} changed to "
+                f"{self.block_name(current)} before the placement landed"
+            )
+
         confirmed = False
         if await_confirm:
             confirmed = await self._settle(
-                changed, seconds=confirm_timeout, tick=tick
+                changed,
+                seconds=confirm_timeout,
+                tick=tick,
+                valid=invalidated,
+                name=f"place {position}",
             )
         state_after = world.get_state_id(*position)
         return await self._emit(
@@ -1230,6 +1298,240 @@ class Actions:
                     else f"no block update at {position} within {confirm_timeout:g}s"
                 ),
                 extra={"face": int(face), "clicked": clicked},
+            )
+        )
+
+    # ------------------------------------------------------------------
+    # beds
+    # ------------------------------------------------------------------
+    #: Vanilla only lets a bed be used while it is dark: ``BedBlock`` asks
+    #: ``level.isDarkOutside()``, which is ``dayTime`` inside the night window.
+    NIGHT_START = 12500
+    NIGHT_END = 23500
+
+    def find_bed(
+        self, *, radius: float = 6.0
+    ) -> tuple[int, int, int] | None:
+        """Nearest bed block within ``radius`` of the player, if one is loaded."""
+
+        world = self.client.world
+        feet = self.client.physics_state.position
+        reach = int(math.floor(radius))
+        best: tuple[int, int, int] | None = None
+        best_distance = math.inf
+        origin = (int(math.floor(feet.x)), int(math.floor(feet.y)), int(math.floor(feet.z)))
+        for dx in range(-reach, reach + 1):
+            for dy in range(-reach, reach + 1):
+                for dz in range(-reach, reach + 1):
+                    candidate = (origin[0] + dx, origin[1] + dy, origin[2] + dz)
+                    state = world.get_state_id(*candidate)
+                    if state <= 0:
+                        continue
+                    try:
+                        name = self.block_name(state)
+                    except ActionError:
+                        continue
+                    if not name.endswith("_bed"):
+                        continue
+                    distance = (
+                        (candidate[0] + 0.5 - feet.x) ** 2
+                        + (candidate[1] + 0.5 - feet.y) ** 2
+                        + (candidate[2] + 0.5 - feet.z) ** 2
+                    )
+                    if distance < best_distance:
+                        best, best_distance = candidate, distance
+        return best
+
+    async def sleep_in_bed(
+        self,
+        position: tuple[int, int, int] | None = None,
+        *,
+        radius: float = 6.0,
+        reach: float = 3.0,
+        timeout: float = 30.0,
+        aim: bool = True,
+    ) -> ActionResult:
+        """Lie down in a bed and wait until the night is actually skipped.
+
+        Sleeping is not "click the bed": the click is accepted, the player lies
+        down, and the night is skipped only when the server decides every player
+        is asleep.  So the confirmation here is the world clock --
+        ``clientbound_update_time`` jumping to morning -- which is the same thing
+        a vanilla client watches.
+
+        The bed is a moving part: if it is dug out while we wait, the wait is
+        invalidated with the block that replaced it instead of burning the whole
+        timeout.  Nothing here retries; a caller that wants a walk to the bed
+        first uses :class:`protobot.goals.SleepGoal`.
+        """
+
+        started = time.monotonic()
+        world = self.client.world
+        bed = position if position is not None else self.find_bed(radius=radius)
+        if bed is None:
+            return await self._emit(
+                ActionResult(
+                    action="sleep_in_bed",
+                    status=ActionStatus.REJECTED,
+                    position=position,
+                    elapsed=time.monotonic() - started,
+                    evidence=(
+                        f"no bed within {radius:g} blocks of the player; pass the "
+                        "bed position explicitly if it is further away"
+                    ),
+                )
+            )
+        feet = self.client.physics_state.position
+        distance = math.dist(
+            (feet.x, feet.y, feet.z), (bed[0] + 0.5, bed[1] + 0.5, bed[2] + 0.5)
+        )
+        if distance > reach:
+            return await self._emit(
+                ActionResult(
+                    action="sleep_in_bed",
+                    status=ActionStatus.REJECTED,
+                    position=bed,
+                    elapsed=time.monotonic() - started,
+                    evidence=(
+                        f"the bed at {bed} is {distance:.2f} blocks away; the server "
+                        f"only accepts a click within {reach:g}, so walk there first"
+                    ),
+                )
+            )
+        day_time = world.day_time % 24000
+        if not (self.NIGHT_START <= day_time < self.NIGHT_END):
+            return await self._emit(
+                ActionResult(
+                    action="sleep_in_bed",
+                    status=ActionStatus.REJECTED,
+                    position=bed,
+                    elapsed=time.monotonic() - started,
+                    evidence=(
+                        f"day_time is {day_time}; a bed refuses to be used now, so "
+                        "the server would answer with the 'can only sleep at night' "
+                        "message and nothing would move"
+                    ),
+                )
+            )
+
+        bed_state = world.get_state_id(*bed)
+        if aim:
+            await self.turn_to(Vec3(bed[0] + 0.5, bed[1] + 0.5, bed[2] + 0.5))
+        teleports = self.client._position_update_serial
+        # The click must not be followed by a movement packet of our own: the
+        # server answers a bed click by teleporting the body into the sleeping
+        # pose, and any position we claim between the click and that teleport is
+        # a position the server has already left (Grim measured three blocks of
+        # simulation offset and then set us back every tick).  A vanilla client
+        # claims every tick, but the sleep pose arrives before its next packet;
+        # ours is a full tick of packet budget later at best, so stay silent.
+        click = await self.use_item_on(
+            bed, face=BlockFace.UP, hand="main_hand", tick=False
+        )
+        # Close the tick right after the click.  An anti-cheat reads the click
+        # as queued behind the tick's movement marker and reports the queue when
+        # a ping arrives before another movement packet clears it; the tick end
+        # we send here clears that queue without claiming a position.
+        await self.client.end_tick()
+        packets = list(click.packets)
+        if click.status is ActionStatus.REJECTED:
+            return await self._emit(
+                ActionResult(
+                    action="sleep_in_bed",
+                    status=ActionStatus.REJECTED,
+                    sequence=click.sequence,
+                    position=bed,
+                    packets=tuple(packets),
+                    elapsed=time.monotonic() - started,
+                    evidence=f"the bed click was refused: {click.evidence}",
+                )
+            )
+
+        def skipped() -> bool:
+            return not (self.NIGHT_START <= world.day_time % 24000 < self.NIGHT_END)
+
+        bed_name = self.block_name(bed_state)
+
+        def invalidated() -> str | None:
+            current = world.get_state_id(*bed)
+            if current == -1 or current == bed_state:
+                return None
+            # Lying down flips the bed's ``occupied`` property, so a different
+            # state id is the *expected* outcome here.  What matters is whether
+            # the bed is still a bed at all.
+            if current == 0:
+                return f"the bed at {bed} disappeared while waiting to fall asleep"
+            if self.block_name(current) == bed_name:
+                return None
+            return (
+                f"the bed at {bed} was replaced by {self.block_name(current)} "
+                "while waiting to fall asleep"
+            )
+
+        def woken() -> str | None:
+            # The wait freezes the tick loop, so a bed that accepts the click but
+            # never puts the player to sleep must not freeze it for the whole
+            # timeout.  The server's own teleport into the sleeping pose is the
+            # signal that the player really is in the bed.
+            if time.monotonic() - started < 3.0:
+                return None
+            if self.client._position_update_serial == teleports:
+                return (
+                    "the server never moved the player into the bed within 3s: the "
+                    "click was accepted but the sleep was not"
+                )
+            return None
+
+        def interrupted() -> str | None:
+            return invalidated() or woken()
+
+        # While the wait runs the player is lying down, so the tick loop freezes
+        # (no simulation, no movement packet) exactly like a sleeping vanilla
+        # client; see ``MovementMixin._tick_once``.  The flag is cleared on every
+        # exit path, a cancellation included, so an abandoned wait cannot leave
+        # the bot unable to move.
+        self.client.sleeping = True
+        slept = False
+        try:
+            outcome = await wait_for_expectation(
+                self.client,
+                skipped,
+                valid=interrupted,
+                timeout=timeout,
+                name=f"sleep at {bed}",
+            )
+            slept = outcome.ok
+        finally:
+            self.client.sleeping = False
+        self.last_outcome = outcome
+        if not outcome.ok:
+            # Still lying in the bed (the wait timed out, or the bed was broken
+            # under us): the server keeps a sleeping player frozen, so get up
+            # before handing control back, or every later claim disagrees with
+            # where the server thinks the body is.
+            await self.client.leave_bed()
+        after = world.day_time % 24000
+        if outcome.ok:
+            status = ActionStatus.CONFIRMED
+            evidence = f"the night was skipped: day_time {day_time} -> {after}"
+        elif outcome.status is ExpectationStatus.INVALIDATED:
+            status = ActionStatus.REJECTED
+            evidence = outcome.describe()
+        else:
+            status = ActionStatus.UNCONFIRMED
+            evidence = f"{outcome.describe()}; the player may be lying down, but the night was not skipped"
+        return await self._emit(
+            ActionResult(
+                action="sleep_in_bed",
+                status=status,
+                sequence=click.sequence,
+                position=bed,
+                state_before=bed_state,
+                state_after=world.get_state_id(*bed),
+                packets=tuple(packets),
+                elapsed=time.monotonic() - started,
+                evidence=evidence,
+                extra={"day_time_before": day_time, "day_time_after": after},
             )
         )
 

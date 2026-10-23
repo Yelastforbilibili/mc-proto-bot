@@ -29,6 +29,7 @@ from .state import EntityState
 from .support import (
     _START_FALL_FLYING_COMMAND,
     _START_SPRINTING_COMMAND,
+    _STOP_SLEEPING_COMMAND,
     _STOP_SPRINTING_COMMAND,
     _TRACE_POS,
     _TRACE_SEND,
@@ -95,6 +96,8 @@ class MovementMixin:
                     send_position=send_position,
                     _navigation_tick=_navigation_tick,
                 )
+                self._last_tick_at = _now()
+                self._ticks_completed += 1
                 if self._next_tick_at == scheduled:
                     # This call did not claim a slot: the tick was a no-op
                     # (navigation owns the body, or nothing was sent), so
@@ -167,6 +170,26 @@ class MovementMixin:
             or self._navigation_active
             or self._navigation_planning
         ) and not _navigation_tick:
+            return self.physics_state
+        if self.sleeping:
+            # A sleeping client simulates nothing and reports nothing: the server
+            # keeps the body on the bed (it teleported us to the bed pose) and
+            # vanilla's own step ends with zero displacement, so ``sendPosition``
+            # has nothing to say.  Claiming a position here would describe a fall
+            # through the bed -- this library's block table approximates every
+            # solid block as a full cube, so the bed reads as a floor one block
+            # lower than it really is -- and the server's prediction flags the
+            # offset every single tick.
+            self.physics_state.velocity = Vec3()
+            if send_position:
+                # The tick still has to cost a slot: vanilla sends
+                # ``client_tick_end`` once per game tick whether or not the body
+                # moved (``Minecraft.tick`` sends it unconditionally), and a
+                # loop that closed ticks faster than the clock would be flagged
+                # as running the game too fast -- which is exactly what an
+                # unpaced freeze did before this.
+                await self._begin_tick_packet()
+                await self.end_tick()
             return self.physics_state
         self._tick_remote_entity_metadata()
         if self.player.vehicle_id is not None:
@@ -824,6 +847,29 @@ class MovementMixin:
         )
         await self.send_raw(self.version.packets.serverbound_player_command, payload)
         self._last_sent_sprinting = sprinting
+
+    async def leave_bed(self) -> None:
+        """Get up from a bed, the way a vanilla client does.
+
+        ``PlayerCommandAction.STOP_SLEEPING`` is the first ordinal in 26.3
+        (``STOP_SLEEPING``, ``START_SPRINTING``, ``STOP_SPRINTING``, ...).  A
+        sleeping player is frozen server-side, so this is the packet that hands
+        control back: until it arrives every movement claim disagrees with the
+        server's idea of where the body is.  Sending it when the player is not
+        asleep is a no-op on the server.
+        """
+
+        entity_id = self.session.entity_id
+        if entity_id is None:
+            raise RuntimeError("a bed cannot be left before play login")
+        payload = (
+            PacketWriter()
+            .write_varint(entity_id)
+            .write_varint(_STOP_SLEEPING_COMMAND)
+            .write_varint(0)
+            .to_bytes()
+        )
+        await self.send_raw(self.version.packets.serverbound_player_command, payload)
 
     def _wire_yaw(self, yaw: float) -> float:
         """``yaw`` adjusted so this packet differs from the last by a small angle.

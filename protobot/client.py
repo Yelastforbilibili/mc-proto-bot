@@ -24,12 +24,19 @@ import uuid
 from collections.abc import Callable, Iterable, Mapping
 
 from .connection import ConnectionMixin
+from .driver import DriverMixin
 from .events import EventBus
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .movement import MovementMixin
 from .navigator import NavigatorMixin
 from .pickup import PickupMixin
-from .physics import BoatPhysicsEngine, PhysicsAttributes, PhysicsEngine, PhysicsState
+from .physics import (
+    BoatPhysicsEngine,
+    MovementInput,
+    PhysicsAttributes,
+    PhysicsEngine,
+    PhysicsState,
+)
 from .play.router import PlayRouterMixin
 from .protocol.codec import PacketWriter
 from .protocol.connection import ConnectionState, ProtocolConnection
@@ -59,7 +66,14 @@ from .support import (  # re-exported: these were module-level names here before
 )
 from .world import BlockStateRegistry, World
 
-class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, PickupMixin):
+class Bot(
+    ConnectionMixin,
+    MovementMixin,
+    PlayRouterMixin,
+    NavigatorMixin,
+    PickupMixin,
+    DriverMixin,
+):
     """An offline-mode Minecraft bot.
 
     ``start`` opens the socket and starts the protocol task. ``wait_ready`` waits
@@ -255,6 +269,13 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, Picku
         self._force_flight_active = False
         self._force_flight_previous = False
         self._no_fall = False
+        # True while the player is lying in a bed.  A sleeping vanilla client
+        # simulates nothing and sends no movement packet at all: the server keeps
+        # the body on the bed, and the client's own step ends with zero
+        # displacement.  The flag lets the tick loop mirror that instead of
+        # claiming a fall through a bed whose collision box this library
+        # approximates as a full cube.
+        self.sleeping = False
         self._navigation_vclip_active = False
         self._navigation_vertical_active = False
         self._position_update_serial = 0
@@ -294,6 +315,17 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, Picku
         # packet of the same tick; they go out once that tick is closed, because
         # a pong is the moment an anti-cheat judges the packets queued before it.
         self._pong_pending: list[int] = []
+        # The tick driver (protobot/driver.py).  `input` is what the driver
+        # holds down every tick; a caller that awaits something slow sets it and
+        # lets the pump keep the stream at 20 Hz instead of freezing the client.
+        self.input = MovementInput()
+        self._driver_task: asyncio.Task[None] | None = None
+        self._driver_error: BaseException | None = None
+        # Monotonic time of the last completed tick, and how many have run: the
+        # driver yields a slot the caller already ticked, and wait_ticks counts
+        # game ticks instead of wall-clock seconds.
+        self._last_tick_at = 0.0
+        self._ticks_completed = 0
 
     @property
     def active_container(self) -> ContainerState | None:

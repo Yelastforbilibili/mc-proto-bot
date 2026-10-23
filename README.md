@@ -70,6 +70,10 @@ tests, and at least one scenario in the in-game suite proves the *server* did it
 | Containers — every menu type, click-level moves, progress data, machine verbs (`enchant`, `anvil`, `grindstone`, `smithing`, `stonecutter`) | Supported | `protobot/containers/` |
 | Crafting — explicit recipe descriptions, 2×2 and 3×3 | Supported | `protobot/crafting/recipes.py`, `containers/menu.py` |
 | Goals, tasks, long trips | Supported | `protobot/goals/`, `protobot/tasks/` |
+| 20 Hz tick driver — a background loop so `await asyncio.sleep()` does not freeze the body | Supported | `protobot/driver.py` |
+| Expectations — one wait loop with `done` / `failed` / `invalidated` / `timed out` and the reason | Supported | `protobot/expectation.py` |
+| Sleeping in a bed (night skipped), `SleepGoal`, getting up when the bed is broken | Supported | `protobot/actions/interactions.py`, `protobot/goals/sleep.py` |
+| Real collision shapes (beds 9/16, slabs, stairs, fences) instead of "every block is a cube" | Supported — 35,723 states / 393 boxes for 26.3 | `protobot/data/shapes-26.3.json.gz`, `tools/gen_block_shapes.py` |
 | Items carrying data components | Partial — decodes the components it ships tables for and refuses an ambiguous slot list instead of guessing | `protobot/protocol/stacks.py` |
 | Online mode (Mojang/Microsoft auth, signed chat) | Supported | `protobot/auth.py` |
 | Anti-cheat-shaped packet ordering (GrimAC as the referee) | 33 in-game scenarios, zero alerts | `docs/anti-cheat.md` |
@@ -524,6 +528,73 @@ if not report.ok:
 Steps retry (`TaskRunner(bot, retries=1)` by default), a failure names the step
 and the attempt that failed, and every layer emits events on `bot.events`
 (`action`, `goal_start`/`goal_done`, `task_start`/`task_step`/`task_done`).
+
+### Let the bot run itself: the tick driver
+
+Without a tick the bot does not move, so a caller that awaits anything for a
+while (a database write, a model call, `asyncio.sleep`) freezes the body and the
+server sees a client that stopped sending. `bot.driving()` runs the 20 Hz tick in
+the background and hands control back:
+
+```python
+from protobot import connect
+from protobot.physics import MovementInput
+
+bot = await connect("127.0.0.1", username="Walker")
+await bot.wait_world()
+async with bot.driving():
+    bot.input = MovementInput(forward=1.0)   # what the driver sends every tick
+    await asyncio.sleep(3.0)                 # the bot keeps walking all 60 ticks
+    await bot.wait_ticks(5)                  # block until five more ticks ran
+await bot.close()
+```
+
+The driver yields whenever an action owns the tick (`dig`, `place`, clicks) and
+whenever the caller ticked itself, so mixing `bot.driving()` with explicit
+`await bot.tick()` does not produce duplicate movement packets. A tick that
+raises is recorded on `bot.driver_error` and fires the `driver_error` event
+instead of silently stopping the loop.
+
+### Wait for the world, not for a sleep
+
+Actions and goals ask one question — "is it true yet?" — and answer with a
+status instead of an exception:
+
+```python
+from protobot import wait_for_expectation
+
+outcome = await wait_for_expectation(
+    bot,
+    lambda: bot.world.day_time % 24000 < 12500,       # the night is over
+    valid=lambda: None if bot.world.get_state_id(8, -60, 4) == 0 else "someone rebuilt it",
+    timeout=30.0,
+    name="dig (8, -60, 4)",
+)
+print(outcome.status, outcome.describe())   # DONE / FAILED / INVALIDATED / TIMEOUT
+```
+
+Every action stores its own `bot.actions.last_outcome`, so a `REJECTED` result
+carries the reason the wait was cut short. The wait never raises: a broken
+premise (`INVALIDATED`) and a `check` that throws (`FAILED`, with the exception
+text) are different answers, and both are visible to the caller.
+
+### Sleeping in a bed
+
+`bot.actions.sleep_in_bed()` is the whole ritual: look at the bed, click it, stop
+claiming a position while the server holds the body in the sleeping pose, and
+return only once the world clock actually jumped to morning.
+
+```python
+result = await bot.actions.sleep_in_bed()          # finds a bed within 6 blocks
+print(result.status, result.evidence)              # CONFIRMED: day_time 13000 -> 0
+
+report = await bot.goals.run(SleepGoal(radius=8))  # walks there, then sleeps
+```
+
+If the bed is dug out while waiting, the wait is invalidated within a few ticks
+and the bot gets up, instead of sitting in a frozen loop until the timeout. The
+same check is what makes `SleepGoal` report `failed` with a reason rather than
+hanging.
 
 See [`docs/automation.md`](docs/automation.md) for the contracts and how to add a
 goal, [`docs/architecture.md`](docs/architecture.md) for how the bot itself is

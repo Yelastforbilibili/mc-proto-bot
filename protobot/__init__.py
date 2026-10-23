@@ -33,7 +33,15 @@ from .errors import (
     ProtocolError,
     UnsupportedVersion,
 )
-from .goals import Goal, GoalError, GoalReport, GoalRunner, GoalStatus
+from .goals import (
+    Goal,
+    GoalError,
+    GoalReport,
+    GoalRunner,
+    GoalStatus,
+    SleepGoal,
+)
+from .expectation import ExpectationStatus, Outcome, wait_for_expectation
 from .containers import (
     ClickRejected,
     ContainerError,
@@ -147,6 +155,10 @@ __all__ = [
     "GoalReport",
     "GoalRunner",
     "GoalStatus",
+    "SleepGoal",
+    "ExpectationStatus",
+    "Outcome",
+    "wait_for_expectation",
     "ItemStack",
     "Loader",
     "LoginRejected",

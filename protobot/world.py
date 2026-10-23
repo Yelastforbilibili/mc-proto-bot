@@ -7,7 +7,7 @@ import io
 import json
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -25,12 +25,35 @@ from .physics.world import (
 )
 from .protocol.codec import PacketReader
 
+#: Registry id of the ``minecraft:overworld`` world clock.  ``WorldClocks``
+#: registers ``overworld`` first and ``the_end`` second, so the id is stable.
+OVERWORLD_CLOCK = 0
+#: Ticks in one Minecraft day; both ``day_time`` and a bed's night window are
+#: expressed modulo this.
+DAY_LENGTH = 24000
+
 
 @dataclass(frozen=True, slots=True)
 class BlockStateDefinition:
     name: str
     shapes: tuple[AABB, ...]
     properties: BlockProperties = DEFAULT_BLOCK
+
+
+@dataclass(frozen=True, slots=True)
+class ClockState:
+    """One world clock's network state (``ClockNetworkState`` in 26.x).
+
+    ``total_ticks`` is the clock's own tick counter -- for the overworld clock
+    that is the day time -- ``partial_tick`` is the sub-tick fraction a renderer
+    lerps with, and ``rate`` is how many ticks the clock advances per tick
+    (0 means the clock is frozen, which is what ``/gamerule doDaylightCycle
+    false`` and a paused world look like on the wire).
+    """
+
+    total_ticks: int = 0
+    partial_tick: float = 0.0
+    rate: float = 1.0
 
 
 class BlockStateRegistry:
@@ -53,6 +76,59 @@ class BlockStateRegistry:
 
     def get(self, state_id: int) -> BlockStateDefinition:
         return self._states.get(state_id, self._unknown)
+
+    def load_shapes(self, table: str | Path | Mapping[str, Any]) -> int:
+        """Overlay the game's own collision shapes on registered states.
+
+        Mojang's blocks report carries ids and properties but no collision
+        boxes, so the generated block table writes a full cube for every solid
+        block.  Beds, slabs, stairs, fences, panes, carpets and snow are not
+        full cubes, and a movement prediction measures the difference -- a
+        sleeping player's body is held by the bed's nine-sixteenths box, while a
+        full-cube bed would put it a block lower.  A table dumped from the game
+        itself (``tools/gen_block_shapes.py``) replaces those approximations
+        here; states the table does not know keep the generated value.
+        """
+
+        if isinstance(table, (str, Path)):
+            path = Path(table)
+            if path.suffix == ".gz":
+                with gzip.open(path, "rt", encoding="utf-8") as stream:
+                    table = json.load(stream)
+            else:
+                with path.open("r", encoding="utf-8") as stream:
+                    table = json.load(stream)
+        if not isinstance(table, Mapping) or not isinstance(table.get("states"), Mapping):
+            raise TypeError("shape table must contain a states mapping")
+        raw_boxes = table.get("boxes", ())
+        if not isinstance(raw_boxes, list):
+            raise TypeError("shape table must contain a boxes list")
+        boxes: list[AABB] = []
+        for values in raw_boxes:
+            if isinstance(values, list) and len(values) == 6:
+                boxes.append(AABB(*(float(value) for value in values)))
+            else:
+                boxes.append(FULL_BLOCK)
+        applied = 0
+        for raw_id, raw_indices in table["states"].items():
+            try:
+                state_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            definition = self._states.get(state_id)
+            if definition is None:
+                # A shape for a state this release does not know says nothing
+                # about the release in use; leave it alone.
+                continue
+            if not isinstance(raw_indices, list):
+                continue
+            shapes: list[AABB] = []
+            for index in raw_indices:
+                if isinstance(index, int) and 0 <= index < len(boxes):
+                    shapes.append(boxes[index])
+            self._states[state_id] = replace(definition, shapes=tuple(shapes))
+            applied += 1
+        return applied
 
     @classmethod
     def from_report(cls, report: str | Path | Mapping[str, Any]) -> BlockStateRegistry:
@@ -702,7 +778,24 @@ class World:
             )
             if builtin.exists():
                 self.block_states.load_table(builtin)
+            # Exact collision shapes, dumped from the game itself.  The block
+            # table can only approximate them (see ``load_shapes``).
+            shapes = Path(__file__).with_name("data") / f"shapes-{bundled_release}.json.gz"
+            if shapes.exists():
+                self.block_states.load_shapes(shapes)
         self.chunks: dict[tuple[int, int], Chunk] = {}
+        # World clock, straight from ``clientbound_set_time``.  Since 26.x the
+        # server no longer sends a day time at all: it sends one state per
+        # *world clock* (``overworld``, ``the_end``), and the overworld clock's
+        # tick count is what the server renders the sun from and what a bed
+        # checks through ``Level.isDarkOutside()``.  ``day_time`` is that clock
+        # modulo 24000 (0 = sunrise, 13000 = night) and jumps forward when the
+        # night is slept through or a caller runs ``/time set``, which is the
+        # server-authoritative proof that a sleep actually happened.
+        self.game_time = 0
+        self.clocks: dict[int, ClockState] = {}
+        self.day_time = 0
+        self.day_time_advancing = True
         # Navigation worker snapshots enable this so unknown chunks are not
         # mistaken for empty air.  Live worlds keep vanilla-compatible air
         # semantics for callers that inspect unloaded coordinates.
@@ -714,6 +807,25 @@ class World:
         provider: Callable[[AABB], list[AABB]] | None,
     ) -> None:
         self._entity_collision_provider = provider
+
+    def apply_clock_updates(self, game_time: int, updates: dict[int, ClockState]) -> None:
+        """Merge one ``clientbound_set_time`` payload into the clock table.
+
+        The packet carries only the clocks whose state changed, and the periodic
+        "time is still ticking" broadcast carries none at all, so an update must
+        never clear the known state -- a sleep would otherwise silently forget
+        the day time it was supposed to advance.
+        """
+
+        self.game_time = game_time
+        if not updates:
+            return
+        self.clocks.update(updates)
+        overworld = self.clocks.get(OVERWORLD_CLOCK)
+        if overworld is None:
+            return
+        self.day_time = overworld.total_ticks % DAY_LENGTH
+        self.day_time_advancing = overworld.rate != 0.0
 
     def entity_collision_boxes(self, query: AABB) -> list[AABB]:
         if self._entity_collision_provider is None:
@@ -797,6 +909,41 @@ class World:
     def block_collision_boxes(self, x: int, y: int, z: int) -> tuple[AABB, ...]:
         definition = self.block_states.get(self.get_state_id(x, y, z))
         return tuple(shape.move(x, y, z) for shape in definition.shapes)
+
+    def has_ground_under(
+        self,
+        position: Vec3,
+        *,
+        width: float = 0.6,
+        epsilon: float = 1.0e-3,
+    ) -> bool:
+        """Whether a collision box top touches the feet at ``position``.
+
+        A teleport moves the body somewhere the ground flag carried into the
+        packet says nothing about, and claiming that flag at the new spot is a
+        ground spoof.  The honest answer is the world's own: is there something
+        the feet are resting on *here*?  The block under the feet is asked with
+        the same exact shapes the physics engine uses, so a bed's nine-sixteenth
+        top counts and a full-cube approximation of it does not.
+        """
+
+        half = width / 2.0
+        block_y = math.floor(position.y - epsilon)
+        min_x = math.floor(position.x - half)
+        max_x = math.floor(position.x + half)
+        min_z = math.floor(position.z - half)
+        max_z = math.floor(position.z + half)
+        for block_x in range(min_x, max_x + 1):
+            for block_z in range(min_z, max_z + 1):
+                for box in self.block_collision_boxes(block_x, block_y, block_z):
+                    if abs(box.max_y - position.y) > epsilon:
+                        continue
+                    if box.max_x <= position.x - half or box.min_x >= position.x + half:
+                        continue
+                    if box.max_z <= position.z - half or box.min_z >= position.z + half:
+                        continue
+                    return True
+        return False
 
     def no_collision(self, query: AABB) -> bool:
         return not self.collision_boxes(query) and not self.entity_collision_boxes(query)

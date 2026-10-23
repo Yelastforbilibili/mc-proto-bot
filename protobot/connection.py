@@ -262,6 +262,8 @@ class ConnectionMixin:
             closed_task.cancel()
 
     async def close(self) -> None:
+        # The driver ticks the socket, so it has to stop before the socket does.
+        await self.stop_driver()
         certificate_task, self._chat_certificate_refresh_task = (
             self._chat_certificate_refresh_task,
             None,

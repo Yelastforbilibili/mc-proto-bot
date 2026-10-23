@@ -51,6 +51,10 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 | 容器——全部菜单类型、点击级搬运、进度数据、机器动词（`enchant`、`anvil`、`grindstone`、`smithing`、`stonecutter`） | 已支持 | `protobot/containers/` |
 | 合成——显式配方描述，2×2 与 3×3 | 已支持 | `protobot/crafting/recipes.py`、`containers/menu.py` |
 | Goal、Task、远距离行进 | 已支持 | `protobot/goals/`、`protobot/tasks/` |
+| 20 Hz tick 驱动——后台自己跑，`await asyncio.sleep()` 不再让身体僵住 | 已支持 | `protobot/driver.py` |
+| Expectation——同一套等待循环，给出 done / failed / invalidated / timed out 与原因 | 已支持 | `protobot/expectation.py` |
+| 上床睡觉（真的跳过夜晚）、`SleepGoal`、床被拆会自己起身 | 已支持 | `protobot/actions/interactions.py`、`protobot/goals/sleep.py` |
+| 真实碰撞形状（床 9/16、台阶、楼梯、栅栏），而不是「所有方块都是立方体」 | 已支持——26.3 有 35,723 个状态 / 393 个盒体 | `protobot/data/shapes-26.3.json.gz`、`tools/gen_block_shapes.py` |
 | 带数据组件的物品 | 部分支持——有表的组件能解，含糊的整槽列表会诚实拒解而不是猜长度 | `protobot/protocol/stacks.py` |
 | 正版验证（Mojang/微软登录、签名聊天） | 已支持 | `protobot/auth.py` |
 | 符合原版包序、不触发反作弊（以 GrimAC 当裁判） | 33 项游戏内场景、零告警 | `docs/anti-cheat.md` |
@@ -461,6 +465,65 @@ if not report.ok:
 步骤自动重试（`TaskRunner(bot, retries=1)` 为默认），失败报告会写明是哪一步、第几次
 尝试失败；每层都会在 `bot.events` 上发事件（`action`、`goal_start`/`goal_done`、
 `task_start`/`task_step`/`task_done`）。
+
+### 让机器人自己跑：tick 驱动
+
+没有 tick 就不会动，所以调用方一旦 `await` 别的东西（写数据库、调模型、
+`asyncio.sleep`），身体就僵住，服务端看到的是一个不再发移动包的客户端。
+`bot.driving()` 把 20 Hz 的 tick 放到后台，然后把控制权交回来：
+
+```python
+from protobot import connect
+from protobot.physics import MovementInput
+
+bot = await connect("127.0.0.1", username="Walker")
+await bot.wait_world()
+async with bot.driving():
+    bot.input = MovementInput(forward=1.0)   # 驱动每 tick 发这个输入
+    await asyncio.sleep(3.0)                 # 这 60 tick 里机器人在一直走
+    await bot.wait_ticks(5)                  # 再等 5 tick 跑完
+await bot.close()
+```
+
+动作占用 tick（挖掘、放置、点击）或调用方自己 tick 过时，驱动会让位，所以
+`bot.driving()` 与显式 `await bot.tick()` 混用不会重复发移动包；驱动里某 tick 抛异常
+会记在 `bot.driver_error` 上并触发 `driver_error` 事件，而不是悄悄停掉循环。
+
+### 等世界，而不是等 sleep
+
+动作和目标层问的是同一个问题——「现在成真了吗」——回答是一个状态，不是异常：
+
+```python
+from protobot import wait_for_expectation
+
+outcome = await wait_for_expectation(
+    bot,
+    lambda: bot.world.day_time % 24000 < 12500,       # 天亮了
+    valid=lambda: None if bot.world.get_state_id(8, -60, 4) == 0 else "有人把它重新填上了",
+    timeout=30.0,
+    name="dig (8, -60, 4)",
+)
+print(outcome.status, outcome.describe())   # DONE / FAILED / INVALIDATED / TIMEOUT
+```
+
+每个动作都会把结果留在 `bot.actions.last_outcome`，所以 `REJECTED` 会带上等待被
+提前结束的原因。这个等待从不抛异常：前提破了（`INVALIDATED`）与判据自己抛错
+（`FAILED`，带异常文本）是两种不同的答案，调用方都看得到。
+
+### 上床睡觉
+
+`bot.actions.sleep_in_bed()` 就是一整套流程：看向床、点下去、在服务端把身体停在
+睡姿期间不再声明坐标，只有世界时钟真的跳到早晨才返回。
+
+```python
+result = await bot.actions.sleep_in_bed()          # 6 格内自己找床
+print(result.status, result.evidence)              # CONFIRMED: day_time 13000 -> 0
+
+report = await bot.goals.run(SleepGoal(radius=8))  # 先走过去，再睡
+```
+
+等待期间床被挖掉时，等待会在几 tick 内被判定失效并起身，而不是冻在循环里耗到超时；
+`SleepGoal` 也是靠这条判据报告 `failed` 并附原因，而不是卡死。
 
 契约与自定义目标的写法见 [`docs/automation.md`](docs/automation.md)，机器人本身如何按关注点
 拆分、新数据包处理器该放哪一层的见 [`docs/architecture.md`](docs/architecture.md)，

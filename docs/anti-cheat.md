@@ -263,3 +263,40 @@ longer than two ticks still stretches the world by the difference.  Only a
 driver that keeps ticking while the caller awaits -- a real client's frame loop
 -- removes that; the grid makes the debt visible and bounded instead of silent.
 
+## 10. Sleeping: say nothing while the server holds the body
+
+Clicking a bed is the one interaction where the server moves the player *in
+answer to* the click: `ServerPlayer.startSleepInBed` calls
+`connection.teleport(...)` and puts the body at the sleeping pose, 0.6875 blocks
+above the floor and up to three blocks from where the player stood.  Every claim
+we send between the click and that teleport is judged against a body the server
+has already moved -- measured at `Simulation 3.077768`, which is exactly
+`sqrt(0.6875² + 3²)`, followed by the anti-cheat setting us back with the same
+teleport 234 times.
+
+So `sleep_in_bed` does three things in this order:
+
+1. `use_item_on(..., tick=False)`: the click goes out, and no movement packet
+   rides behind it;
+2. `end_tick()` right after the click: an anti-cheat queues action packets that
+   arrive after a tick's movement marker and reports the queue when a ping lands
+   before the next movement packet clears it (`Post`), and the tick end clears
+   that queue without claiming a position;
+3. `bot.sleeping = True` for the wait: `_tick_once` then simulates nothing and
+   sends no position at all, only the tick-end marker every tick that a vanilla
+   client also sends while asleep.
+
+Getting up, or a bed that is broken under us, clears the flag and sends
+`STOP_SLEEPING` (action code 0) so the server hands control back instead of
+keeping a frozen avatar.
+
+The honest limitation: a bed is a 9/16 block box and the sleeping pose sits on
+top of it, so when the night is skipped the server's wake-up teleport lands the
+standing player a fraction above the bed.  We resolve that with the real shape
+table (`data/shapes-26.3.json.gz`) and `World.has_ground_under`, which fixed the
+three-block offset but not the last 0.0225: a sleeping round trip still leaves one
+`Simulation` and one `GroundSpoof (claimed true)` per sleep in the acceptance
+probe.  Both are single alerts with no setback, and both are recorded here rather
+than rounded away.
+
+

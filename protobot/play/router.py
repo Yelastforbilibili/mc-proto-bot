@@ -59,6 +59,7 @@ from ..support import (
     _parse_chat_text,
 )
 from ..text import plain_text
+from ..world import ClockState
 
 
 class PlayRouterMixin:
@@ -124,6 +125,8 @@ class PlayRouterMixin:
             reader.expect_end()
             response = PacketWriter().write_long(value).to_bytes()
             await self.send_raw(ids.serverbound_keep_alive, response)
+        elif ids.clientbound_update_time and packet.packet_id == ids.clientbound_update_time:
+            await self._handle_update_time(packet.payload)
         elif packet.packet_id == ids.clientbound_login:
             self._handle_play_login(packet.payload)
             await self.events.emit("world", self.session)
@@ -586,6 +589,35 @@ class PlayRouterMixin:
             self._set_game_mode(game_mode)
             await self.events.emit("game_mode", game_mode)
         await self.events.emit("game_event", event_id, value)
+
+    async def _handle_update_time(self, payload: bytes) -> None:
+        """Mirror the world clock: game time plus the per-clock states (26.x).
+
+        Since 26.x the server no longer sends a day time.  It sends the game
+        time and a sparse map of *world clocks* -- ``overworld`` and ``the_end``
+        -- each with its own tick count, sub-tick fraction and rate.  The
+        overworld clock is the one a bed reads through ``Level.isDarkOutside()``,
+        so that is what :attr:`World.day_time` follows.  The periodic "the clock
+        is still running" broadcast carries an empty map, which must not erase
+        what we already know.
+        """
+
+        reader = PacketReader(payload)
+        game_time = reader.read_long()
+        updates: dict[int, ClockState] = {}
+        if reader.remaining:
+            for _ in range(reader.read_varint()):
+                clock_id = reader.read_varint()
+                updates[clock_id] = ClockState(
+                    total_ticks=reader.read_varlong(),
+                    partial_tick=reader.read_float(),
+                    rate=reader.read_float(),
+                )
+        self.world.apply_clock_updates(game_time, updates)
+        if updates:
+            await self.events.emit(
+                "time", game_time, self.world.day_time, self.world.day_time_advancing
+            )
 
     async def _handle_block_update(self, payload: bytes) -> None:
         reader = PacketReader(payload)
@@ -2203,22 +2235,17 @@ class PlayRouterMixin:
         self.physics_state.velocity = Vec3(*velocity)
         self.physics_state.yaw = yaw
         self.physics_state.pitch = pitch
-        self.physics_state.on_ground = self.player.on_ground
-        self.physics_state.horizontal_collision = self.player.horizontal_collision
-        if not self.physics_state.on_ground and not self._force_flight_active:
-            # A teleport can put us on top of a block while the predictor still
-            # carries the "in the air" flag from before it.  Claiming that flag
-            # in the next movement packet is a ground spoof and anti-cheat
-            # flags it, so settle the flag from the world we have: a solid block
-            # right under the feet means we are standing on it.
-            below = self.world.get_state_id(
-                math.floor(position[0]),
-                math.floor(position[1] - 0.001),
-                math.floor(position[2]),
+        if not self._force_flight_active:
+            # A teleport lands wherever the server says, so the "on ground" flag
+            # carried into it describes the position we just left -- claiming it
+            # at the new one is a ground spoof (Grim flags it either way).  Ask
+            # the world instead: is something's top face under the feet *here*?
+            self.physics_state.on_ground = self.world.has_ground_under(
+                self.physics_state.position,
+                width=self.physics_state.width,
             )
-            if below > 0:
-                self.player.on_ground = True
-                self.physics_state.on_ground = True
+            self.player.on_ground = self.physics_state.on_ground
+        self.physics_state.horizontal_collision = self.player.horizontal_collision
         if self._force_flight_active:
             # Keep forced local flight active after any authoritative position
             # sync.  This packet is not interpreted as a permission decision.
@@ -2226,6 +2253,12 @@ class PlayRouterMixin:
             self.physics_state.flying = True
             self.physics_state.velocity = Vec3(*velocity)
         self._position_update_serial += 1
+        # An anti-cheat pairs a required teleport with the transaction it sent
+        # right before it and only accepts the confirmation while that
+        # transaction is the newest one it has seen (Grim's BadPacketsN is
+        # exactly "ignored or failed to accept a required server teleport").
+        # Answers deferred for tick ordering must go out first.
+        await self._flush_pongs()
         confirm = PacketWriter().write_varint(teleport_id)
         if self.version.protocol >= 777:
             # 26.3 echoes the resolved position/rotation in the accept packet;
