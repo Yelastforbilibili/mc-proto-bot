@@ -218,3 +218,19 @@ Two guards keep the tick self-consistent:
 of applied, and a tick that overlaps one is not replayed.  Vanilla clients never
 disable it; the switch exists for callers that drive movement themselves (a
 pathfinder that must not be pushed off its lane, for example).
+
+## 8. The sprint bit needs a forward impulse
+
+The input packet carries one bit per action, sprint included, and the server
+keeps its own sprint flag from the START/STOP SPRINTING commands.  A movement
+prediction combines both: if the input says "no forward" while the flag still
+says "sprinting", the two sides disagree by a few millimetres on every such
+tick, which Grim reports as `Simulation` (0.005 to 0.01, decaying with air drag
+because the error rides in the velocity).
+
+A vanilla client cannot produce that state -- releasing forward stops the sprint
+in the same tick, and the client sends STOP_SPRINTING -- so `_tick_once` clears
+`controls.sprint` whenever there is no forward impulse.  This matters for
+`navigate_to`, which pauses with `forward=0` whenever it is inside a waypoint's
+tolerance: sprint + knockback + a pause in flight used to produce a decay series
+of `Simulation` offsets, and stopping the sprint at the pause removes them.

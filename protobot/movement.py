@@ -77,6 +77,16 @@ class MovementMixin:
         self._require_play()
         await self._refresh_chat_certificate_if_due()
         controls = controls or MovementInput()
+        if controls.sprint and controls.forward <= 0.0:
+            # Vanilla drops out of sprint as soon as the forward impulse is
+            # released, so a real client never reports "sprinting while standing
+            # still".  The server keeps its own sprint flag from the START/STOP
+            # SPRINTING commands and a movement prediction uses that flag
+            # together with the input bits; leaving the flag set while the input
+            # says "no forward" makes the two disagree by a few millimetres every
+            # such tick, which is what ``navigate_to`` used to do whenever it
+            # paused inside a waypoint's tolerance.
+            controls = dataclasses.replace(controls, sprint=False)
         if (
             self._navigation_claimed
             or self._navigation_active
