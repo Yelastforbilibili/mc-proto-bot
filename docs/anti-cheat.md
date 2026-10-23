@@ -234,3 +234,32 @@ in the same tick, and the client sends STOP_SPRINTING -- so `_tick_once` clears
 `navigate_to`, which pauses with `forward=0` whenever it is inside a waypoint's
 tolerance: sprint + knockback + a pause in flight used to produce a decay series
 of `Simulation` offsets, and stopping the sprint at the pause removes them.
+
+## 9. Catch up two ticks at most, because the clock is measured
+
+`tick` keeps an absolute 50 ms grid in `_next_tick_at` and, when a caller comes
+back late, runs the slots that have already passed instead of stretching the
+next one.  That is what keeps a knockback arc ten ticks long when the loop that
+drives the bot hiccups: the impulse is resolved by the physics of the tick it
+belongs to, not by whenever the caller got around to it.
+
+The depth of that catch-up is not free.  Vanilla drains up to ten ticks per frame
+(`Minecraft.MAX_TICKS_PER_UPDATE`) because a real frame can take 500 ms, but the
+anti-cheat measures those bursts against the wall clock: Grim's `Timer` adds
+50 ms per movement packet (`timerBalanceRealTime += 50e6`), flags the moment the
+balance goes positive, and only remembers how far behind a client was up to
+`Timer.drift` (default 120 ms, `limitFallBehind`).  A client that was away for
+200 ms therefore cannot spend more than those 120 ms of remembered debt; sending
+the full four slots would put it half a tick ahead of real time and be flagged.
+
+`MAX_CATCH_UP_TICKS` is two (100 ms, inside the allowance), and
+`TICK_DEBT_RESET_SECONDS` is its width: debt older than that is not jitter but a
+caller that stopped ticking, so the grid re-anchors to now and drops it.  With
+ten ticks that is the difference between a burst of ten packets (four `Timer`
+alerts in the acceptance suite) and one honest tick.
+
+The consequence is worth stating plainly: a caller that awaits something for
+longer than two ticks still stretches the world by the difference.  Only a
+driver that keeps ticking while the caller awaits -- a real client's frame loop
+-- removes that; the grid makes the debt visible and bounded instead of silent.
+

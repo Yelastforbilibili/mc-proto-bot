@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import os
@@ -40,7 +41,7 @@ from protobot.constants import IDLE_TICK_SECONDS
 from protobot.containers import Menu, MenuNotOpen
 from protobot.crafting import recipe_for
 from protobot.goals import CraftGoal, GoalStatus, TravelGoal
-from protobot.physics import Vec3
+from protobot.physics import MovementInput, Vec3
 from protobot.tasks import BreakBlocks, PlaceBlocks, Task
 
 CHAT_LIMIT = 230
@@ -2754,6 +2755,238 @@ async def task_of_steps(s: Suite) -> None:
     )
     assert len({step.name for step in report.steps}) == 4, "报告里的步骤名重复了"
     await s.say("    " + " → ".join(f"{step.name}: {step.status.value}" for step in report.steps))
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+# ---------------------------------------------------------------------------
+# 10. physics fidelity: the knockback impulse and the sprint bit
+# ---------------------------------------------------------------------------
+OPPONENT = "KnockBot"
+
+
+@contextlib.asynccontextmanager
+async def _opponent(s: Suite, name: str = OPPONENT):
+    """A second client that ticks like a real one and can swing at the suite bot.
+
+    It has to keep ticking: an idle client sends no movement packets, so the
+    server keeps the position it last heard, and every swing is then rejected as
+    unreachable -- which looks exactly like "the hit did no damage".
+    """
+
+    opponent = await connect(
+        getattr(s.bot, "host", "127.0.0.1"),
+        port=int(getattr(s.bot, "port", 25565)),
+        username=name,
+        version=s.bot.version.name,
+        timeout=30.0,
+    )
+    stop = asyncio.Event()
+    ticker: asyncio.Task | None = None
+
+    async def loop() -> None:
+        while not stop.is_set():
+            try:
+                await opponent.tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+            await asyncio.sleep(0)
+
+    try:
+        for _ in range(600):
+            position = opponent.physics_state.position
+            key = (math.floor(position.x) >> 4, math.floor(position.z) >> 4)
+            if opponent.player.loaded and key in opponent.world.chunks:
+                break
+            await opponent.tick()
+        s.command(f"gamemode survival {name}")
+        s.command(f"heal {name}")
+        ticker = asyncio.create_task(loop())
+        await s.settle(0.3)
+        yield opponent
+    finally:
+        stop.set()
+        if ticker is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(ticker, timeout=2.0)
+        with contextlib.suppress(Exception):
+            await opponent.close()
+
+
+async def _swing_at(s: Suite, opponent, name: str = OPPONENT) -> float:
+    """Aim ``opponent`` at the suite bot, swing once, return the distance."""
+
+    entity = None
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        entity = opponent.find_player_entity(s.username)
+        if entity is not None:
+            break
+        await s.settle(0.1)
+    assert entity is not None, f"{name} 看不到 {s.username}"
+    center = opponent.actions.entity_center(entity.entity_id)
+    await opponent.actions.turn_to(center)
+    hit = opponent.actions.raycast_entity()
+    position = opponent.physics_state.position
+    distance = math.dist(
+        (position.x, position.y, position.z), (center.x, center.y, center.z)
+    )
+    assert hit is not None and hit.entity_id == entity.entity_id, (
+        f"{name} 的准星没有落在我们身上：hit={hit} 距离={distance:.2f} "
+        f"我们本地位置=({entity.x:.2f}, {entity.y:.2f}, {entity.z:.2f})"
+    )
+    result = await opponent.actions.attack_looked_at()
+    assert result.status is ActionStatus.SENT, f"攻击没有发出去：{result.evidence}"
+    return distance
+
+
+@case(34, "物理", "击退：impulse 在下一个移动包里就生效，不被拉回", timeout=180.0)
+async def knockback_same_tick(s: Suite) -> None:
+    """A knockback impulse must show up in the very next movement claim.
+
+    The failure this pins down: the impulse arrives while a tick is between its
+    physics step and its packet.  That packet then claims a step computed without
+    the impulse, the prediction check reports `AntiKB`/`Simulation`, and a
+    setback teleport throws the bot back to where it stood.
+    """
+
+    ax, ay, az = s.anchor
+    await s.teleport((ax + 3.5, float(ay), az + 3.5))
+    await s.settle(0.4)
+
+    impulses: list[tuple[float, float]] = []
+    corrections: list[Any] = []
+    own = s.bot.session.entity_id
+
+    def on_motion(entity_id: int, velocity: Any, entity: Any) -> None:
+        if entity_id == own:
+            impulses.append((velocity[0], velocity[2]))
+
+    def on_position(player: Any) -> None:
+        corrections.append(player)
+
+    s.bot.events.on("entity_motion", on_motion)
+    s.bot.events.on("position", on_position)
+    before = s.position()
+    try:
+        async with _opponent(s) as opponent:
+            s.command(f"tp {OPPONENT} {ax + 3.5:.2f} {ay:.2f} {az + 1.4:.2f}")
+            await s.settle(0.6)
+            distance = await _swing_at(s, opponent)
+
+            deadline = time.monotonic() + 4.0
+            moved = 0.0
+            while time.monotonic() < deadline:
+                moved = math.dist(s.position(), before)
+                if impulses and moved >= 0.3:
+                    break
+                await s.settle(0.05)
+            assert impulses, (
+                f"没有收到击退速度包（距离 {distance:.2f}，血量 {s.bot.player.health}）"
+            )
+            impulse = impulses[0]
+            magnitude = math.hypot(*impulse)
+            assert 0.3 <= magnitude <= 0.5, f"击退幅度不对：{impulse}"
+            after = s.position()
+            drift = (after[0] - before[0], after[2] - before[2])
+            assert moved >= 0.3, f"击退位移不足：{moved:.2f} 格"
+            dot = drift[0] * impulse[0] + drift[1] * impulse[1]
+            assert dot > 0, f"位移方向与 impulse 相反：位移 {drift}，impulse {impulse}"
+            server = s.server_position()
+            assert server is not None, "服务端没有列出我们"
+            assert math.dist(server, after) <= 0.8, (
+                f"服务端位置 {server} 与本地 {tuple(round(v, 2) for v in after)} 对不上"
+            )
+            assert not corrections, f"被服务端拉回（setback）：{len(corrections)} 次传送"
+            await s.say(
+                f"    impulse={tuple(round(v, 3) for v in impulse)} "
+                f"位移={moved:.2f} 格，服务端与本地一致"
+            )
+    finally:
+        s.bot.events.remove("entity_motion", on_motion)
+        s.bot.events.remove("position", on_position)
+    bad = s.anti_cheat_lines()
+    assert not bad, f"反作弊日志：{bad[:2]}"
+
+
+@case(
+    35,
+    "物理",
+    "疾跑位：停手后输入包不再出现「疾跑但没有前进」",
+    timeout=180.0,
+)
+async def sprint_bit_needs_forward(s: Suite) -> None:
+    """The input bits must never contradict the sprint flag.
+
+    Vanilla stops sprinting the moment the forward impulse goes away, but the
+    server keeps its own sprint flag until STOP_SPRINTING arrives, so claiming
+    ``sprint=1, forward=0`` leaves a per-tick disagreement with the prediction.
+    Once a knockback keeps that error airborne it surfaces as a decaying series
+    of `Simulation` offsets (0.005, 0.009, ...).  This case watches the packets
+    that actually went out.
+    """
+
+    inputs: list[tuple[bool, bool]] = []
+    original = s.bot.send_input
+    impulses: list[tuple[float, float]] = []
+    own = s.bot.session.entity_id
+
+    async def record(
+        *,
+        forward: bool,
+        backward: bool,
+        left: bool,
+        right: bool,
+        jump: bool,
+        sneak: bool,
+        sprint: bool,
+    ) -> None:
+        inputs.append((forward, sprint))
+        await original(
+            forward=forward,
+            backward=backward,
+            left=left,
+            right=right,
+            jump=jump,
+            sneak=sneak,
+            sprint=sprint,
+        )
+
+    def on_motion(entity_id: int, velocity: Any, entity: Any) -> None:
+        if entity_id == own:
+            impulses.append((velocity[0], velocity[2]))
+
+    ax, ay, az = s.anchor
+    s.bot.send_input = record  # type: ignore[method-assign]
+    s.bot.events.on("entity_motion", on_motion)
+    try:
+        await s.teleport((ax + 3.5, float(ay), az + 3.5))
+        await s.settle(0.4)
+        async with _opponent(s) as opponent:
+            s.command(f"tp {OPPONENT} {ax + 3.5:.2f} {ay:.2f} {az + 1.5:.2f}")
+            await s.settle(0.6)
+            for _ in range(2):
+                await s.bot.tick(MovementInput(forward=1.0, sprint=True))
+            assert s.bot.physics_state.sprinting, "起步之后没有进入疾跑"
+            distance = await _swing_at(s, opponent)
+            assert impulses, f"没有收到击退（距离 {distance:.2f}）"
+            for _ in range(3):
+                await s.bot.tick(MovementInput(forward=1.0, sprint=True))
+            assert not s.bot.physics_state.on_ground, "击退之后应该离地，否则测不到这条"
+            inputs.clear()
+            for _ in range(3):
+                await s.bot.tick(MovementInput(forward=0.0, sprint=True))
+            assert not s.bot.physics_state.sprinting, "前进位为 0 时仍在疾跑"
+            careless = [pair for pair in inputs if pair[1] and not pair[0]]
+            assert not careless, f"输入包出现了「疾跑但没有前进」：{careless[:4]}"
+            await s.say(
+                f"    击退 {distance:.2f} 格，离地后停手，{len(inputs)} 条输入包没有一条自相矛盾"
+            )
+    finally:
+        s.bot.events.remove("entity_motion", on_motion)
+        s.bot.send_input = original  # type: ignore[method-assign]
     bad = s.anti_cheat_lines()
     assert not bad, f"反作弊日志：{bad[:2]}"
 

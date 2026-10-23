@@ -31,10 +31,12 @@ __all__ = [
     "GOAL_POLL_SECONDS",
     "HOLD_MARGIN_SECONDS",
     "IDLE_TICK_SECONDS",
+    "MAX_CATCH_UP_TICKS",
     "MIN_TICK_GAP",
     "POLL_SECONDS",
     "QUIET_SECONDS",
     "ROTATION_EPSILON",
+    "TICK_DEBT_RESET_SECONDS",
     "TICK_SECONDS",
     "VANILLA_ROTATION_EPSILON_SQUARED",
 ]
@@ -58,6 +60,28 @@ MIN_TICK_GAP = TICK_SECONDS
 #: never stops sending movement; a hole in the stream makes the next step
 #: disagree with the server's prediction by most of a step.
 IDLE_TICK_SECONDS = 0.075
+
+#: How many ticks one late call may run back to back.
+#:
+#: A vanilla client drains up to ten per frame (``Minecraft``:
+#: ``MAX_TICKS_PER_UPDATE = 10``) because a real client's frame can take 500 ms
+#: and it keeps the unpaid remainder in ``DeltaTracker``.  We cannot afford ten:
+#: an anti-cheat measures those bursts against the wall clock.  Grim's ``Timer``
+#: adds 50 ms per movement packet, subtracts real time, flags the moment the
+#: balance goes positive, and clamps how far behind it remembers at
+#: ``Timer.drift`` = 120 ms.  Spending two slots (100 ms) still fits inside that
+#: allowance, so the knockback arc keeps its shape across an ordinary await
+#: instead of stretching, without the client ever claiming to run ahead of time.
+MAX_CATCH_UP_TICKS = 2
+
+#: The widest debt one call will replay.  Anything older cannot be spent inside
+#: the allowance above: the packets would have to go out faster than real time,
+#: which is exactly what ``Timer`` flags.  It is a caller that stopped ticking
+#: (waiting for a chunk, a path plan, a chat round trip), so the grid re-anchors
+#: to now and the unspendable debt is dropped -- the honest record of a client
+#: that was not running.  A vanilla client needs no valve because its loop never
+#: stops; keeping our own loop running is the caller's or a driver's job.
+TICK_DEBT_RESET_SECONDS = MAX_CATCH_UP_TICKS * TICK_SECONDS
 
 # ---------------------------------------------------------------------------
 # rotation

@@ -14,20 +14,42 @@ import dataclasses
 import math
 import time
 
-from .constants import ANTI_KICK_WIRE_OFFSET, VANILLA_ROTATION_EPSILON_SQUARED
+from .constants import (
+    ANTI_KICK_WIRE_OFFSET,
+    MAX_CATCH_UP_TICKS,
+    TICK_DEBT_RESET_SECONDS,
+    TICK_SECONDS,
+    VANILLA_ROTATION_EPSILON_SQUARED,
+)
 from .log import debug as log_debug, trace as log_trace
 from .physics import AABB, MovementInput, PhysicsState, Vec3
 from .physics.math import f32, minecraft_cos, minecraft_sin
 from .protocol.codec import PacketWriter
 from .state import EntityState
 from .support import (
-    MIN_TICK_GAP,
     _START_FALL_FLYING_COMMAND,
     _START_SPRINTING_COMMAND,
     _STOP_SPRINTING_COMMAND,
     _TRACE_POS,
     _TRACE_SEND,
 )
+
+
+#: A wait shorter than this is bookkeeping noise, not a schedule: two floats
+#: that should be equal can still leave a few attoseconds on the clock.
+_SLEEP_EPSILON = 1e-6
+
+
+def _now() -> float:
+    """Monotonic seconds.  A seam so tests can drive the tick grid."""
+
+    return time.monotonic()
+
+
+async def _sleep(delay: float) -> None:
+    """Sleep without blocking the loop.  A seam so tests can advance the grid."""
+
+    await asyncio.sleep(delay)
 
 
 class MovementMixin:
@@ -41,22 +63,65 @@ class MovementMixin:
         send_position: bool = True,
         _navigation_tick: bool = False,
     ) -> PhysicsState:
-        """Advance the local player by one 20 Hz tick.
+        """Advance the local player's 20 Hz tick grid.
 
         The body runs under a lock because one tick is one movement packet: a
         goal, an action and a caller's own loop can all ask for a tick, and two
         of them running at once would advance the physics twice and then report
         that as a single step, which the server reads as a position that does
         not match its prediction.
+
+        A call advances one tick when it arrives on time.  When the caller is
+        slightly late -- it awaited something short and the grid slipped by a
+        slot or two -- the call runs the ticks whose slot has passed, so a
+        knockback arc keeps its shape instead of being stretched by the await.
+
+        The catch-up is deliberately shallow: ``MAX_CATCH_UP_TICKS``.  Vanilla
+        drains up to ten per frame, but those bursts are measured against the
+        wall clock by the anti-cheat (see the constant), and a library caller
+        waiting on a chunk, a path plan or a chat round trip is not a 500 ms
+        frame -- it is a client that was not running.  Debt wider than the
+        allowance therefore drops and the grid re-anchors to now, which records
+        that honestly instead of replaying seconds of stale input.
         """
 
         async with self._tick_lock:
-            return await self._tick_once(
-                controls,
-                send_input=send_input,
-                send_position=send_position,
-                _navigation_tick=_navigation_tick,
-            )
+            state = self.physics_state
+            for _ in range(self._ticks_due(send_input, send_position)):
+                scheduled = self._next_tick_at
+                state = await self._tick_once(
+                    controls,
+                    send_input=send_input,
+                    send_position=send_position,
+                    _navigation_tick=_navigation_tick,
+                )
+                if self._next_tick_at == scheduled:
+                    # This call did not claim a slot: the tick was a no-op
+                    # (navigation owns the body, or nothing was sent), so
+                    # catching up would only spin.
+                    break
+            return state
+
+    def _ticks_due(self, send_input: bool, send_position: bool) -> int:
+        """How many ticks are owed right now, the way vanilla counts them."""
+
+        if not (send_input or send_position):
+            return 1
+        scheduled = self._next_tick_at
+        if scheduled is None:
+            return 1
+        behind = _now() - scheduled
+        if behind <= 0.0:
+            return 1
+        if behind > TICK_DEBT_RESET_SECONDS:
+            # Wider than the anti-cheat lets a client spend (see
+            # _begin_tick_packet, which re-anchors): one tick from now.
+            return 1
+        # Every slot that has arrived is owed, current one included.  Binary
+        # division of the float clock can land a hair under the count (0.10 -
+        # 0.05 is 0.0499...), which would lose the slot the caller is standing
+        # in, so round up there.
+        return min(MAX_CATCH_UP_TICKS, int(behind / TICK_SECONDS + 1e-9) + 1)
 
     async def _tick_once(
         self,
@@ -369,18 +434,26 @@ class MovementMixin:
         self._last_sent_yaw, self._last_sent_pitch = yaw, pitch
 
     async def wait_tick_budget(self) -> None:
-        """Sleep until the next movement packet may go out without speeding up.
+        """Sleep until the next movement packet's slot has arrived.
 
         Actions use this to place a packet (an arm swing, a stop-digging) right
         before the movement packet that closes the tick, so anti-cheat never
-        finds it queued alone when a transaction arrives.
+        finds it queued alone when a transaction arrives.  It only *waits* for
+        the slot; the tick claims it, so asking twice cannot push two movement
+        packets into one slot.  When the grid is already behind, this returns at
+        once and the tick that follows catches up.
         """
 
-        if not self._last_tick_packet_time:
+        scheduled = self._next_tick_at
+        if scheduled is None:
+            if not self._last_tick_packet_time:
+                return
+            scheduled = self._last_tick_packet_time + TICK_SECONDS
+            self._next_tick_at = scheduled
+        delay = scheduled - _now()
+        if delay <= _SLEEP_EPSILON:
             return
-        delay = MIN_TICK_GAP - (time.monotonic() - self._last_tick_packet_time)
-        if delay > 0:
-            await asyncio.sleep(delay)
+        await _sleep(delay)
 
     async def _begin_tick_packet(self) -> None:
         """Start a movement tick the way a vanilla client does.
@@ -391,16 +464,28 @@ class MovementMixin:
         is two ticks inside one real-time frame.  Grim's Timer check adds 50 ms
         per movement packet and flags once the balance runs ahead of real time,
         and its TickTimer check flags a tick that carries two movement packets.
-        So close the previous tick and keep the packets 50 ms apart.
+        So close the previous tick and keep the packets on the grid.
+
+        The grid is absolute, not relative: the next slot is the one this packet
+        was scheduled for plus one tick, so a call that is already late sends
+        immediately and hands the debt on, and ``tick`` can drain several slots
+        in a row after a stall exactly like ``Minecraft.runTick``.  Only a gap
+        too wide to be jitter re-anchors the grid, because replaying seconds of
+        stale input would claim movement the server never saw.
         """
 
         if self.version.protocol >= 777 and self._position_sent_this_tick:
             await self.end_tick()
-        if self._last_tick_packet_time:
-            delay = MIN_TICK_GAP - (time.monotonic() - self._last_tick_packet_time)
-            if delay > 0:
-                await asyncio.sleep(delay)
-        self._last_tick_packet_time = time.monotonic()
+        now = _now()
+        scheduled = self._next_tick_at
+        if scheduled is None or now - scheduled > TICK_DEBT_RESET_SECONDS:
+            scheduled = now
+        delay = scheduled - now
+        if delay > _SLEEP_EPSILON:
+            await _sleep(delay)
+            now = _now()
+        self._next_tick_at = scheduled + TICK_SECONDS
+        self._last_tick_packet_time = now
         self._position_sent_this_tick = True
 
     async def _send_position_packet(self, packet_id: int, payload: bytes) -> None:

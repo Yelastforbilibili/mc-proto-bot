@@ -263,6 +263,10 @@ class Bot(ConnectionMixin, MovementMixin, PlayRouterMixin, NavigatorMixin, Picku
         self._position_sent_this_tick = False
         # Monotonic time of the last movement packet; see _begin_tick_packet.
         self._last_tick_packet_time = 0.0
+        # Monotonic instant at which the next movement packet is due.  Owed tick
+        # time is carried here, never dropped, so a late caller catches up the
+        # way a vanilla client does instead of stretching the tick grid.
+        self._next_tick_at: float | None = None
         # Rotation carried by the last look/posRot packet; see _rotation_unchanged.
         self._last_sent_yaw = None
         self._last_sent_pitch = None
