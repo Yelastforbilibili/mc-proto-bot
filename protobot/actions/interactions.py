@@ -124,6 +124,11 @@ def _continuous_yaw(previous: float, yaw: float) -> float:
     return previous + ((yaw - previous + 180.0) % 360.0 - 180.0)
 
 
+_BLOCK_ACTIONS = frozenset(
+    {"dig", "dig_start", "dig_stop", "dig_abort", "dig_change_direction"}
+)
+
+
 class Actions:
     """Interaction primitives bound to one connected client.
 
@@ -1779,15 +1784,26 @@ class Actions:
         face: BlockFace = BlockFace.UP,
     ) -> ActionResult:
         started = time.monotonic()
-        position = self._action_position() if position is None else position
+        block_related = action in _BLOCK_ACTIONS
+        if block_related:
+            position = self._action_position() if position is None else position
+            direction = int(face)
+            sequence = self._sequence()
+        else:
+            # Vanilla sends BlockPos.ZERO, DOWN and sequence 0 for the item
+            # actions (drop, release, swap): the server does not look at a block,
+            # and an anti-cheat reads a non-zero position here as a lie.
+            position = (0, 0, 0)
+            direction = 0
+            sequence = 0
         packet_id = await self._send(
             "serverbound_player_action",
             action,
             PacketWriter()
             .write_varint(code)
             .write_position(*position)
-            .write_unsigned_byte(int(face))
-            .write_varint(self._sequence())
+            .write_unsigned_byte(direction)
+            .write_varint(sequence)
             .to_bytes(),
         )
         return await self._emit(

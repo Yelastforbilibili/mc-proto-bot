@@ -40,7 +40,14 @@ from protobot import connect
 from protobot.actions import ActionStatus, BlockFace
 from protobot.containers import Menu, MenuNotOpen
 from protobot.crafting import recipe_for
-from protobot.goals import CraftGoal, GoalStatus, TravelGoal
+from protobot.expectation import ExpectationStatus, wait_for_expectation
+from protobot.goals import (
+    BreakBlockGoal,
+    CraftGoal,
+    GoalStatus,
+    SequenceGoal,
+    TravelGoal,
+)
 from protobot.physics import MovementInput, Vec3
 from protobot.tasks import BreakBlocks, PlaceBlocks, Task
 
@@ -3003,6 +3010,288 @@ async def sprint_bit_needs_forward(s: Suite) -> None:
 
 # ---------------------------------------------------------------------------
 # main
+@case(36, "库能力", "驱动：给 input 之后调用方只 await，机器人自己按 20 Hz 走", timeout=120.0)
+async def case_driver(s: Suite) -> None:
+    feet = s.feet()
+    s.command(f"tp {s.username} {feet[0]+0.5} {feet[1]+0.2} {feet[2]+0.5} 0 0")
+    await s.settle(0.5)
+    before = s.server_position()
+    assert before is not None, "读不到服务端位置"
+    s.bot.input = MovementInput(forward=1.0)
+    try:
+        # Nothing in this block calls tick(): the driver is the only thing that
+        # can move the body, which is the whole point of the feature.
+        await asyncio.sleep(1.2)
+    finally:
+        s.bot.input = MovementInput()
+    await s.settle(0.3)
+    after = s.server_position()
+    assert after is not None
+    walked = math.dist(before, after)
+    assert walked >= 2.0, f"await 期间没有前进：{walked:.2f} 格"
+    await s.say(f"    只 await 1.2s，服务端看到走了 {walked:.2f} 格（驱动在跑）")
+
+
+@case(37, "库能力", "Expectation：done / timed out / invalidated / failed 四种结局", timeout=60.0)
+async def case_expectation(s: Suite) -> None:
+    done = await wait_for_expectation(
+        s.bot, lambda: True, timeout=0.5, name="already true"
+    )
+    assert done.status is ExpectationStatus.DONE and done.ok, done.describe()
+    late = await wait_for_expectation(s.bot, lambda: False, timeout=0.3, name="never")
+    assert late.status is ExpectationStatus.TIMEOUT, late.describe()
+    gone = await wait_for_expectation(
+        s.bot,
+        lambda: False,
+        valid=lambda: "the bed is gone",
+        timeout=0.5,
+        name="window",
+    )
+    assert gone.status is ExpectationStatus.INVALIDATED, gone.describe()
+    assert "the bed is gone" in gone.detail
+
+    def boom() -> bool:
+        raise ValueError("state id 0 is not in the block table")
+
+    broken = await wait_for_expectation(s.bot, boom, timeout=0.5, name="broken")
+    assert broken.status is ExpectationStatus.FAILED, broken.describe()
+    assert "state id 0" in broken.detail
+    await s.say(
+        f"    {done.status.value} / {late.status.value} / "
+        f"{gone.status.value} / {broken.status.value}"
+    )
+
+
+@case(38, "库能力", "物理：跳得起来、潜行更慢、入水被识别", timeout=180.0)
+async def case_physics(s: Suite) -> None:
+    feet = s.feet()
+    base = (feet[0], feet[1] - 1, feet[2])
+    s.setblock(base, "minecraft:stone")
+    for dy in (0, 1, 2, 3):
+        s.air((base[0], base[1] + 1 + dy, base[2]))
+    await s.teleport((base[0] + 0.5, base[1] + 1.05, base[2] + 0.5))
+    await s.settle(0.5)
+    start = s.server_position()
+    assert start is not None
+    local = [s.bot.physics_state.position.y]
+    seen = [start[1]]
+    # Park the driver: it would otherwise slip an empty-input tick between the
+    # jumps and the two of us would take turns steering the same body.
+    await s.bot.stop_driver()
+    try:
+        for _ in range(14):
+            await s.bot.tick(MovementInput(jump=True))
+            local.append(s.bot.physics_state.position.y)
+            sample = s.server_position()
+            if sample is not None:
+                seen.append(sample[1])
+    finally:
+        await s.bot.start_driver()
+    risen = max(local) - local[0]
+    assert risen > 0.8, (
+        f"跳不起来（本地物理）：最高 {risen:.3f} 格，"
+        f"on_ground={s.bot.physics_state.on_ground}"
+    )
+    server_rise = max(seen) - start[1]
+    assert server_rise > 0.5, (
+        f"本地跳了 {risen:.2f} 格，服务端只看到 {server_rise:.3f} 格"
+    )
+
+    async def slide(controls: MovementInput, ticks: int) -> float:
+        origin = s.bot.physics_state.position
+        for _ in range(ticks):
+            await s.bot.tick(controls)
+        end = s.bot.physics_state.position
+        return math.hypot(end.x - origin.x, end.z - origin.z)
+
+    await s.teleport((base[0] + 0.5, base[1] + 1.0, base[2] + 0.5))
+    await s.settle(0.4)
+    await s.bot.stop_driver()
+    try:
+        walked = await slide(MovementInput(forward=1.0), 10)
+        await s.teleport((base[0] + 0.5, base[1] + 1.0, base[2] + 0.5))
+        await s.settle(0.4)
+        sneaked = await slide(MovementInput(forward=1.0, sneak=True), 10)
+    finally:
+        await s.bot.start_driver()
+    assert sneaked < walked * 0.7, (
+        f"潜行没有变慢：走 {walked:.2f} 格，潜行 {sneaked:.2f} 格"
+    )
+
+    pool = (base[0] + 3, base[1], base[2])
+    s.setblock(pool, "minecraft:stone")
+    # A walled basin: water poured into open air flows away before the client
+    # reads the block under its feet.
+    for offset in (-1, 1):
+        for dy in (1, 2):
+            s.setblock((pool[0] + offset, pool[1] + dy, pool[2]), "minecraft:stone")
+            s.setblock((pool[0], pool[1] + dy, pool[2] + offset), "minecraft:stone")
+    for dz in (-1, 1):
+        s.setblock((pool[0], pool[1], pool[2] + dz), "minecraft:stone")
+    s.command(
+        f"fill {pool[0]} {pool[1] + 1} {pool[2]} {pool[0]} {pool[1] + 2} {pool[2]} minecraft:water"
+    )
+    await s.teleport((pool[0] + 0.5, pool[1] + 1.0, pool[2] + 0.5))
+    await s.settle(0.5)
+    await s.bot.tick(MovementInput())
+    assert s.bot.physics_state.in_water, "在水里却没有识别为入水"
+    await s.say(
+        f"    跳 {risen:.2f} 格 / 走 {walked:.2f} / 潜行 {sneaked:.2f} / 入水已识别"
+    )
+
+
+@case(39, "库能力", "载具：上船、船带着人走、再下船", timeout=180.0)
+async def case_vehicle(s: Suite) -> None:
+    base = s.spot(0, 7)
+    s.setblock(base, "minecraft:stone")
+    s.command(
+        f"fill {base[0]-1} {base[1]+1} {base[2]-1} {base[0]+1} {base[1]+1} {base[2]+1} minecraft:water"
+    )
+    await s.teleport((base[0] + 0.5, base[1] + 1.0, base[2] + 0.5))
+    await s.settle(0.5)
+    boat_type = s.bot.version.entities.by_name["minecraft:oak_boat"]["id"]
+    before = {
+        entity.entity_id
+        for entity in s.bot.entities.values()
+        if entity.type_id == boat_type
+    }
+    s.clear_inventory()
+    s.give("minecraft:oak_boat", 1)
+    await s.wait_count("minecraft:oak_boat", 1, timeout=6.0)
+    await s.hold("minecraft:oak_boat")
+    # The server decides where the boat lands from the aim ray, so point at the
+    # water surface before using the item.
+    await s.bot.actions.turn_to(
+        (base[0] + 0.5, base[1] + 1.05, base[2] + 1.5), tick=True
+    )
+    await s.bot.actions.use_item()
+    await s.settle(0.8)
+    boats = [
+        entity.entity_id
+        for entity in s.bot.entities.values()
+        if entity.type_id == boat_type and entity.entity_id not in before
+    ]
+    assert boats, "服务端没有生成船"
+    boat = boats[0]
+    await s.bot.actions.interact(boat)
+    await s.settle(0.5)
+    assert s.bot.player.vehicle_id == boat, (
+        f"没有上船：vehicle_id={s.bot.player.vehicle_id}，船={boat}"
+    )
+    start = s.server_position()
+    assert start is not None
+    for _ in range(20):
+        await s.bot.tick(MovementInput(forward=1.0, strafe=0.4))
+    await s.settle(0.3)
+    moved = s.server_position()
+    assert moved is not None
+    distance = math.dist(start, moved)
+    assert distance >= 0.5, f"在船上却没有移动：{distance:.2f} 格"
+    for _ in range(8):
+        await s.bot.tick(MovementInput(sneak=True))
+    await s.settle(0.4)
+    assert s.bot.player.vehicle_id is None, "下不了船"
+    await s.say(f"    上船 → 随船走 {distance:.2f} 格 → 下船")
+
+
+@case(40, "库能力", "丢弃与拾取：丢出的物品成为服务端实体，再走回去捡回来", timeout=180.0)
+async def case_drop_pickup(s: Suite) -> None:
+    feet = s.feet()
+    s.command(f"tp {s.username} {feet[0]+0.5} {feet[1]+0.2} {feet[2]+0.5} 0 0")
+    await s.settle(0.4)
+    s.clear_inventory()
+    s.give("minecraft:oak_log", 3)
+    await s.wait_count("minecraft:oak_log", 3, timeout=6.0)
+    await s.hold("minecraft:oak_log")
+    await s.bot.stop_driver()
+    try:
+        result = await s.bot.actions.drop_item()
+        assert result.status is ActionStatus.SENT, result.evidence
+        await s.settle(1.0)
+    finally:
+        await s.bot.start_driver()
+    while_inventory = s.server_count("minecraft:oak_log")
+    assert while_inventory <= 2, f"丢出去之后背包里还有 {while_inventory} 个"
+    report = await s.bot.pick_up(items=["minecraft:oak_log"], count=1, radius=8.0)
+    assert report.ok, f"没捡回来：{report.describe()}"
+    picked = s.wait_count("minecraft:oak_log", 3, timeout=6.0)
+    assert picked >= 3, f"捡回来以后只有 {picked} 个"
+    await s.say(f"    丢弃 → 服务端 {while_inventory} 个 → 拾取 → {picked} 个")
+
+
+@case(41, "库能力", "碰撞形状：台阶不是满方块，站上去的高度差半格", timeout=120.0)
+async def case_shapes(s: Suite) -> None:
+    base = s.spot(-7, 0)
+    s.setblock(base, "minecraft:stone")
+    s.setblock((base[0], base[1] + 1, base[2]), "minecraft:smooth_stone_slab")
+    for dy in (2, 3):
+        s.air((base[0], base[1] + dy, base[2]))
+    await s.teleport((base[0] + 0.5, base[1] + 3.0, base[2] + 0.5))
+    await s.settle(1.2)
+    await s.bot.tick(MovementInput())
+    landed = s.server_position()
+    assert landed is not None
+    expected = base[1] + 1 + 0.5       # 台阶顶面
+    full_block = base[1] + 1 + 1.0     # 若是满方块才会站这里
+    assert abs(landed[1] - expected) <= 0.08, (
+        f"没有站在台阶顶面：y={landed[1]:.3f}，台阶顶 {expected:.3f}，满方块顶 {full_block:.3f}"
+    )
+    assert s.bot.physics_state.on_ground, "站在台阶上却报告悬空"
+    await s.say(f"    站在台阶顶面 y={landed[1]:.3f}（满方块会是 {full_block:.3f}）")
+
+
+@case(42, "库能力", "组合目标：SequenceGoal(走到 → 挖掉)，一份报告说明结果", timeout=180.0)
+async def case_goal_sequence(s: Suite) -> None:
+    feet = s.feet()
+    base = (feet[0], feet[1] - 1, feet[2])
+    s.setblock(base, "minecraft:stone")
+    first = (base[0], base[1] + 1, base[2])
+    second = (base[0] + 1, base[1] + 1, base[2])
+    for log in (first, second):
+        s.setblock(log, "minecraft:oak_log")
+        s.air((log[0], log[1] + 1, log[2]))
+    await s.teleport((base[0] + 0.5, base[1] + 1.05, base[2] + 0.5))
+    await s.settle(0.5)
+    goal = SequenceGoal(
+        BreakBlockGoal(first, hold=4.0),
+        BreakBlockGoal(second, hold=4.0),
+        name="two digs in order",
+    )
+    report = await s.bot.goals.run(goal, timeout=90.0)
+    assert report.ok, f"组合目标没有完成：{report.status} {getattr(report, 'detail', '')}"
+    for log in (first, second):
+        state = s.bot.world.get_state_id(*log)
+        assert state == 0, f"{log} 还在：state {state}"
+    await s.say(f"    两个按顺序挖完：{report.status}")
+
+
+@case(43, "库能力", "实体跟踪：服务端把牛 tp 走，客户端跟着更新", timeout=120.0)
+async def case_entity_tracking(s: Suite) -> None:
+    base = s.spot(0, -9)
+    s.setblock(base, "minecraft:stone")
+    s.command(f"kill @e[type=minecraft:cow]")
+    s.command(f"summon minecraft:cow {base[0]+0.5} {base[1]+1} {base[2]+0.5}")
+    await s.settle(0.6)
+    cow_type = s.bot.version.entities.by_name["minecraft:cow"]["id"]
+    cows = [
+        entity for entity in s.bot.entities.values() if entity.type_id == cow_type
+    ]
+    assert cows, "服务端有牛，客户端却没跟踪到"
+    cow = cows[0]
+    destination = (base[0] + 4.5, base[1] + 1, base[2] + 3.5)
+    s.command(f"tp @e[type=minecraft:cow,limit=1] {destination[0]} {destination[1]} {destination[2]}")
+    await s.settle(0.8)
+    tracked = s.bot.entities.get(cow.entity_id)
+    assert tracked is not None, "牛被传送之后客户端丢了它"
+    offset = math.dist(
+        (tracked.x, tracked.y, tracked.z),
+        (destination[0], destination[1], destination[2]),
+    )
+    assert offset <= 1.0, f"客户端记录的牛位置差 {offset:.2f} 格"
+    await s.say(f"    牛被服务器 tp 到 {destination[0]:.1f},{destination[2]:.1f}，客户端差 {offset:.2f} 格")
+
+
+
 # ---------------------------------------------------------------------------
 async def main_async(args: argparse.Namespace) -> int:
     bridge = Bridge(args.bridge)
