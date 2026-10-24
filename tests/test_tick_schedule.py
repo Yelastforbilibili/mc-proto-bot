@@ -171,6 +171,21 @@ class TickGridTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_movements(bot, sent), 0)
         self.assertAlmostEqual(bot._next_tick_at, TICK)
 
+    async def test_a_no_op_tick_gives_the_event_loop_a_turn(self) -> None:
+        bot, sent = _make_bot()
+        bot.physics_state.on_ground = True
+        # Navigation owns the body, so this tick does nothing at all: without the
+        # yield a caller looping on tick() would spin and starve the very task it
+        # is waiting for (asyncio.Lock is not a yield point when it is free).
+        bot._navigation_claimed = True
+        sent.clear()
+
+        await bot.tick(MovementInput(forward=1.0))
+
+        self.assertEqual(_movements(bot, sent), 0)
+        self.assertEqual(len(self.clock.sleeps), 1)
+        self.assertAlmostEqual(self.clock.sleeps[0], TICK)
+
 
 if __name__ == "__main__":
     unittest.main()
