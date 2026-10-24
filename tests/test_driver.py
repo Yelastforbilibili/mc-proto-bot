@@ -148,11 +148,73 @@ class DriverPumpTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WaitTicksTests(unittest.IsolatedAsyncioTestCase):
-    async def test_wait_ticks_times_out_without_a_driver(self) -> None:
+    async def test_wait_ticks_without_a_driver_says_why(self) -> None:
+        # No pump, so no tick can ever arrive: that is a stopped driver, not a
+        # slow server, and hanging until the caller's own timeout hides it.
         bot, _sent = _make_bot()
-        with self.assertRaises(TimeoutError):
-            await bot.wait_ticks(1, timeout=0.05)
+        with self.assertRaises(RuntimeError):
+            await bot.wait_ticks(1, timeout=5.0)
 
     async def test_wait_zero_ticks_returns_immediately(self) -> None:
         bot, _sent = _make_bot()
         self.assertIs(await bot.wait_ticks(0), bot.physics_state)
+
+
+class AdvanceTests(unittest.IsolatedAsyncioTestCase):
+    """``advance`` is the one way to say "let the game move".
+
+    Two call shapes must stay equivalent, because every layer above uses it:
+    with a driver it holds the controls and waits for the pump, without one it
+    is the plain tick the caller wrote before.
+    """
+
+    def setUp(self) -> None:
+        self.clock = FakeClock()
+        self.enterContext(mock.patch("protobot.movement._now", lambda: self.clock.now))
+        self.enterContext(mock.patch("protobot.driver._now", lambda: self.clock.now))
+        self.enterContext(mock.patch("protobot.movement._sleep", self._fake_sleep))
+        self.enterContext(mock.patch("protobot.driver._sleep", self._fake_sleep))
+
+    async def _fake_sleep(self, delay: float) -> None:
+        self.clock.advance(delay)
+        await asyncio.sleep(0)
+
+    async def test_without_a_driver_advance_is_a_tick(self) -> None:
+        bot, sent = _make_bot()
+        await bot.advance(MovementInput(forward=1.0))
+        self.assertEqual(_movements(bot, sent), 1)
+        self.assertEqual(bot._ticks_completed, 1)
+
+    async def test_without_a_driver_advance_leaves_the_held_input_alone(self) -> None:
+        bot, _sent = _make_bot()
+        before = bot.input
+        await bot.advance()
+        self.assertIs(bot.input, before)
+
+    async def test_with_a_driver_advance_holds_the_controls(self) -> None:
+        bot, sent = _make_bot()
+        held = MovementInput(strafe=1.0)
+        bot.input = held
+        async with bot.driving():
+            await bot.advance(MovementInput(forward=1.0), ticks=2)
+            pump = _movements(bot, sent)
+            self.assertGreaterEqual(pump, 2)
+        # The caller's own call must not have added ticks of its own.
+        self.assertLessEqual(_movements(bot, sent) - pump, 1)
+        # ... and the controls handed over for those ticks are handed back: the
+        # pump keeps ticking while the caller plans, and a control left behind
+        # would walk the bot the whole time.
+        self.assertIs(bot.input, held)
+
+    async def test_navigation_release_drops_the_controls(self) -> None:
+        # A walker parks its controls on ``input`` so the pump keeps walking
+        # between waypoints; handing the bot back must clear them, or a driven
+        # bot walks into the next scenario on its own.
+        bot, _sent = _make_bot()
+        bot.input = MovementInput(forward=1.0, sprint=True)
+        bot._navigation_claimed = True
+        bot._release_navigation_input()
+        self.assertFalse(bot._navigation_claimed)
+        self.assertEqual(bot.input.forward, 0.0)
+        self.assertFalse(bot.input.sprint)
+

@@ -37,7 +37,6 @@ from typing import Any, Awaitable, Callable
 
 from protobot import connect
 from protobot.actions import ActionStatus, BlockFace
-from protobot.constants import IDLE_TICK_SECONDS
 from protobot.containers import Menu, MenuNotOpen
 from protobot.crafting import recipe_for
 from protobot.goals import CraftGoal, GoalStatus, TravelGoal
@@ -404,6 +403,11 @@ class Suite:
             self.log_offset = os.path.getsize(server_log) if server_log else 0
         except OSError:
             self.log_offset = 0
+        # Reading the bridge's log instead of the server's is not a fallback, it
+        # is blindness: ``/log`` only carries the lines the plugin captured at
+        # startup, so a run against it reports "no alerts" no matter what the
+        # console says.  Say so out loud instead of printing a clean verdict.
+        self.alert_blind = not (server_log and os.path.exists(server_log))
         # The alert window restarts for every scenario; 0 means "not marked yet,
         # fall back to the suite start".
         self.alert_offset = 0
@@ -1073,34 +1077,17 @@ class Suite:
     async def keep_ticking(self) -> None:
         """Tick like a vanilla client, even while the test code is not.
 
-        A real client sends one movement packet per tick no matter what else it
-        is doing.  This suite blocks on its own HTTP calls (setblock, command,
-        inventory reads), and a pause looks like dropped ticks to the server and
-        to a movement-prediction check: the next claim then disagrees with the
-        prediction by most of a step.  Filling the gaps keeps the record
-        continuous, which is what the scenarios are supposed to be testing.
+        The suite used to fill its own gaps with this loop, waiting for a 75 ms
+        idle threshold before sending a tick.  That is a worse client than the
+        library now runs: :meth:`protobot.Bot.driving` sends every slot on the
+        absolute 20 Hz grid and yields only to the action layer, which owns its
+        tick on purpose.  The method is kept as a thin alias so an old checkout
+        of an external script still imports, and it is no longer started here.
         """
 
-        while not self.bot.closed.is_set():
-            await asyncio.sleep(0.02)
-            if self.ticks_paused:
-                # A vanilla client stops reporting movement while it sleeps, and
-                # a claim made from the old spot after the server has already
-                # laid the player in the bed reads as a spoofed movement.
-                continue
-            if time.monotonic() < getattr(self.bot, "_action_busy_until", 0.0):
-                # An action is between "end the previous tick" and "send this
-                # tick's movement packet"; a tick of ours in that window would
-                # put the action inside a tick that already got packet-ordered.
-                continue
-            try:
-                behind = time.monotonic() - (self.bot._last_tick_packet_time or 0.0)
-                if behind > IDLE_TICK_SECONDS:
-                    await self.bot.tick()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                pass
+        async with self.bot.driving():
+            while not self.bot.closed.is_set():
+                await asyncio.sleep(0.25)
 
     async def run_case(self, item: Case) -> bool:
         if self.bot.closed.is_set():
@@ -3028,7 +3015,18 @@ async def main_async(args: argparse.Namespace) -> int:
     bot.events.on("player_chat", suite.on_chat)
     bot.events.on("packet", suite.journal_packet)
     worker = asyncio.create_task(suite.worker())
-    idle = asyncio.create_task(suite.keep_ticking())
+    # One 20 Hz pump for the whole run: the scenarios then behave like a client
+    # that is playing the game, not like a script that occasionally pokes it.
+    # Anything the scenarios want to do between ticks (bridge HTTP calls, menu
+    # waits, sleeps) happens while the pump keeps the packet stream seamless.
+    await bot.start_driver()
+    if suite.alert_blind:
+        print(
+            "[suite] WARNING: no server log to read, so anti-cheat alerts cannot"
+            f" be detected ({args.server_log!r}).  Pass --server-log pointing at"
+            " Test26.3Server\\logs\\latest.log.",
+            flush=True,
+        )
 
     try:
         await asyncio.sleep(1.0)
@@ -3081,6 +3079,13 @@ async def main_async(args: argparse.Namespace) -> int:
             print(f"[suite] {len(wanted) - failures}/{len(wanted)} passed"
                   f" in {total:.1f}s", flush=True)
             alerts = suite.anti_cheat_lines()
+            if suite.alert_blind:
+                print(
+                    "[suite] anti-cheat check: UNKNOWN -- no server log was read,"
+                    " so this run cannot prove anything about alerts",
+                    flush=True,
+                )
+                return 1 if failures else 3
             if alerts:
                 print(f"[suite] anti-cheat alerts: {len(alerts)}", flush=True)
                 for line in alerts[:10]:
@@ -3093,7 +3098,7 @@ async def main_async(args: argparse.Namespace) -> int:
             await asyncio.sleep(0.5)
     finally:
         worker.cancel()
-        idle.cancel()
+        await bot.stop_driver()
         try:
             await bot.close()
         except Exception:
@@ -3118,8 +3123,12 @@ def main() -> int:
     parser.add_argument("--world", default="world")
     parser.add_argument(
         "--server-log",
-        default=None,
-        help="console log to scan for anti-cheat alerts (default: the bridge's copy)",
+        default=os.path.join("..", "Test26.3Server", "logs", "latest.log"),
+        help=(
+            "console log to scan for anti-cheat alerts; defaults to the test"
+            " server next to this checkout.  A run without a readable log reports"
+            " the alert check as UNKNOWN instead of clean"
+        ),
     )
     parser.add_argument("--x", type=int, default=0)
     parser.add_argument("--y", type=int, default=-60)

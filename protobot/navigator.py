@@ -114,7 +114,7 @@ class NavigatorMixin:
             )
         finally:
             self._navigation_planning = False
-            self._navigation_claimed = False
+            self._release_navigation_input()
 
     async def walk_to(
         self,
@@ -268,7 +268,7 @@ class NavigatorMixin:
             if force_started:
                 self._force_flight_active = False
                 self._set_physics_flying(self._force_flight_previous)
-            self._navigation_claimed = False
+            self._release_navigation_input()
             raise
         attempt = 0
         pending_plan: asyncio.Task[NavigationPath] | None = None
@@ -452,7 +452,7 @@ class NavigatorMixin:
             await self._stop_flying_after_navigation(
                 keep_flying, force_flight=force_flight
             )
-            self._navigation_claimed = False
+            self._release_navigation_input()
 
     def plan_path(
         self,
@@ -567,6 +567,18 @@ class NavigatorMixin:
         finally:
             self._navigation_active = False
 
+    def _release_navigation_input(self) -> None:
+        """Hand the bot back to its caller with no controls held.
+
+        Navigation keeps its controls on :attr:`input` while a driver is running,
+        so the pump keeps walking between waypoints.  Dropping the claim without
+        clearing the input would leave the bot walking into whatever comes next,
+        which is the exact failure the driver was meant to remove.
+        """
+
+        self.input = MovementInput()
+        self._navigation_claimed = False
+
     async def _execute_path_unlocked(
         self,
         path: NavigationPath,
@@ -577,36 +589,54 @@ class NavigatorMixin:
     ) -> bool:
         loop = asyncio.get_running_loop()
         for waypoint in path:
+            target = waypoint.position
+            jumping = waypoint.operation == "jump"
+
+            def steer(
+                target=target, jumping=jumping
+            ) -> None:
+                """Aim the tick that is about to be sent, from where it starts.
+
+                This is where a vanilla client turns: the heading is set just
+                before the movement packet goes out, so the rotation and the step
+                describe the same instant.  Running it per tick is also what makes
+                one input hold work for the whole walking loop.
+                """
+
+                current = self.physics_state
+                ahead_x = target.x - current.position.x
+                ahead_z = target.z - current.position.z
+                ahead = math.hypot(ahead_x, ahead_z)
+                if ahead > tolerance:
+                    current.yaw = math.degrees(math.atan2(-ahead_x, ahead_z))
+                self.input = MovementInput(
+                    forward=1.0 if ahead > tolerance else 0.0,
+                    jump=jumping and current.position.y < target.y - 0.05,
+                    sprint=sprint,
+                )
+
+            self.set_steer(steer)
             best_distance = math.inf
             stagnant_ticks = 0
             while True:
                 state = self.physics_state
-                dx = waypoint.position.x - state.position.x
-                dz = waypoint.position.z - state.position.z
+                dx = target.x - state.position.x
+                dz = target.z - state.position.z
                 horizontal = math.hypot(dx, dz)
-                vertical = abs(waypoint.position.y - state.position.y)
+                vertical = abs(target.y - state.position.y)
                 if horizontal <= tolerance and vertical <= 0.55:
                     break
                 if loop.time() >= deadline:
+                    self.clear_steer()
+                    self.input = MovementInput()
                     return False
 
-                if horizontal > tolerance:
-                    # Only set the heading here; ``tick`` carries it in the same
-                    # movement packet as the step (one packet per tick, like a
-                    # vanilla client).
-                    state.yaw = math.degrees(math.atan2(-dx, dz))
-                jump = (
-                    waypoint.operation == "jump"
-                    and state.position.y < waypoint.position.y - 0.05
-                )
-                await self.tick(
-                    MovementInput(
-                        forward=1.0 if horizontal > tolerance else 0.0,
-                        jump=jump,
-                        sprint=sprint,
-                    ),
-                    _navigation_tick=True,
-                )
+                if not self.driving_active:
+                    # Nobody else is going to run the callback, so aim by hand.
+                    steer()
+                # Hand the input over explicitly: with a driver the pump ticks
+                # from ``input``, and without one this tick must still walk.
+                await self.advance(self.input)
 
                 distance = horizontal + vertical
                 if distance < best_distance - 0.02:
@@ -615,8 +645,12 @@ class NavigatorMixin:
                 else:
                     stagnant_ticks += 1
                 if stagnant_ticks >= 20:
+                    self.clear_steer()
+                    self.input = MovementInput()
                     return False
                 await asyncio.sleep(tick_interval if tick_interval else 0)
+        self.clear_steer()
+        self.input = MovementInput()
         return True
 
     def plan_flight_path(

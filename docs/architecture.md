@@ -151,6 +151,44 @@ as `driver_error`. `bot.close()` stops the driver before closing the socket.
 `wait_ticks(n)` is the small primitive that makes the driver usable from test
 code: "let the world run n ticks, then continue".
 
+### One call style: `advance()`
+
+Everything that walks, waits or falls calls `await bot.advance(...)` instead of
+`await bot.tick(...)`:
+
+```python
+await bot.advance()                                  # let one tick happen
+await bot.advance(MovementInput(forward=1.0), ticks=10)   # hold this for ten ticks
+```
+
+With a driver running it waits for the pump and holds `controls` for exactly the
+ticks it waits for, then puts the previous input back. The restore is what keeps a
+slow caller honest: while it plans a path the pump keeps ticking at 20 Hz, and an
+input left behind would walk the bot that whole time. Without a driver the same
+call is `tick()` repeated, so library users who run their own loop see no change.
+
+The wait is bounded on purpose: if the pump stops claiming slots the call raises
+instead of hanging until the caller's own timeout, because an infinite await reads
+like a slow server and hides the real bug.
+
+`tick()` is still the right call in one place: the action layer, where a click,
+dig or place owns the tick between its own packet and the movement packet of the
+same tick. Those windows set `_action_busy_until`, and the driver yields them.
+
+### Steering: `set_steer()`
+
+A walker cannot aim between ticks when the pump sends every slot: nudging
+`bot.input` from outside races the pump. Navigation installs a callback instead:
+
+```python
+bot.set_steer(lambda: aim_from_here())   # runs immediately before each driven tick
+```
+
+The callback runs right before the tick is sent, which is exactly where a vanilla
+client turns -- the rotation rides in that tick's movement packet. Navigation sets
+one per waypoint and clears it on every exit; `bot.input` is cleared at the same
+time so a finished path leaves nothing held down.
+
 ## The layers above
 
 ```

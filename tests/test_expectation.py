@@ -21,6 +21,9 @@ class _FakeBot:
     async def tick(self) -> None:
         self.ticks += 1
 
+    async def advance(self) -> None:
+        self.ticks += 1
+
 
 class WaitEndingTests(unittest.IsolatedAsyncioTestCase):
     async def test_check_true_ends_done(self) -> None:

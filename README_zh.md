@@ -489,6 +489,19 @@ await bot.close()
 `bot.driving()` 与显式 `await bot.tick()` 混用不会重复发移动包；驱动里某 tick 抛异常
 会记在 `bot.driver_error` 上并触发 `driver_error` 事件，而不是悄悄停掉循环。
 
+会走、会等、会掉落的代码一律调 `await bot.advance(...)`：它在驱动下等泵跑够 tick，
+并且只在这几 tick 里持有你给的控制位，结束后把之前的输入放回去——所以规划路径时
+机器人不会一直朝旧方向走：
+
+```python
+await bot.advance(MovementInput(forward=1.0), ticks=10)   # 走十 tick
+await bot.advance()                                       # 就让一 tick 过去
+```
+
+走路的人用 `bot.set_steer(...)` 瞄准，而不是在两次 tick 之间戳 `bot.input`：回调在
+每个被驱动的 tick 发包前一刻执行，那正是原版客户端转视角的位置，所以旋转和这一步
+落在同一个移动包里。
+
 ### 等世界，而不是等 sleep
 
 动作和目标层问的是同一个问题——「现在成真了吗」——回答是一个状态，不是异常：

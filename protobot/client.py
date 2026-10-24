@@ -319,6 +319,11 @@ class Bot(
         # holds down every tick; a caller that awaits something slow sets it and
         # lets the pump keep the stream at 20 Hz instead of freezing the client.
         self.input = MovementInput()
+        # A per-tick steering callback: the driver calls it immediately before it
+        # sends a tick, so whoever owns the walk can aim from the position the
+        # tick will actually start at.  Navigation installs one; without it the
+        # driver just holds ``input`` as it is.
+        self._steer: Callable[[], None] | None = None
         self._driver_task: asyncio.Task[None] | None = None
         self._driver_error: BaseException | None = None
         # Monotonic time of the last completed tick, and how many have run: the

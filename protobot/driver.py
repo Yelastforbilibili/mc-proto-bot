@@ -27,12 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 from .constants import TICK_SECONDS
 from .movement import _now, _sleep
-from .physics import PhysicsState
+from .physics import MovementInput, PhysicsState
 from .protocol.connection import ConnectionState
 
 __all__ = ["DriverMixin"]
@@ -133,8 +133,80 @@ class DriverMixin:
                     f"waited {timeout:.3f}s for {count} ticks,"
                     f" only {self._ticks_completed - (target - count)} ran"
                 )
+            if not self.driving_active or self._driver_error is not None:
+                # Nothing can deliver the tick, so waiting is not a slow server
+                # but a stopped pump: say which, instead of hanging the caller
+                # for as long as its own timeout allows.
+                raise RuntimeError(
+                    "the tick driver stopped before the expected ticks arrived"
+                    f" ({self.driver_error!r})"
+                )
             await asyncio.sleep(WAIT_POLL_SECONDS)
         return self.physics_state
+
+    def set_steer(self, steer: Callable[[], None] | None) -> None:
+        """Aim the next tick from wherever it is about to start.
+
+        The driver holds one input for every slot, so the walker cannot nudge the
+        heading between ticks without racing it.  This callback runs immediately
+        before the driver sends a tick, which is exactly where a vanilla client
+        turns: the rotation rides in that tick's movement packet.
+        """
+
+        self._steer = steer
+
+    def clear_steer(self) -> None:
+        """Stop steering; the driver holds :attr:`input` unchanged."""
+
+        self._steer = None
+
+    async def advance(
+        self, controls: MovementInput | None = None, *, ticks: int = 1
+    ) -> PhysicsState:
+        """Advance the world by ``ticks`` ticks, whoever is sending them.
+
+        This is the one call that expresses "let the game move": with a driver
+        running it holds ``controls`` on :attr:`input` for the ticks it waits for
+        and then puts the previous controls back, so a walk, a fall or a knockback
+        arc is measured in ticks instead of in wall-clock sleeps.  Without a
+        driver it is exactly ``await self.tick(controls)``, repeated, so callers
+        that manage their own loop keep working unchanged.
+
+        Restoring the input is what keeps a slow caller honest: the pump keeps
+        ticking at 20 Hz while the caller plans a path or waits for a chunk, and a
+        control left behind would walk the bot that whole time.
+
+        ``controls=None`` leaves the held input alone (and, without a driver,
+        ticks with no input as before).  Anything that owns the wire for a tick --
+        the action layer's click/dig/place windows -- keeps calling :meth:`tick`
+        directly, because the driver yields those slots to it on purpose.
+        """
+
+        if self.driving_active:
+            previous = self.input
+            if controls is not None:
+                self.input = controls
+            try:
+                if ticks > 0:
+                    # Bounded on purpose: a pump that is alive but never claims a
+                    # slot (an action window left open, a stuck driver loop) must
+                    # surface as an error here instead of hanging the caller until
+                    # its own timeout, which would look like a server problem.
+                    await self.wait_ticks(
+                        ticks, timeout=max(1.0, ticks * TICK_SECONDS * 40)
+                    )
+            finally:
+                self.input = previous
+            return self.physics_state
+        state = self.physics_state
+        for _ in range(max(1, ticks)):
+            # A tick taken while navigation owns the body still has to advance the
+            # physics: without this flag _tick_once sees the navigation claim and
+            # returns early, which would spin the loop without moving at all.
+            state = await self.tick(
+                controls, _navigation_tick=bool(self._navigation_claimed)
+            )
+        return state
 
     async def _drive(self) -> None:
         """The pump itself: one tick per grid slot, unless someone beat us to it."""
@@ -148,7 +220,14 @@ class DriverMixin:
                     # them a whole slot and look again.
                     await _sleep(TICK_SECONDS)
                     continue
-                await self.tick(self.input)
+                steer = self._steer
+                if steer is not None:
+                    # Aim from the position this tick starts at, so the rotation
+                    # and the step describe the same instant.
+                    steer()
+                await self.tick(
+                    self.input, _navigation_tick=bool(self._navigation_claimed)
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - a dead pump must be visible

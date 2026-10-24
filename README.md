@@ -555,6 +555,19 @@ whenever the caller ticked itself, so mixing `bot.driving()` with explicit
 raises is recorded on `bot.driver_error` and fires the `driver_error` event
 instead of silently stopping the loop.
 
+Everything that walks or waits calls `await bot.advance(...)`; it waits for the
+pump and holds the controls for exactly the ticks it waits for, then puts the
+previous input back, so planning a path does not leave the bot walking:
+
+```python
+await bot.advance(MovementInput(forward=1.0), ticks=10)   # ten ticks of walking
+await bot.advance()                                       # just let one tick happen
+```
+
+A walker aims with `bot.set_steer(...)` instead of poking `bot.input` between
+ticks: the callback runs immediately before each driven tick, which is where a
+vanilla client turns, so the rotation rides in that tick's movement packet.
+
 ### Wait for the world, not for a sleep
 
 Actions and goals ask one question — "is it true yet?" — and answer with a

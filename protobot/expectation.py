@@ -143,6 +143,6 @@ async def wait_for_expectation(
         if before_tick is not None:
             await before_tick()
         if tick:
-            await bot.tick()
+            await bot.advance()
         else:
             await asyncio.sleep(max(0.0, poll))

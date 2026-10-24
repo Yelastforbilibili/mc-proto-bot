@@ -270,7 +270,7 @@ class PickupMixin:
             while time.monotonic() < poll_until:
                 if entity_id not in self.entities:
                     break
-                await self.tick()
+                await self.advance()
                 await asyncio.sleep(POLL_SECONDS)
             if entity_id in self.entities:
                 entity = self.entities[entity_id]
