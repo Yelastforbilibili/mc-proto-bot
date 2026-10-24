@@ -25,6 +25,7 @@ from collections.abc import Callable, Iterable, Mapping
 
 from .connection import ConnectionMixin
 from .driver import DriverMixin
+from .prediction import EntityPredictor
 from .events import EventBus
 from .modlist import ChannelSpec, Loader, ModListAdapter, make_adapter
 from .movement import MovementMixin
@@ -221,6 +222,9 @@ class Bot(
         if block_state_table is not None:
             self.world.block_states.load_table(block_state_table)
         self.events = EventBus()
+        # Dead reckoning for other entities: aim at where a target will
+        # be instead of where the last packet said it was.
+        self.prediction = EntityPredictor(self)
         self.ready = asyncio.Event()
         self.loaded = asyncio.Event()
         self.world_ready = asyncio.Event()

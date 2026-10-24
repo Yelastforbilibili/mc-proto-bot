@@ -171,6 +171,23 @@ class TickGridTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_movements(bot, sent), 0)
         self.assertAlmostEqual(bot._next_tick_at, TICK)
 
+    async def test_a_no_op_tick_gives_the_event_loop_a_turn(self) -> None:
+        bot, sent = _make_bot()
+        await bot.tick(MovementInput(forward=1.0))
+        sent.clear()
+        self.clock.sleeps.clear()
+
+        # Navigation owns the body, so this call cannot advance the physics or
+        # claim a slot.  It still has to come back to the loop, or a caller that
+        # simply loops on ``tick()`` would starve the navigation it waits for.
+        bot._navigation_claimed = True
+        bot._next_tick_at = self.clock.now + TICK
+        await bot.tick()
+
+        self.assertEqual(_movements(bot, sent), 0)
+        self.assertEqual(len(self.clock.sleeps), 1)
+        self.assertAlmostEqual(self.clock.sleeps[0], TICK)
+
 
 if __name__ == "__main__":
     unittest.main()

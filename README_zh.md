@@ -1071,3 +1071,18 @@ MIT，见 [LICENSE](LICENSE)。你可以自由使用、修改与再分发 ProtoB
 
 请把绿线理解为「包的形状和原版一致」，而不是「免疫被打」。库现在能做什么、
 怎么用，见 [docs/guide.md](docs/guide.md)。
+
+### 预测移动目标
+
+`bot.prediction` 为每个实体维护一条运动轨迹，回答「n tick 之后它在哪」
+（`position_at`、`center_at`、`arc`），并给出弓的弹道：`intercept()` 解出一组
+「打在目标将要去的位置」的发射角，同时返回 `confidence`。
+
+```python
+shot = bot.prediction.intercept(cow_id)
+if shot is not None and shot.confidence > 0.5:
+    await bot.actions.turn_to(shot.point)
+```
+
+模型就是原版的积分器，用真原版客户端的击退弧线校准过。视线最多 20 tick，
+因为 mob 自己的输入不在任何包里：这是带误差条的测量，不是预言。

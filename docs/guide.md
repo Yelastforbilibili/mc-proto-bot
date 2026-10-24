@@ -235,3 +235,47 @@ line as "unaffected by players fighting it".  Concretely measured:
 | how incoming packets update the model | `protobot/play/router.py` |
 | pathfinding | `protobot/navigator.py` |
 | collision shapes and clocks | `protobot/world.py` |
+
+## Predicting where an entity will be
+
+`bot.prediction` is dead reckoning for other entities, and the ballistics that
+turn it into an aim point:
+
+```python
+aim = bot.prediction.position_at(cow_id, 2)          # feet in two ticks
+centre = bot.prediction.center_at(cow_id, 2)         # middle of its box
+shot = bot.prediction.intercept(cow_id)              # solved arrow launch
+if shot is not None:
+    await bot.actions.turn_to(shot.point)            # or send shot.yaw/pitch
+    await bot.actions.use_item()                     # fire
+```
+
+The motion model is vanilla's integrator: move by the velocity, subtract
+gravity, then the horizontal friction of the block underfoot and the vertical
+drag. `MotionModel(hold_horizontal=False)` (exported as `PHYSICS_MOTION`)
+reproduces a real client's knockback arc exactly -- 0.4, 0.2184, 0.1987
+horizontally and 0.3608, 0.2752, 0.1913 vertically, measured on Paper 26.3 --
+which is how the model is checked. The default holds the horizontal velocity
+instead, because a mob that is walking keeps walking; that is the better guess
+for aiming but it is still a guess.
+
+What it cannot know, and does not pretend to:
+
+* **The entity's own input** -- a mob's pathfinding, a player's keys, a jump.
+  A target that starts turning only turns after the next update arrives.
+* **Sparse updates** -- most entity movement arrives as 2 Hz deltas for
+  interpolation, and a knockback or setback that has not arrived cannot be
+  predicted at all.
+* **Collisions** -- predicted positions ignore walls: a mob walking into one
+  keeps going in the model until the server corrects it.
+* **Vehicles** -- only the root entity is extrapolated, passengers move with
+  their vehicle.
+* **Latency and charge** -- what we hold is already `ping / 2` old, and arrow
+  speed depends on how far the bow was drawn; the caller passes the speed.
+
+So the lookahead is capped at `PREDICTION_HORIZON_TICKS` (20), every answer
+carries a `confidence` that decays with the lookahead and with how long ago the
+entity was last seen, and `intercept()` returns `None` rather than a fantasy
+when the target is out of range. For a bow this is the difference between
+"aim at where it is" (always misses a moving target) and "aim at where it will
+be, and know how sure that is".

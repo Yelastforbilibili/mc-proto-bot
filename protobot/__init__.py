@@ -70,6 +70,19 @@ from .navigation import (
     PathNode,
     PathWaypoint,
 )
+from .prediction import (
+    ARROW,
+    DEFAULT_MOTION,
+    PHYSICS_MOTION,
+    PREDICTION_HORIZON_TICKS,
+    Aim,
+    EntityPredictor,
+    Launch,
+    MotionModel,
+    PredictedState,
+    ProjectileModel,
+    solve_launch,
+)
 from .physics import (
     AABB,
     AIR,
@@ -116,6 +129,17 @@ from .state import (
 from .world import BlockStateDefinition, BlockStateRegistry, World
 
 __all__ = [
+    "ARROW",
+    "DEFAULT_MOTION",
+    "PHYSICS_MOTION",
+    "PREDICTION_HORIZON_TICKS",
+    "Aim",
+    "EntityPredictor",
+    "Launch",
+    "MotionModel",
+    "PredictedState",
+    "ProjectileModel",
+    "solve_launch",
     constants,
     get_log_level,
     log,

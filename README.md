@@ -1242,3 +1242,20 @@ follows does not always carry it.  Measured on Paper 26.3 with GrimAC v2.3.74:
 Read the green line as "the packets are shaped like a vanilla client's", not as
 "immune to being fought".  What the library does today, and how to use it, is
 in [docs/guide.md](docs/guide.md).
+
+### Predicting moving targets
+
+`bot.prediction` keeps a motion track per entity and answers where it will be in
+n ticks (`position_at`, `center_at`, `arc`), plus the ballistics for a bow:
+`intercept()` solves a launch that meets the target where it is going and
+returns a `confidence` with it.
+
+```python
+shot = bot.prediction.intercept(cow_id)
+if shot is not None and shot.confidence > 0.5:
+    await bot.actions.turn_to(shot.point)
+```
+
+The model is vanilla's integrator and is checked against a real client's
+knockback arc. The horizon is capped at 20 ticks because a mob's own input is
+in no packet: it is a measured guess with an honest error bar, not an oracle.
