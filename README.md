@@ -35,7 +35,7 @@ ProtoBot implements the vanilla protocol stack directly on asyncio TCP sockets �
 - **Plugin system & unified CLI** — plugins auto-discovered from `plugins/` with prerequisite declarations, dependency-ordered loading, exception isolation, and hot load/reload/close; `protobot login|run|plugins|setup` covers sign-in, connecting, and plugin management, with automatic reconnects.
 - **Diagnostic CLI** — live regression checks and movement traces against a local server.
 - **In-game acceptance suite** — `tools/live_suite.py` builds its own scenes on a real server and runs 33 numbered scenarios (dig, place, every container, the button-driven machines, the enchanting table, watching a bot, container invalidation, crafting, navigation, combat, tools, items with components, buckets, boats, minecarts, sleeping, breeding and three mixed end-to-end jobs) triggered from chat by any player typing a number; every check asks the server (`data get`) rather than the bot. The suite also reads the server log and fails a scenario that produced an anti-cheat alert. See [docs/acceptance-suite.md](docs/acceptance-suite.md) and [docs/anti-cheat.md](docs/anti-cheat.md).
-- **One command for the checks** — `.\tools\ci_local.ps1` runs byte-compilation, import hygiene and the unit suite (add `-Live` to append the 33 in-game scenarios) and prints a summary table with a non-zero exit code on failure; `.github/workflows/ci.yml` runs the same non-server gates on every push on Python 3.12 and 3.13.
+- **One command for the checks** — `.\tools\ci_local.ps1` runs byte-compilation, import hygiene and the unit suite (add `-Live` to append the 43 in-game scenarios) and prints a summary table with a non-zero exit code on failure; `.github/workflows/ci.yml` runs the same non-server gates on every push on Python 3.12 and 3.13.
 
 ## Installation
 
@@ -64,9 +64,12 @@ tests, and at least one scenario in the in-game suite proves the *server* did it
 | --- | --- | --- |
 | 26.3 end to end — handshake, login, configuration, play, chunks, entities, chat, transfers | Supported | `protobot/connection.py`, `protobot/play/router.py` |
 | 1.21.8 / 1.21.11 / 26.1 / 26.1.1 / 26.1.2 / 26.2 | Data tables (packet ids, items, blocks, menus, entities, breaking, components) plus unit tests; no end-to-end run | `protobot/protocol/versions.py` |
-| Physics — walking, sprinting, jumping, swimming, sneaking, boats, spectator flight | Supported | `protobot/physics/engine.py`, `protobot/movement.py` |
+| Physics — walking, sprinting, sneaking, boats, spectator flight | Supported | `protobot/physics/engine.py`, `protobot/movement.py` |
+| Physics — jumping and swimming | Implemented and unit-tested; **not yet proven on a live server**: the local arc is right, but a hand-ticked jump has not been seen to reach the server and water poured into a basin is not detected (case #38 is red) | `protobot/physics/engine.py` |
 | Navigation — A\* over decoded chunks, replanning, trips past the view distance | Supported | `protobot/navigator.py`, `protobot/goals/travel.py` |
-| Actions — dig, place, use item (bucket, boat, snowball), use item on (chest, rail, bed), attack, interact (feed, mount), swing, drop, pick up | Supported | `protobot/actions/`, `protobot/pickup.py` |
+| Actions — dig, place, use item on (chest, rail, bed), use item (bucket), attack, interact (feed), swing, drop | Supported | `protobot/actions/` |
+| Actions — placing a boat or a minecart from the item | Implemented; **not yet proven**: `use_item_on` on water returns `SENT` and no boat entity appears (case #39 is red) | `protobot/actions/` |
+| Picking a drop up | Implemented; **not yet proven**: the drop itself is accepted, then `pick_up` finds no item entity (case #40 is red) | `protobot/pickup.py` |
 | Containers — every menu type, click-level moves, progress data, machine verbs (`enchant`, `anvil`, `grindstone`, `smithing`, `stonecutter`) | Supported | `protobot/containers/` |
 | Crafting — explicit recipe descriptions, 2×2 and 3×3 | Supported | `protobot/crafting/recipes.py`, `containers/menu.py` |
 | Goals, tasks, long trips | Supported | `protobot/goals/`, `protobot/tasks/` |
@@ -76,7 +79,21 @@ tests, and at least one scenario in the in-game suite proves the *server* did it
 | Real collision shapes (beds 9/16, slabs, stairs, fences) instead of "every block is a cube" | Supported — 35,723 states / 393 boxes for 26.3 | `protobot/data/shapes-26.3.json.gz`, `tools/gen_block_shapes.py` |
 | Items carrying data components | Partial — decodes the components it ships tables for and refuses an ambiguous slot list instead of guessing | `protobot/protocol/stacks.py` |
 | Online mode (Mojang/Microsoft auth, signed chat) | Supported | `protobot/auth.py` |
-| Anti-cheat-shaped packet ordering (GrimAC as the referee) | 33 in-game scenarios, zero alerts | `docs/anti-cheat.md` |
+| Anti-cheat-shaped packet ordering (GrimAC as the referee) | 43 in-game scenarios; zero alerts **only while nothing else touches the bot** — see below | `docs/anti-cheat.md` |
+
+### What "passes anti-cheat" means here
+
+- The referee is **GrimAC v2.3.74 on Paper 26.3**, and every green line in this
+  README was measured with nobody interacting with the bot.
+- **It is not an immunity.** If a player keeps knocking the bot around while it
+  walks or performs an action, GrimAC can still flag `AntiKB`, `GroundSpoof`,
+  `Simulation` or `Post`: the library cannot put an impulse into a tick it has
+  already claimed (measured: roughly one alert per mixed scenario).
+- **Cheat emulation is off by default and stays a bypass attempt.** `vclip`,
+  `anti_kick` and the `no_fall` plugin all tell the server something that did not
+  happen. They are documented so you know they exist, not because a strict
+  server accepts them: any of them can be flagged or kicked for.
+- **Nothing is claimed about other anti-cheats.** Only GrimAC was used as judge.
 
 ### Not implemented yet
 
@@ -96,6 +113,13 @@ tests, and at least one scenario in the in-game suite proves the *server* did it
   tests, not a live run.
 - **A recipe database.** Recipes are declared by the caller (`Recipe`,
   `recipe_for`); there is no scraped recipe book.
+- **Jumping and swimming on a live server.** The local arc is right, but a
+  hand-ticked jump's vertical movement has not been seen by the server and
+  water poured into a basin is not detected (case #38 is red).
+- **Placing a boat.** `use_item_on` on water answers `SENT` and no boat entity
+  appears (case #39 is red); minecarts are unverified for the same reason.
+- **Picking a drop up.** The drop is accepted by the server, then `pick_up`
+  finds no item entity to walk to (case #40 is red).
 
 ## Quick start
 
@@ -103,20 +127,25 @@ The simplest way in is the `connect()` helper, which returns a spawned bot:
 
 ```python
 import asyncio
-from protobot import connect, MovementInput
+from protobot import MovementInput, connect
 
 async def main():
-    bot = await connect("127.0.0.1", username="MyBot", version="26.2")
+    bot = await connect("127.0.0.1", username="MyBot", version="26.3")
     print(f"logged in as {bot.username} at ({bot.player.x:.1f}, {bot.player.y:.1f}, {bot.player.z:.1f})")
 
-    # Run 40 forward ticks through the physics engine
-    for _ in range(40):
-        await bot.tick(MovementInput(forward=1.0))
-        await asyncio.sleep(0.05)
+    # The 20 Hz loop runs on its own: say what you want, then wait.
+    async with bot.driving():
+        bot.input = MovementInput(forward=1.0)
+        await asyncio.sleep(2.0)          # the body keeps walking while you wait
+        bot.input = MovementInput()
 
     await bot.close()
 
 asyncio.run(main())
+
+Manual `await bot.tick(...)` still exists, but it is for tests and step-by-step
+control: with the driver running the library owns the tick, and with a blocking
+`await` outside of it nothing moves.
 ```
 
 ### A tour of the whole library
@@ -125,7 +154,10 @@ asyncio.run(main())
 every layer in order and prints what the *server* answered at each step: read the
 data tables, walk with a goal, dig one block with an action, pick the drop up,
 put the block back, then do the same thing again as one `Task`. Start there; it
-is the shortest path from "it connects" to "it plays".
+is the shortest path from "it connects" to "it plays".  The snippets below
+all use the driver (`async with bot.driving(): bot.input = ...`), because that
+is what a real script does; manual `await bot.tick(...)` is for step-by-step
+tests.
 
 The shape of a real script, all the way up:
 
@@ -146,6 +178,11 @@ async def main():
     # 2. a window: open it, move items, let the server confirm every click
     chest = await bot.menu.open_block((12, -60, 4))
     await chest.deposit("minecraft:oak_log", count=8)
+
+    # 2b. keep walking while you do something else
+    async with bot.driving():
+        bot.input = MovementInput(forward=1.0)
+        await asyncio.sleep(1.0)
 
     # 3. intent: walk there, then break that block
     report = await bot.goals.run(
@@ -189,7 +226,7 @@ async def main():
     await bot.walk_to(10.5, 20.5, sprint=True)          # straight-line walk
     await bot.navigate_to(50.0, -30.0, sprint=True)     # A* route with replanning
     await bot.fly_to(50.0, 90.0, -30.0)                 # collision-aware 3D flight
-    await bot.fly_to(50.0, 10.0, -30.0, vclip=True)     # optional vertical clip
+    await bot.fly_to(50.0, 10.0, -30.0, vclip=True)     # vertical clip (cheat, off by default)
 
     await bot.close()
 
@@ -204,9 +241,9 @@ do not perform an abilities check or send an abilities packet.
 
 The optional `no_fall` plugin forces the on-ground bit to `false` on every
 outgoing player and vehicle movement packet. It only changes the wire flag;
-local physics continues to track real landings. It is enabled by default when
-discovered and can be toggled in `plugins/no_fall.json` or with the LLM tools
-`no_fall_status` and `no_fall_set`.
+local physics continues to track real landings. It is **off by default** — it is
+cheat emulation, the same category as `vclip` — and can be turned on in
+`plugins/no_fall.json` or with the LLM tools `no_fall_status` and `no_fall_set`.
 
 Flight navigation is path-quality-first by default. It plans the complete
 route on a worker thread before moving, scores turns, vertical changes, and
@@ -226,8 +263,9 @@ The client only has the chunks currently sent by the server. The live
 `get_status` tool reports the loaded chunk bounds and approximate radius;
 `view_distance` and server chunk-send/unload policy determine that radius.
 
-For servers or proxies that kick idle flying players, the anti-kick heartbeat
-is enabled by default and can be configured locally:
+For servers or proxies that kick idle flying players, the anti-kick heartbeat is
+**off by default** (it writes a Y coordinate the server did not see, so it is
+cheat emulation and may be flagged) and can be configured locally:
 
 ```yaml
 navigation:
@@ -248,7 +286,7 @@ disconnect component and logged as `[disconnect] server kick reason=...` along
 with a bounded `payload_hex=...` field. Unexpected socket/protocol failures are
 logged with their exception type and reason as well.
 
-VClip is enabled by default. Configure vertical clip distance locally in
+VClip is **off by default**. Configure vertical clip distance locally in
 `config.yaml` (in blocks); the limits apply separately to upward and downward
 vertical wall passage:
 
@@ -1234,14 +1272,16 @@ can still get it flagged (`AntiKB`, `GroundSpoof`, `Simulation`, occasionally
 `Post`): the impulse arrives while the action owns the tick, and the claim that
 follows does not always carry it.  Measured on Paper 26.3 with GrimAC v2.3.74:
 
-| Situation | Alerts over the 35 scenarios |
+| Situation | Alerts over the 43 scenarios |
 | --- | --- |
 | Full suite, nobody interfering | none |
 | Full suite while a player punches the bot | about one per mixed scenario (#23, #25, #30) |
 
 Read the green line as "the packets are shaped like a vanilla client's", not as
-"immune to being fought".  What the library does today, and how to use it, is
-in [docs/guide.md](docs/guide.md).
+"immune to being fought".  Three of the newer cases (#38 jumping and water,
+#39 placing a boat, #40 picking a drop up) are red today; they are listed under
+**Not implemented yet** above rather than counted as supported.  What the library
+does today, and how to use it, is in [docs/guide.md](docs/guide.md).
 
 ### Predicting moving targets
 

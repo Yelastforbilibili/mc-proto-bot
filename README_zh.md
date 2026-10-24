@@ -35,7 +35,7 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **插件系统与统一 CLI**——`plugins/` 目录自动发现插件，支持前置插件依赖、拓扑排序加载、异常隔离、热加载/热重载/热关闭；`protobot login|run|plugins|setup` 一个命令搞定授权、连服与插件管理，掉线自动重连。
 - **诊断 CLI**——针对本地服务器的在线回归检查与移动轨迹采集。
 - **游戏内验收套件**——`tools/live_suite.py` 在真服上自建场景，提供 33 个编号测试（挖掘、放置、全部容器、按键驱动的机器、附魔台、观看一个 bot、容器失效、合成、导航、战斗、工具、带组件物品、桶、船、矿车、睡觉、繁殖，以及三个混合端到端任务），任意玩家在聊天框发数字即可触发；每项判定都向服务端求证（`data get`），而不是看 bot 自己的模型。套件还会读服务端日志，任何一项触发了反作弊告警就算失败。见 [docs/acceptance-suite.md](docs/acceptance-suite.md) 与 [docs/anti-cheat.md](docs/anti-cheat.md)。
-- **一条命令跑完检查**——`.\tools\ci_local.ps1` 依次跑字节编译、import 卫生检查和单测（加 `-Live` 会再追加 33 项游戏内测试），结束时打印汇总表，任一环节失败就以非零退出码结束；`.github/workflows/ci.yml` 在每次 push 上跑同样的无服务器环节（Python 3.12 与 3.13）。
+- **一条命令跑完检查**——`.\tools\ci_local.ps1` 依次跑字节编译、import 卫生检查和单测（加 `-Live` 会再追加 43 项游戏内测试），结束时打印汇总表，任一环节失败就以非零退出码结束；`.github/workflows/ci.yml` 在每次 push 上跑同样的无服务器环节（Python 3.12 与 3.13）。
 
 ## 目前支持什么
 
@@ -45,9 +45,12 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 | --- | --- | --- |
 | 26.3 端到端——握手、登录、configuration、play、区块、实体、聊天、跨服转移 | 已支持 | `protobot/connection.py`、`protobot/play/router.py` |
 | 1.21.8 / 1.21.11 / 26.1 / 26.1.1 / 26.1.2 / 26.2 | 有全套数据表（包 id、物品、方块、菜单、实体、硬度、组件）与单测；没有真服端到端 | `protobot/protocol/versions.py` |
-| 物理——走、疾跑、跳、游泳、潜行、船、旁观飞行 | 已支持 | `protobot/physics/engine.py`、`protobot/movement.py` |
+| 物理——走、疾跑、潜行、船、旁观飞行 | 已支持 | `protobot/physics/engine.py`、`protobot/movement.py` |
+| 物理——跳与游泳 | 已实现并有单测，**但还没在真服上证明**：本地弧线是对的，手动逐 tick 的跳跃服务端还没被观察到跟着动，往围好的池子里灌水也没被识别为入水（用例 #38 是红的） | `protobot/physics/engine.py` |
 | 寻路——在已解码区块上做 A\*、自动重规划、走出视距继续走 | 已支持 | `protobot/navigator.py`、`protobot/goals/travel.py` |
-| 动作——挖掘、放置、用物品（桶、船、雪球）、对点物品（箱子、铁轨、床）、攻击、交互（喂食、上坐骑）、挥手、丢弃、拾取 | 已支持 | `protobot/actions/`、`protobot/pickup.py` |
+| 动作——挖掘、放置、对点物品（箱子、铁轨、床）、用物品（桶）、攻击、交互（喂食）、挥手、丢弃 | 已支持 | `protobot/actions/` |
+| 动作——从物品放置船 / 矿车 | 已实现，**但还没证明**：对水面 `use_item_on` 返回 `SENT`，服务端没有生成船（用例 #39 是红的） | `protobot/actions/` |
+| 拾取掉落物 | 已实现，**但还没证明**：丢弃本身被服务端接受，`pick_up` 却找不到掉落物实体（用例 #40 是红的） | `protobot/pickup.py` |
 | 容器——全部菜单类型、点击级搬运、进度数据、机器动词（`enchant`、`anvil`、`grindstone`、`smithing`、`stonecutter`） | 已支持 | `protobot/containers/` |
 | 合成——显式配方描述，2×2 与 3×3 | 已支持 | `protobot/crafting/recipes.py`、`containers/menu.py` |
 | Goal、Task、远距离行进 | 已支持 | `protobot/goals/`、`protobot/tasks/` |
@@ -57,7 +60,19 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 | 真实碰撞形状（床 9/16、台阶、楼梯、栅栏），而不是「所有方块都是立方体」 | 已支持——26.3 有 35,723 个状态 / 393 个盒体 | `protobot/data/shapes-26.3.json.gz`、`tools/gen_block_shapes.py` |
 | 带数据组件的物品 | 部分支持——有表的组件能解，含糊的整槽列表会诚实拒解而不是猜长度 | `protobot/protocol/stacks.py` |
 | 正版验证（Mojang/微软登录、签名聊天） | 已支持 | `protobot/auth.py` |
-| 符合原版包序、不触发反作弊（以 GrimAC 当裁判） | 33 项游戏内场景、零告警 | `docs/anti-cheat.md` |
+| 符合原版包序、不触发反作弊（以 GrimAC 当裁判） | 43 项游戏内场景；**只有在没人干扰 bot 时才是零告警**，见下 | `docs/anti-cheat.md` |
+
+### 「不触发反作弊」到底指什么
+
+- 裁判是 **Paper 26.3 上的 GrimAC v2.3.74**。本文里每一条绿线都是在**没有人干扰
+  bot** 的前提下测出来的。
+- **它不是免疫。** 如果有玩家在 bot 走路或执行动作的过程中持续击退它，GrimAC 仍可能
+  报 `AntiKB`、`GroundSpoof`、`Simulation`、`Post`：库没办法把击退塞进一个它已经声明
+  过的 tick（实测每个混合项约 1 条）。
+- **作弊模拟默认关闭，而且永远是绕过尝试。** `vclip`、`anti_kick` 和 `no_fall`
+  插件都在告诉服务端没发生过的事。写进文档是为了让你知道它们存在，不是表示严格服务器
+  会接受它们——任何一条都可能被判或被踢。
+- **不对其它反作弊作任何承诺。** 只把 GrimAC 当过裁判。
 
 ### 还没做的
 
@@ -68,6 +83,12 @@ ProtoBot 直接基于 asyncio TCP 套接字实现完整的原版协议栈——�
 - **死亡后自动重生。** 这是有意的：库把死亡与重生交给调用方或服务端插件（`plugins/respawn.py` 是示例）。
 - **第二个版本的端到端证明。** 1.21.8–26.2 只有数据表与单测，没有真服跑过。
 - **配方库。** 配方由调用方声明（`Recipe`、`recipe_for`），没有内置的配方大全。
+- **真服上的跳与游泳。** 本地弧线是对的，但手动逐 tick 的跳跃服务端还没被观察到
+  跟着动，灌进池子的水也没被识别为入水（用例 #38 是红的）。
+- **放置船。** 对水面 `use_item_on` 返回 `SENT`，服务端没有生成船（用例 #39 是红的）；
+  矿车同理，尚未验证。
+- **拾取掉落物。** 丢弃被服务端接受，但 `pick_up` 找不到可走过去的掉落物实体
+  （用例 #40 是红的）。
 
 ## 安装
 
@@ -93,25 +114,29 @@ uv sync --extra online --extra tui
 
 ```python
 import asyncio
-from protobot import connect, MovementInput
+from protobot import MovementInput, connect
 
 async def main():
-    bot = await connect("127.0.0.1", username="MyBot", version="26.2")
+    bot = await connect("127.0.0.1", username="MyBot", version="26.3")
     print(f"已登录 {bot.username}，位置 ({bot.player.x:.1f}, {bot.player.y:.1f}, {bot.player.z:.1f})")
 
-    # 通过物理引擎向前走 40 个 tick
-    for _ in range(40):
-        await bot.tick(MovementInput(forward=1.0))
-        await asyncio.sleep(0.05)
+    # 20 Hz 循环由库自己跑：你只需要说想做什么，然后等。
+    async with bot.driving():
+        bot.input = MovementInput(forward=1.0)
+        await asyncio.sleep(2.0)          # 你在等的这两秒里，身体一直在走
+        bot.input = MovementInput()
 
     await bot.close()
 
 asyncio.run(main())
+
+手动 `await bot.tick(...)` 仍然存在，但它只用于测试与逐 tick 控制：驱动跑起来的
+时候 tick 归库所有，而在驱动之外阻塞式 `await` 时身体是不动的。
 ```
 
 ### 库用法总览
 
-[`examples/tour.py`](examples/tour.py) 是一份可运行的脚本，按顺序走完每一层，并把**服务端**每一步的回答打出来：读数据表、用 Goal 走一段、用 Action 挖一格、把掉落物捡起来、再把方块放回去、最后用 Task 把同样的步骤再跑一遍。想从「能连上」走到「能干活」，先读它。
+[`examples/tour.py`](examples/tour.py) 是一份可运行的脚本，按顺序走完每一层，并把**服务端**每一步的回答打出来：读数据表、用 Goal 走一段、用 Action 挖一格、把掉落物捡起来、再把方块放回去、最后用 Task 把同样的步骤再跑一遍。想从「能连上」走到「能干活」，先读它。下面所有示例都用驱动写法（`async with bot.driving(): bot.input = ...; await asyncio.sleep(...)`），因为真实脚本就是这么写的；手动 `await bot.tick(...)` 只留给逐 tick 的测试。
 
 一份真实脚本从低层到高层的写法：
 
@@ -132,6 +157,11 @@ async def main():
     # 2. 一个窗口：打开、搬东西，每一次点击都由服务端的槽位更新确认
     chest = await bot.menu.open_block((12, -60, 4))
     await chest.deposit("minecraft:oak_log", count=8)
+
+    # 2b. 一边做别的事，一边继续走
+    async with bot.driving():
+        bot.input = MovementInput(forward=1.0)
+        await asyncio.sleep(1.0)
 
     # 3. 意图：先走过去，再挖掉那个方块
     report = await bot.goals.run(
@@ -184,9 +214,9 @@ asyncio.run(main())
 `bypass_permission` 仍可传入，但不会检查权限，也不会发送 abilities 包。
 
 可选的 `no_fall` 插件会把所有玩家和载具移动包的 on-ground 位强制改为
-`false`。它只修改线上包，本地物理仍记录真实落地状态。插件被发现时默认开启，
-可编辑 `plugins/no_fall.json`，也可以使用 LLM 工具 `no_fall_status` 和
-`no_fall_set` 切换。
+`false`。它只修改线上包，本地物理仍记录真实落地状态。它**默认关闭**——和 `vclip`
+一样属于作弊模拟——可以在 `plugins/no_fall.json` 里打开，也可以用 LLM 工具
+`no_fall_status` 和 `no_fall_set` 切换。
 
 飞行寻路默认以路径质量优先：先在工作线程计算完整路线，再开始移动。路线成本除
 几何距离外还会考虑转弯、升降和 VClip，并把无遮挡的飞行段压缩为连续操作。
@@ -220,7 +250,7 @@ Packet 模式会按 Meteor 的逻辑，在周期到达时只把移动包里的 Y
 `[disconnect] server kick reason=... payload_hex=...`。网络或协议异常也会记录异常类型
 和具体原因。
 
-飞行寻路默认开启 VClip。上下穿墙距离仍由本地配置限制（单位为方块）：
+VClip **默认关闭**（`connect(..., vclip=True)` 或 `navigation.vclip: true` 才打开，属于作弊模拟）。上下穿墙距离仍由本地配置限制（单位为方块）：
 
 ```yaml
 navigation:
@@ -232,7 +262,7 @@ navigation:
 也可以只对某次调用开启：
 
 ```python
-await bot.fly_to(50.0, 10.0, -30.0, vclip=True)
+await bot.fly_to(50.0, 10.0, -30.0, vclip=True)  # 竖直穿墙（作弊模拟，默认关闭）
 ```
 
 VClip 只放宽连续竖直段，横向穿墙仍然禁止；上下限制分别统计一次连续穿墙的距离。
@@ -1044,7 +1074,7 @@ git push origin main --tags
 ## 注意事项与限制
 
 - **可调参数只有一处。** 库自己选的容差——tick 节奏、旋转阈值、按住余量、破块冷却、触及与瞄准偏移、容器轮询间隔——全部在 [`protobot/constants.py`](protobot/constants.py)。原版常数留在镜像它们的那段代码旁边（`physics/engine.py`、`protocol/breaking.py`），因为把它们搬离抄录来源只会让物理更难核对。`tests/test_defaults.py` 钉住发包时序依赖的那几个值。
-- **作弊模拟默认关闭。** `connect(..., vclip=True)` 会让寻路穿过实体方块，`connect(..., anti_kick=True)` 会往周期性移动包里写入合成坐标。两者默认都是 `False`：它们等于告诉服务端没发生过的事，只适合自有服务器。
+- **作弊模拟默认关闭。** `connect(..., vclip=True)` 会让寻路穿过实体方块，`connect(..., anti_kick=True)` 会往周期性移动包里写入合成坐标，`no_fall` 插件会把 on-ground 位改成假的。三者默认都是关闭：它们等于告诉服务端没发生过的事，只适合自有服务器，而且**不保证不被反作弊抓住**。
 - **日志分级。** `protobot.log` 是 print 风格且默认安静（只输出 `info`/`warn`/`error`）。`PROTOBOT_LOG=debug`（或 `protobot.set_log_level("debug")`）打开库内部诊断；`PROTOBOT_TRACE_SEND` / `PROTOBOT_TRACE_RECV` / `PROTOBOT_TRACE_POS` 三个变量把包与移动轨迹打在同一条通道上。
 - **正版与离线模式。** 离线模式保持零第三方依赖。若需连接开启 `online-mode=true` 的正版服务器，请安装 `protobot[online]`（引入 `cryptography`）。
 - **在线账号支持安全聊天。** ProtoBot 会获取账号的临时玩家证书、注册新的聊天会话、签署 `send_message()` 消息、维护 last-seen 确认窗口，并在连接期间刷新证书。离线模式仍使用无签名兼容路径；`send_command()` 继续使用普通命令包。
@@ -1064,13 +1094,14 @@ MIT，见 [LICENSE](LICENSE)。你可以自由使用、修改与再分发 ProtoB
 `Simulation`，偶尔 `Post`）：击退落在动作占用的那个 tick 里，紧随的移动包并不
 总能把它带上。在 Paper 26.3 + GrimAC v2.3.74 上实测：
 
-| 场景 | 35 项中的告警数 |
+| 场景 | 43 项中的告警数 |
 | --- | --- |
 | 全量套件，无人干扰 | 0 |
 | 全量套件，期间玩家持续击退 bot | 每个混合项约 1 条（#23、#25、#30） |
 
-请把绿线理解为「包的形状和原版一致」，而不是「免疫被打」。库现在能做什么、
-怎么用，见 [docs/guide.md](docs/guide.md)。
+请把绿线理解为「包的形状和原版一致」，而不是「免疫被打」。新增的三项
+（#38 跳与入水、#39 放船、#40 捡掉落物）目前是红的，已列在上面的「还没做的」里，
+没有算进「已支持」。库现在能做什么、怎么用，见 [docs/guide.md](docs/guide.md)。
 
 ### 预测移动目标
 

@@ -3,6 +3,11 @@
 This plugin changes only the wire flag. The local physics predictor continues
 to track its real landing and fall-distance state, so enabling the plugin does
 not create a movement loop or send extra packets.
+
+It is **off by default**: the flag it writes is a claim the server can check, so
+this is cheat emulation in the same category as ``vclip`` and ``anti_kick``.
+Turn it on in ``plugins/no_fall.json`` (or with the ``no_fall_set`` tool) when
+you are testing on a server you control.
 """
 
 from __future__ import annotations
@@ -12,7 +17,7 @@ import asyncio
 from protobot import Plugin, PluginSettings, log
 
 DEFAULT_SETTINGS: dict = {
-    "enabled": True,
+    "enabled": False,
 }
 
 RELOAD_INTERVAL = 5.0
@@ -93,7 +98,7 @@ class NoFall(Plugin):
         bot = self.bot
         if bot is None:
             return
-        enabled = bool(self._settings.get("enabled", True))
+        enabled = bool(self._settings.get("enabled", False))
         bot.set_no_fall(enabled)
         log.debug(f"[no_fall] outgoing on_ground flag {'forced false' if enabled else 'restored'}")
 
