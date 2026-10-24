@@ -168,3 +168,34 @@ swing, which is what the event reports.
   23 therefore summon ordinary cows and chase them, which is also why they land
   11 hits for 10 health -- one of them fell inside the attack cooldown and dealt
   no damage, exactly as it would for a player.
+
+## Knockback reference: the same arc on a real client and on the bot
+
+A standing, unsprinted punch is the cleanest measurement in the game: the server
+sends one impulse (`SetEntityMotion [-0.4, 0.3608, 0]` for the axis it hits) and
+everything after that is pure physics. `artifacts/kb_vanilla.py` puts the same
+attacker next to the human client, punches once, reads the server's `/trace`
+samples (which are the victim's own move packets), then repeats the blow on a bot
+from the identical geometry.
+
+Both victims produced, tick for tick, the same twelve moves:
+
+```
+#  1: dz 0.4000  dy  0.3608      #  7: dz 0.1363  dy -0.1279
+#  2: dz 0.2184  dy  0.2752      #  8: dz 0.1240  dy -0.2037
+#  3: dz 0.1987  dy  0.1913      #  9: dz 0.1129  dy -0.2781
+#  4: dz 0.1809  dy  0.1091      # 10: dz 0.1027  dy -0.3046
+#  5: dz 0.1646  dy  0.0285      # 11: dz 0.0935  dy  0.0000
+#  6: dz 0.1498  dy -0.0505      # 12: dz 0.0789  dy  0.0000
+```
+
+- **1.96 blocks** of horizontal travel, **9 airborne moves**, roughly half a
+  second of air time. The first step is ground friction (`0.4 * 0.546`), the rest
+  is air drag (`* 0.91`), and the vertical column is `0.98` drag minus gravity.
+- The numbers agreeing to four decimals is the point: the bot's arc is not "close
+  to" the real client's, it is the same sequence, because both are the same
+  physics on the same impulse.
+- How to read a wrong arc: a first step of `0.4` followed by `0.4` again means we
+  claimed the impulse twice; a jump straight to `0.2184` means the impulse was
+  applied a tick late (which is what the anti-cheat's `AntiKB` offset measures);
+  a step of `0.0` in the middle means a teleport correction interrupted the arc.

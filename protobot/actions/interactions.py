@@ -21,7 +21,7 @@ import asyncio
 import math
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable
 
 from ..constants import (
     BLOCK_INTERACTION_RANGE,
@@ -36,6 +36,7 @@ from ..constants import (
 )
 from ..expectation import ExpectationStatus, Outcome, wait_for_expectation
 from ..physics import Vec3
+from .policy import DEFAULT_POLICY, ActionPolicy
 from ..protocol.codec import PacketWriter
 from ..protocol.entities import DEFAULT_HEIGHT, DEFAULT_WIDTH
 from ..protocol.tools import best_tool
@@ -138,6 +139,74 @@ class Actions:
         #: Why the last wait ended -- ``DONE``, ``TIMEOUT``, ``INVALIDATED`` or
         #: ``FAILED`` -- so a caller can report the reason instead of guessing.
         self.last_outcome: Outcome | None = None
+        #: What to do when a knockback lands between aiming and acting.  Assign
+        #: another :class:`~protobot.actions.policy.ActionPolicy` (or
+        #: ``NEVER_RETRY``) to change the behaviour for every action at once.
+        self.policy: ActionPolicy = DEFAULT_POLICY
+        #: How many attempts the last aiming action took.
+        self.attempts: int = 0
+        #: Whether the last aiming action had to be repeated because the player
+        #: was knocked back mid-flight.
+        self.retried_after_knockback: bool = False
+
+    # ------------------------------------------------------------------
+    # knockback-tolerant aiming
+    # ------------------------------------------------------------------
+    def _motion_epoch(self) -> int:
+        """How many times the server has pushed this player, per the client."""
+
+        return getattr(self.client, "_motion_epoch", 0)
+
+    async def _attempt_with_retry(
+        self,
+        attempt: Callable[[], Awaitable[ActionResult | None]],
+        *,
+        policy: ActionPolicy,
+        name: str,
+    ) -> ActionResult | None:
+        """Run ``attempt`` and re-aim if a knockback made the aim stale.
+
+        A knockback is not a rejection: the same click would have landed a tick
+        earlier, so the honest response is to aim again.  Anything the *server*
+        refused is returned as it is -- re-sending a rejected packet would only
+        teach the caller to ignore the answer.
+        """
+
+        started = time.monotonic()
+        attempts = 0
+        retried = False
+        result: ActionResult | None = None
+        while True:
+            attempts += 1
+            epoch = self._motion_epoch()
+            result = await attempt()
+            if result is None or result.ok:
+                break
+            if attempts >= policy.attempts:
+                break
+            if time.monotonic() - started >= policy.max_seconds:
+                break
+            if self._motion_epoch() == epoch:
+                # Nothing moved us, so a second try would repeat the same
+                # answer: leave the decision to the caller.
+                break
+            retried = True
+            # Let the arc start before aiming again, otherwise the next aim
+            # leads a player that is still sliding.
+            await asyncio.sleep(policy.settle)
+        self.attempts = attempts
+        self.retried_after_knockback = retried
+        if retried and result is not None:
+            result = replace(
+                result,
+                extra={
+                    **dict(result.extra),
+                    "attempts": attempts,
+                    "knocked_back": True,
+                    "policy": name,
+                },
+            )
+        return result
 
     # ------------------------------------------------------------------
     # plumbing
@@ -379,28 +448,45 @@ class Actions:
         return await self.look_at(center)
 
     async def attack_looked_at(
-        self, *, max_distance: float = ENTITY_ATTACK_RANGE, swing: bool = True
+        self,
+        *,
+        max_distance: float = ENTITY_ATTACK_RANGE,
+        swing: bool = True,
+        policy: ActionPolicy | None = None,
     ) -> ActionResult | None:
         """Aim at the entity under the crosshair and hit it.
 
         Returns ``None`` when the crosshair is not on an entity, so a caller
         can tell "nothing there" from "not sent".
+
+        Aiming and hitting are two ticks apart, which is exactly the window a
+        knockback fits into: the target is no longer where the crosshair was
+        when the packet arrives.  ``policy`` decides whether that is retried
+        (:class:`~protobot.actions.policy.ActionPolicy`, default one retry).
         """
 
-        hit = self.raycast_entity(max_distance=max_distance)
-        if hit is None:
-            return None
-        await self.look_at(hit.center)
-        # Turning can move the crosshair off the target (or onto another one),
-        # and a hit whose ray does not touch the hitbox is exactly what Grim's
-        # Hitboxes check flags.  Only hit what the crosshair covers right now.
-        again = self.raycast_entity(max_distance=max_distance)
-        if again is None:
-            return None
-        result = await self.attack(again.entity_id, swing=swing)
-        return replace(
-            result,
-            evidence=f"hit entity {again.entity_id} at {again.distance:.2f} blocks",
+        async def attempt() -> ActionResult | None:
+            hit = self.raycast_entity(max_distance=max_distance)
+            if hit is None:
+                return None
+            await self.look_at(hit.center)
+            # Turning can move the crosshair off the target (or onto another
+            # one), and a hit whose ray does not touch the hitbox is exactly
+            # what Grim's Hitboxes check flags.  Only hit what the crosshair
+            # covers right now.
+            again = self.raycast_entity(max_distance=max_distance)
+            if again is None:
+                return None
+            result = await self.attack(again.entity_id, swing=swing)
+            return replace(
+                result,
+                evidence=(
+                    f"hit entity {again.entity_id} at {again.distance:.2f} blocks"
+                ),
+            )
+
+        return await self._attempt_with_retry(
+            attempt, policy=policy or self.policy, name="attack"
         )
 
     async def _settle(
@@ -849,6 +935,42 @@ class Actions:
         await_confirm: bool = True,
         confirm_timeout: float = CONFIRM_TIMEOUT_SECONDS,
         send_stop: bool = True,
+        policy: ActionPolicy | None = None,
+    ) -> ActionResult:
+        """Break ``position``, re-aiming if a knockback spoiled the attempt.
+
+        The work happens in :meth:`_dig_once`; this wrapper only decides whether
+        a break that was pushed off target gets a second try
+        (:class:`~protobot.actions.policy.ActionPolicy`, one retry by default).
+        A break the *server* refused is returned unchanged.
+        """
+
+        return await self._attempt_with_retry(
+            lambda: self._dig_once(
+                position,
+                face=face,
+                aim=aim,
+                tick=tick,
+                hold=hold,
+                await_confirm=await_confirm,
+                confirm_timeout=confirm_timeout,
+                send_stop=send_stop,
+            ),
+            policy=policy or self.policy,
+            name="dig",
+        )
+
+    async def _dig_once(
+        self,
+        position: tuple[int, int, int],
+        *,
+        face: BlockFace | None = None,
+        aim: bool = True,
+        tick: bool = True,
+        hold: float | None = None,
+        await_confirm: bool = True,
+        confirm_timeout: float = CONFIRM_TIMEOUT_SECONDS,
+        send_stop: bool = True,
     ) -> ActionResult:
         """Break the block at ``position``, the way a held mouse button does.
 
@@ -1168,6 +1290,40 @@ class Actions:
         return None
 
     async def place_block(
+        self,
+        position: tuple[int, int, int],
+        *,
+        face: BlockFace = BlockFace.UP,
+        hand: str | int = "main_hand",
+        aim: bool = True,
+        tick: bool = True,
+        await_confirm: bool = True,
+        confirm_timeout: float = CONFIRM_TIMEOUT_SECONDS,
+        policy: ActionPolicy | None = None,
+    ) -> ActionResult:
+        """Place into ``position``, re-clicking if a knockback spoiled the aim.
+
+        The placement itself is :meth:`_place_block_once`; this wrapper adds the
+        knockback tolerance (:class:`~protobot.actions.policy.ActionPolicy`),
+        because a placement needs the clicked face to stay inside reach and in
+        view for the whole tick, and a shove moves both.
+        """
+
+        return await self._attempt_with_retry(
+            lambda: self._place_block_once(
+                position,
+                face=face,
+                hand=hand,
+                aim=aim,
+                tick=tick,
+                await_confirm=await_confirm,
+                confirm_timeout=confirm_timeout,
+            ),
+            policy=policy or self.policy,
+            name="place_block",
+        )
+
+    async def _place_block_once(
         self,
         position: tuple[int, int, int],
         *,

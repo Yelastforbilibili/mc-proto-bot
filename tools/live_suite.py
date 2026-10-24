@@ -416,6 +416,10 @@ class Suite:
         self.stop_requested = False
         # One row per scenario that ran: case, passed, seconds, detail.
         self.results: list[tuple[Case, bool, float, str]] = []
+        # Alerts are windowed per scenario (`mark_log` resets the offset), so the
+        # closing verdict has to keep what each scenario saw; reading the log once
+        # at the end would only see the last window and quietly report "none".
+        self.alert_reports: list[tuple[int, list[str]]] = []
         # Set while the bot is asleep: vanilla clients send no movement then.
         self.ticks_paused = False
         self.own_uuid = getattr(bot, "uuid", None)
@@ -1115,6 +1119,9 @@ class Suite:
             outcome, detail = "FAIL", f"{type(error).__name__}: {error}"
             print(traceback.format_exc(), flush=True)
         elapsed = time.monotonic() - started
+        seen = self.anti_cheat_lines()
+        if seen:
+            self.alert_reports.append((item.number, seen))
         if outcome == "PASS":
             await self.say(f"[#{item.number}] ✓ {item.title} ({elapsed:.1f}s)")
         elif outcome == "STOP":
@@ -3078,7 +3085,7 @@ async def main_async(args: argparse.Namespace) -> int:
             total = sum(row[2] for row in suite.results)
             print(f"[suite] {len(wanted) - failures}/{len(wanted)} passed"
                   f" in {total:.1f}s", flush=True)
-            alerts = suite.anti_cheat_lines()
+            alerts = [line for _, lines in suite.alert_reports for line in lines]
             if suite.alert_blind:
                 print(
                     "[suite] anti-cheat check: UNKNOWN -- no server log was read,"
@@ -3087,12 +3094,16 @@ async def main_async(args: argparse.Namespace) -> int:
                 )
                 return 1 if failures else 3
             if alerts:
-                print(f"[suite] anti-cheat alerts: {len(alerts)}", flush=True)
+                cases = ", ".join(f"#{number}" for number, _ in suite.alert_reports)
+                print(
+                    f"[suite] anti-cheat alerts: {len(alerts)} in {cases}",
+                    flush=True,
+                )
                 for line in alerts[:10]:
                     print(f"    {line.strip()}", flush=True)
             else:
                 print("[suite] no anti-cheat alerts", flush=True)
-            return 0 if failures == 0 else 1
+            return 0 if (failures == 0 and not alerts) else 1
         print("[suite] ready: type a number in game chat", flush=True)
         while not bot.closed.is_set():
             await asyncio.sleep(0.5)
