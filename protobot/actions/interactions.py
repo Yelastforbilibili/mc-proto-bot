@@ -447,12 +447,48 @@ class Actions:
             )
         return await self.look_at(center)
 
+    async def lock_on(
+        self,
+        entity_id: int,
+        *,
+        max_distance: float = ENTITY_ATTACK_RANGE,
+        ticks: int = 2,
+        tick: bool = True,
+    ) -> bool:
+        """Keep the crosshair on an entity for a few ticks.
+
+        Returns whether the lock survived.  ``False`` means the entity is gone
+        or left ``max_distance`` -- the only two reasons a vanilla client stops
+        tracking a target.
+
+        Every tick re-aims at the box centre the client can see *right now*.
+        No leading and no guessing: a target that walks is followed tick by
+        tick, and because :meth:`turn_to` rides the rotation inside the
+        movement packet, the server sees the aim and the step as one unit.
+        Aiming twice at the same angle sends nothing, so holding the lock on a
+        target that is not moving costs no packets.
+        """
+
+        for _ in range(max(1, ticks)):
+            centre = self.entity_center(entity_id)
+            if centre is None:
+                return False
+            eye = self.eye_position()
+            if math.dist(
+                (eye.x, eye.y, eye.z), (centre.x, centre.y, centre.z)
+            ) > max_distance:
+                return False
+            await self.turn_to(centre, tick=tick)
+        return True
+
     async def attack_looked_at(
         self,
         *,
         max_distance: float = ENTITY_ATTACK_RANGE,
         swing: bool = True,
         policy: ActionPolicy | None = None,
+        lock: bool = False,
+        lock_ticks: int = 2,
     ) -> ActionResult | None:
         """Aim at the entity under the crosshair and hit it.
 
@@ -463,12 +499,40 @@ class Actions:
         knockback fits into: the target is no longer where the crosshair was
         when the packet arrives.  ``policy`` decides whether that is retried
         (:class:`~protobot.actions.policy.ActionPolicy`, default one retry).
+
+        ``lock`` keeps the crosshair on that same entity after the swing, for
+        ``lock_ticks`` ticks or until it leaves ``max_distance``.  The swing
+        then goes to the entity that was aimed at rather than to whatever the
+        crosshair happens to cover next, which is the difference between "hit
+        the cow" and "hit the cow if it stood still".
         """
 
         async def attempt() -> ActionResult | None:
             hit = self.raycast_entity(max_distance=max_distance)
             if hit is None:
                 return None
+            if lock:
+                entity_id = hit.entity_id
+                centre = self.entity_center(entity_id)
+                if centre is None:
+                    return None
+                await self.turn_to(centre)
+                result = await self.attack(entity_id, swing=swing)
+                evidence = f"hit entity {entity_id} at {hit.distance:.2f} blocks"
+                held = await self.lock_on(
+                    entity_id, max_distance=max_distance, ticks=lock_ticks
+                )
+                if not held:
+                    evidence += ", then it left reach"
+                return replace(
+                    result,
+                    evidence=evidence,
+                    extra={
+                        **dict(result.extra),
+                        "locked": held,
+                        "lock_ticks": max(1, lock_ticks),
+                    },
+                )
             await self.look_at(hit.center)
             # Turning can move the crosshair off the target (or onto another
             # one), and a hit whose ray does not touch the hitbox is exactly

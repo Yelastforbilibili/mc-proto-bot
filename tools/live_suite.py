@@ -1004,7 +1004,13 @@ class Suite:
             # Hit through the crosshair, not through the entity table: a hit
             # whose ray misses the box is what Grim's Hitboxes check flags, and
             # that is exactly what a player cannot do either.
-            result = await self.bot.actions.attack_looked_at(max_distance=3.0)
+            # Lock on: the cow is walking, and an aim that is a tick stale
+            # misses the hitbox the server ray-tests (Grim reports Hitboxes).
+            # Locking re-aims every tick and keeps the swing on the entity
+            # that was aimed at.
+            result = await self.bot.actions.attack_looked_at(
+                max_distance=3.0, lock=True, lock_ticks=2
+            )
             if result is None or result.entity_id != entity_id:
                 await self.settle(0.1)
                 continue
@@ -2841,7 +2847,7 @@ async def _swing_at(s: Suite, opponent, name: str = OPPONENT) -> float:
         f"{name} 的准星没有落在我们身上：hit={hit} 距离={distance:.2f} "
         f"我们本地位置=({entity.x:.2f}, {entity.y:.2f}, {entity.z:.2f})"
     )
-    result = await opponent.actions.attack_looked_at()
+    result = await opponent.actions.attack_looked_at(lock=True, lock_ticks=2)
     assert result.status is ActionStatus.SENT, f"攻击没有发出去：{result.evidence}"
     return distance
 

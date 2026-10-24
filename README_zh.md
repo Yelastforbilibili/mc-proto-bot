@@ -1086,3 +1086,9 @@ if shot is not None and shot.confidence > 0.5:
 
 模型就是原版的积分器，用真原版客户端的击退弧线校准过。视线最多 20 tick，
 因为 mob 自己的输入不在任何包里：这是带误差条的测量，不是预言。
+
+### 锁定目标
+
+`bot.actions.attack_looked_at(lock=True)` 先看向实体、对**同一个**实体出手，
+并在它留在触及范围内时继续把准星压在它身上 —— 每 tick 重新瞄准，不做提前量。
+`lock_on(entity_id, ticks=2)` 就是这段跟踪循环本身。

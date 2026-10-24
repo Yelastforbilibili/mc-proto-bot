@@ -1259,3 +1259,10 @@ if shot is not None and shot.confidence > 0.5:
 The model is vanilla's integrator and is checked against a real client's
 knockback arc. The horizon is capped at 20 ticks because a mob's own input is
 in no packet: it is a measured guess with an honest error bar, not an oracle.
+
+### Holding the aim on a target
+
+`bot.actions.attack_looked_at(lock=True)` looks at the entity, swings at that
+same entity, and keeps the crosshair on it while it stays within reach --
+re-aiming each tick, never leading. `lock_on(entity_id, ticks=2)` is the same
+tracking loop on its own.

@@ -639,3 +639,46 @@ class FaceChoiceTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class LockOnTests(unittest.IsolatedAsyncioTestCase):
+    def _bot_with_zombie(self, *, distance: float = 2.0) -> _FakeBot:
+        bot = _FakeBot(get_version("26.3"))
+        bot.entities[154] = EntityState(
+            entity_id=154, type_id=154, x=0.5, y=64.0, z=0.5 + distance
+        )
+        return bot
+
+    async def test_lock_on_aims_once_per_tick(self) -> None:
+        bot = self._bot_with_zombie()
+        self.assertTrue(await Actions(bot).lock_on(154, ticks=2))
+        self.assertEqual(bot.ticks, 2)
+
+    async def test_lock_on_gives_up_when_the_target_is_out_of_reach(self) -> None:
+        bot = self._bot_with_zombie(distance=4.0)
+        self.assertFalse(await Actions(bot).lock_on(154, max_distance=3.0, ticks=3))
+        self.assertEqual(bot.ticks, 0)
+
+    async def test_lock_on_gives_up_when_the_entity_is_gone(self) -> None:
+        bot = self._bot_with_zombie()
+        actions = Actions(bot)
+        del bot.entities[154]
+        self.assertFalse(await actions.lock_on(154, ticks=3))
+        self.assertEqual(bot.ticks, 0)
+
+    async def test_attack_with_lock_reports_that_it_held(self) -> None:
+        bot = self._bot_with_zombie()
+        result = await Actions(bot).attack_looked_at(lock=True, lock_ticks=2)
+        assert result is not None
+        self.assertEqual(result.entity_id, 154)
+        self.assertIn("hit entity 154", result.evidence)
+        self.assertTrue(result.extra["locked"])
+        self.assertEqual(result.extra["lock_ticks"], 2)
+        # one tick for the swing, two more for the lock
+        self.assertEqual(bot.ticks, 3)
+
+    async def test_attack_without_lock_does_not_keep_aiming(self) -> None:
+        bot = self._bot_with_zombie()
+        result = await Actions(bot).attack_looked_at()
+        assert result is not None
+        self.assertNotIn("locked", result.extra)
+        self.assertEqual(bot.ticks, 1)

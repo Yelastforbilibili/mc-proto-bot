@@ -279,3 +279,28 @@ entity was last seen, and `intercept()` returns `None` rather than a fantasy
 when the target is out of range. For a bow this is the difference between
 "aim at where it is" (always misses a moving target) and "aim at where it will
 be, and know how sure that is".
+
+### Keep the crosshair on the target: `lock`
+
+`attack_looked_at(lock=True)` aims at the entity, swings at *that* entity, and
+then keeps tracking it for `lock_ticks` ticks:
+
+```python
+result = await bot.actions.attack_looked_at(lock=True, lock_ticks=2)
+if result is not None and not result.extra["locked"]:
+    ...                      # it left the 3 block reach, the swing still went out
+```
+
+The rule is the one a player follows without thinking: while the target is
+within reach, look at it; stop when it is gone or out of reach, or when the
+call ends. Every tick re-aims at the box centre the client can see right now --
+no leading, no prediction. Because `turn_to()` rides the rotation inside the
+movement packet, the aim and the step reach the server as one unit, and aiming
+at the same angle twice sends nothing.
+
+`lock_on(entity_id, ticks=...)` is the same loop on its own, and returns
+`False` when the target vanished or is beyond `max_distance`.
+
+This is what fixes the "the aim was right a tick ago" class of misses: a
+walking cow is re-aimed at every tick of the swing, instead of being clicked
+with a rotation measured when the crosshair was first put on it.
