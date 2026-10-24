@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import faulthandler
 import contextlib
 import json
 import math
@@ -3150,6 +3151,12 @@ def main() -> int:
         default="",
         help="run these cases without chat (comma separated, or 'all') and exit",
     )
+    if os.environ.get("SUITE_WATCHDOG"):
+        # A case that hangs prints every thread's stack, so the freeze can be
+        # located instead of guessed.
+        faulthandler.dump_traceback_later(
+            float(os.environ["SUITE_WATCHDOG"]), repeat=True
+        )
     args = parser.parse_args()
     if args.list:
         for line in menu_lines():

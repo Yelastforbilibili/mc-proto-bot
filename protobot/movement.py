@@ -88,7 +88,6 @@ class MovementMixin:
 
         async with self._tick_lock:
             state = self.physics_state
-            claimed = False
             for _ in range(self._ticks_due(send_input, send_position)):
                 scheduled = self._next_tick_at
                 state = await self._tick_once(
@@ -104,18 +103,6 @@ class MovementMixin:
                     # (navigation owns the body, or nothing was sent), so
                     # catching up would only spin.
                     break
-                claimed = True
-            if not claimed:
-                # A no-op tick owes the event loop a turn.  Without this an
-                # ordinary ``while True: await bot.tick()`` loop keeps the loop
-                # for itself -- ``asyncio.Lock`` is not a yield point when it is
-                # free -- and starves whatever owns the body (the navigation it
-                # is waiting for, the reader task, the driver).  Waiting for the
-                # slot is the honest amount: this tick had nothing to send.
-                if self._next_tick_at is None:
-                    await _sleep(TICK_SECONDS)
-                else:
-                    await self.wait_tick_budget()
             return state
 
     def _ticks_due(self, send_input: bool, send_position: bool) -> int:

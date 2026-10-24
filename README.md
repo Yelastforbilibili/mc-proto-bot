@@ -1224,3 +1224,21 @@ artifacts). Offline mode stays dependency-free in the wheel -- `[online]` and
 MIT. See [LICENSE](LICENSE). You can use, modify, and redistribute ProtoBot
 freely, including in closed-source and commercial projects, as long as the
 copyright and permission notices stay attached.
+
+
+## The honest scope of "zero alerts"
+
+The suite's green line means **no anti-cheat alert with nobody touching the
+bot**.  A player who keeps punching a bot in the middle of an action or a walk
+can still get it flagged (`AntiKB`, `GroundSpoof`, `Simulation`, occasionally
+`Post`): the impulse arrives while the action owns the tick, and the claim that
+follows does not always carry it.  Measured on Paper 26.3 with GrimAC v2.3.74:
+
+| Situation | Alerts over the 35 scenarios |
+| --- | --- |
+| Full suite, nobody interfering | none |
+| Full suite while a player punches the bot | about one per mixed scenario (#23, #25, #30) |
+
+Read the green line as "the packets are shaped like a vanilla client's", not as
+"immune to being fought".  What the library does today, and how to use it, is
+in [docs/guide.md](docs/guide.md).
