@@ -249,6 +249,27 @@ implementation (MovementSync 1.12 `PathMovement`) rather than tuned by feel:
 `NavigationTimeout` with the remaining distance, so a caller can tell "walked
 most of the way" from "did not move".
 
+### Jump edges are replayed, not assumed
+
+Geometry only proves the column above a step is empty. Whether the jump *lands*
+there depends on the integrator: jump strength, air drag, gravity, the sprint
+boost, and whether something above shortens the arc. So when a planner is given
+a physics engine, every edge it classifies as a jump is simulated from the start
+node with `MovementInput(forward=1.0, jump=True)` until the body comes down
+again, and the edge is accepted only if it lands on the target node (within 0.75
+blocks horizontally, 0.5 vertically). `Pathfinder(...).jump_replays` /
+`jump_rejects` expose the count for tests and probes.
+
+### A changed block makes the plan stale
+
+While a route is being walked, every `block_update` lands in a tiny notebook
+(`note_block_change`, bounded to 128 entries and 40 ticks). If a change falls
+near a waypoint the route has **not** reached yet -- one block around it in X/Z,
+from two below to three above in Y -- the executor stops, reports the route as
+stale, and `navigate_to()` plans again. That replan does not spend the retry
+budget (it is news, not failure), but it is capped at `MAX_EVENT_REPLANS = 3` so
+a server that keeps moving blocks cannot loop forever.
+
 ## 9. What it does not do (yet)
 
 - Only 26.3 is verified end to end; other releases have tables and tests, not

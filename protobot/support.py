@@ -246,6 +246,7 @@ def _find_ground_path(
     allow_diagonal: bool,
     max_nodes: int,
     match_target_y: bool,
+    physics=None,
 ) -> NavigationPath:
     planner = Pathfinder(
         world,
@@ -254,6 +255,7 @@ def _find_ground_path(
         step_height=step_height,
         max_drop=max_drop,
         allow_diagonal=allow_diagonal,
+        physics=physics,
     )
     return planner.find_path(
         start,

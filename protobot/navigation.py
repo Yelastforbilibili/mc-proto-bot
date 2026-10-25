@@ -8,8 +8,17 @@ import math
 from dataclasses import dataclass
 
 from .errors import ProtoBotError
+from .physics.engine import MovementInput, PhysicsEngine, PhysicsState
 from .physics.geometry import AABB, Vec3
 from .physics.world import CollisionWorld
+
+# A jump edge is not a geometric question: whether a jump lands where the grid
+# says depends on the integrator (jump strength, drag, gravity, the sprint boost).
+# Replaying it is what the reference implementation does, and it is why it does
+# not plan jumps through a ceiling it would bump into.
+JUMP_REPLAY_TICKS = 24
+JUMP_LANDING_RADIUS = 0.75
+JUMP_LANDING_HEIGHT = 0.5
 
 
 class PathNotFound(ProtoBotError):
@@ -130,6 +139,8 @@ class Pathfinder:
         max_jump_height: float = 1.25,
         max_drop: float = 3.0,
         allow_diagonal: bool = True,
+        physics: PhysicsEngine | None = None,
+        validate_jumps: bool = True,
     ) -> None:
         values = (player_width, player_height, step_height, max_jump_height, max_drop)
         if not all(math.isfinite(value) and value > 0.0 for value in values):
@@ -143,6 +154,11 @@ class Pathfinder:
         self.max_jump_height = max_jump_height
         self.max_drop = max_drop
         self.allow_diagonal = allow_diagonal
+        # Optional: when given, a jump edge is accepted only if replaying the
+        # real integrator from the start node still lands on the end node.
+        self.physics = physics if validate_jumps else None
+        self.jump_replays = 0
+        self.jump_rejects = 0
 
     def find_path(
         self,
@@ -376,7 +392,44 @@ class Pathfinder:
             )
             if not (x_first or z_first):
                 return False
+        if requires_jump and self.physics is not None:
+            return self._jump_lands(start, end)
         return True
+
+    def _jump_lands(self, start: Vec3, end: Vec3) -> bool:
+        """Replay a jump with the real integrator and see where it comes down.
+
+        Geometry says the column is free; it does not say the jump gets there.  A
+        jump under a low ceiling, or one that needs more horizontal speed than the
+        approach has, passes every box test and still lands short -- which is how
+        a route ends up walking into a wall and reporting "stuck".  Two dozen
+        ticks is enough for the arc a one-block jump needs.
+        """
+
+        self.jump_replays += 1
+        yaw = math.degrees(math.atan2(-(end.x - start.x), end.z - start.z))
+        state = PhysicsState(
+            position=Vec3(start.x, start.y, start.z),
+            yaw=yaw,
+            on_ground=True,
+            width=self.player_width,
+            height=self.player_height,
+        )
+        landed = state
+        for tick in range(JUMP_REPLAY_TICKS):
+            step = self.physics.step(
+                state, MovementInput(forward=1.0, jump=tick == 0), self.world
+            )
+            state = step.state
+            landed = state
+            if tick > 0 and state.on_ground:
+                break
+        offset = math.hypot(landed.position.x - end.x, landed.position.z - end.z)
+        height = abs(landed.position.y - end.y)
+        if offset <= JUMP_LANDING_RADIUS and height <= JUMP_LANDING_HEIGHT:
+            return True
+        self.jump_rejects += 1
+        return False
 
     def _horizontal_clear(
         self,

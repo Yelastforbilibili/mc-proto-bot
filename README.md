@@ -1321,3 +1321,11 @@ Also worth knowing: an explosion's player knockback is added to the velocity
 (`clientbound_explode`), a walk along a cardinal heading gets exact zeros
 instead of vanilla's 1.2e-16 residue, and `bot.actions.frame()` hands you the
 pose a click will be judged in.
+### Planning that checks itself
+
+Jump edges are no longer assumed from geometry: given a physics engine, the
+planner replays each jump with the real integrator and accepts the edge only if
+the body actually comes down on the target node (`jump_replays` / `jump_rejects`
+count it).  A route is also no longer blind to the world: a `block_update` near
+a waypoint it has not reached yet makes the plan stale, so `navigate_to()`
+replans instead of walking into a wall that was not there when it planned.

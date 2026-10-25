@@ -627,6 +627,9 @@ class PlayRouterMixin:
         state_id = reader.read_varint()
         reader.expect_end()
         self.world.set_state_id(x, y, z, state_id)
+        # A route that is being walked cares about news near its remaining
+        # waypoints; the notebook is bounded and short-lived (see note_block_change).
+        self.note_block_change(x, y, z)
         await self.events.emit("block_update", x, y, z, state_id)
 
     async def _handle_block_changed_ack(self, payload: bytes) -> None:

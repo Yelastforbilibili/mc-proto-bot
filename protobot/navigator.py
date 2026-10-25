@@ -41,6 +41,19 @@ SETTLE_TICKS = 8
 PROGRESS_DISTANCE_SQUARED = 0.0025
 PROGRESS_TICKS = 40
 
+# A route is not a promise about a frozen world: if a block that the remaining
+# waypoints stand on changes, the plan is stale before the bot walks into it.
+# The reference implementation watches the tail of the route (one block around
+# each node, from two below to three above) instead of replanning on a timer.
+REPLAN_BESIDE = 1
+REPLAN_ABOVE = 3
+REPLAN_BELOW = 2
+REPLAN_TTL_TICKS = 40
+REPLAN_MAX_CHANGES = 128
+# Event-driven replans are free: they are news, not failure.  Only the retry
+# budget (`replans`) is finite, and it stays finite on purpose.
+MAX_EVENT_REPLANS = 3
+
 
 def _horizontal_speed(state: PhysicsState) -> float:
     return math.hypot(state.velocity.x, state.velocity.z)
@@ -99,7 +112,9 @@ class NavigatorMixin:
 
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout
-            for attempt in range(replans + 1):
+            attempt = 0
+            event_replans = 0
+            while attempt <= replans:
                 remaining = deadline - loop.time()
                 if remaining <= 0.0:
                     break
@@ -119,7 +134,22 @@ class NavigatorMixin:
                 finally:
                     self._navigation_planning = False
                 await self.events.emit("path", path, attempt)
-                if await self._execute_path(path, deadline, tolerance, sprint, tick_interval):
+                self._replan_requested = False
+                arrived = await self._execute_path(
+                    path, deadline, tolerance, sprint, tick_interval
+                )
+                if self._replan_requested:
+                    # The world changed under the route.  That is not a failure
+                    # of the plan, so it does not spend the retry budget -- but
+                    # it is still capped, because a server that keeps changing
+                    # blocks must not turn into an infinite loop.
+                    self._replan_requested = False
+                    if event_replans < MAX_EVENT_REPLANS:
+                        event_replans += 1
+                        await self.events.emit("replan", event_replans)
+                        continue
+                attempt += 1
+                if arrived:
                     state = self.physics_state
                     horizontal = math.hypot(x - state.position.x, z - state.position.z)
                     vertical = abs(y - state.position.y) if y is not None else 0.0
@@ -499,6 +529,7 @@ class NavigatorMixin:
             step_height=self.physics._attribute(state, "step_height"),
             max_drop=max_drop,
             allow_diagonal=allow_diagonal,
+            physics=self.physics,
         )
         return planner.find_path(
             state.position,
@@ -555,6 +586,9 @@ class NavigatorMixin:
             allow_diagonal=allow_diagonal,
             max_nodes=max_nodes,
             match_target_y=y is not None,
+            # The worker thread gets its own copy: it replays jump edges and must
+            # not touch the engine the tick loop is using right now.
+            physics=copy.copy(self.physics),
         )
 
     def _navigation_world_snapshot(self, *, missing_chunks_solid: bool = True) -> World:
@@ -600,6 +634,41 @@ class NavigatorMixin:
         self.input = MovementInput()
         self._navigation_claimed = False
 
+    def note_block_change(self, x: int, y: int, z: int) -> None:
+        """Remember a block update so an active route can notice it.
+
+        The notebook is tiny and short-lived: a route only cares about changes
+        made while it is being walked, and only near the part it has left to
+        walk.  Keeping it bounded means a busy server cannot grow it.
+        """
+
+        tick = self._ticks_completed
+        cutoff = tick - REPLAN_TTL_TICKS
+        changes = [entry for entry in self._block_changes if entry[3] >= cutoff]
+        changes.append((x, y, z, tick))
+        self._block_changes = changes[-REPLAN_MAX_CHANGES:]
+        self._block_change_serial += 1
+
+    def _route_blocked(self, path: NavigationPath, index: int, *, since_tick: int) -> bool:
+        """Whether a block update sits on the part of the route still to walk."""
+
+        if not self._block_changes:
+            return False
+        nodes = [waypoint.position for waypoint in path.waypoints[index:]]
+        for x, y, z, tick in self._block_changes:
+            if tick < since_tick:
+                # Written before this route started walking: the plan already
+                # knows about it, so it is not news.
+                continue
+            for node in nodes:
+                if abs(x - math.floor(node.x)) <= REPLAN_BESIDE and abs(
+                    z - math.floor(node.z)
+                ) <= REPLAN_BESIDE:
+                    node_y = math.floor(node.y)
+                    if node_y - REPLAN_BELOW <= y <= node_y + REPLAN_ABOVE:
+                        return True
+        return False
+
     async def _execute_path_unlocked(
         self,
         path: NavigationPath,
@@ -643,6 +712,8 @@ class NavigatorMixin:
             progress_position = self.physics_state.position
             progress_ticks = 0
             settled_ticks = 0
+            route_started = self._ticks_completed
+            seen_serial = self._block_change_serial
             while True:
                 state = self.physics_state
                 dx = target.x - state.position.x
@@ -683,6 +754,18 @@ class NavigatorMixin:
                     self.clear_steer()
                     self.input = MovementInput()
                     return False
+                if self._block_change_serial != seen_serial:
+                    seen_serial = self._block_change_serial
+                    body = self.physics_state
+                    if (
+                        body.on_ground or body.in_water or body.on_climbable
+                    ) and self._route_blocked(path, index, since_tick=route_started):
+                        # The route is stale: something a remaining waypoint
+                        # depends on just changed.  Walking on would be the bug.
+                        self._replan_requested = True
+                        self.clear_steer()
+                        self.input = MovementInput()
+                        return False
                 await asyncio.sleep(tick_interval if tick_interval else 0)
         self.clear_steer()
         self.input = MovementInput()

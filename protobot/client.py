@@ -335,6 +335,12 @@ class Bot(
         # game ticks instead of wall-clock seconds.
         self._last_tick_at = 0.0
         self._ticks_completed = 0
+        # World-news notebook for the active route: a block update near the part
+        # of the plan still to walk makes that plan stale.  ``_replan_requested``
+        # is how the executor tells navigate_to "news, not failure".
+        self._block_changes: list[tuple[int, int, int, int]] = []
+        self._block_change_serial = 0
+        self._replan_requested = False
 
     @property
     def active_container(self) -> ContainerState | None:

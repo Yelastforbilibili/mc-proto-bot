@@ -1136,3 +1136,6 @@ if shot is not None and shot.confidence > 0.5:
 另外三件值得知道的事：爆炸的玩家击退是**叠加**进速度（`clientbound_explode`）；
 轴对齐行走用精确 0 而不是原版表里的 1.2e-16 残留；`bot.actions.frame()` 给出这一次点击
 将被服务端按哪个姿态来量。
+### 会自我检查的规划
+
+跳跃边不再只靠几何判断：给了物理引擎之后，规划器会用真实积分器把每一次跳跃重放一遍，只有身体真的落在目标节点上才承认这条边（`jump_replays` / `jump_rejects` 计数）。路线也不再对世界视而不见：**尚未走到的** waypoint 附近出现 `block_update` 就让计划过期，`navigate_to()` 会重新规划，而不是撞上规划时还不存在的墙。
