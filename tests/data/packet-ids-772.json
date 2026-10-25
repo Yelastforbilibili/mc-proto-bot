@@ -18,6 +18,7 @@
     "clientbound_damage_event": 25,
     "clientbound_disconnect": 28,
     "clientbound_entity_position_sync": 31,
+    "clientbound_explode": 32,
     "clientbound_game_event": 34,
     "clientbound_hurt_animation": 36,
     "clientbound_keep_alive": 38,

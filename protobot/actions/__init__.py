@@ -30,7 +30,7 @@ server jar, so a primitive branches on data rather than on a guess.
 """
 
 from .errors import ActionError, ActionTimeout, UnsupportedAction
-from .interactions import Actions
+from .interactions import Actions, PlacementFrame
 from .policy import DEFAULT_POLICY, NEVER_RETRY, ActionPolicy
 from .profiles import ActionCodes, InteractionProfile, profile_for
 from .raycast import (
@@ -58,6 +58,7 @@ __all__ = [
     "EntityHit",
     "InteractionProfile",
     "NEVER_RETRY",
+    "PlacementFrame",
     "UnsupportedAction",
     "entity_bounds",
     "look_angles",

@@ -81,6 +81,18 @@ actually visible from the eye and turn with a `position_and_rotation` packet
 (a separate look packet would let a click appear out of nowhere).  `dig`
 refuses a face you cannot see instead of firing a packet the server drops.
 
+`bot.actions.frame()` returns the `PlacementFrame` the next click will be judged
+in — position, eye height, yaw, pitch, and the eye point computed from them.  The
+server measures a click against the pose carried by the movement packet of the
+same tick, so anything that casts a ray first and clicks second should read the
+frame once and keep using it:
+
+```python
+frame = bot.actions.frame()
+hit = bot.actions.raycast()            # uses that same frame
+print(frame.describe())                # {"x": …, "eye_y": …, "yaw": …}
+```
+
 ### Retry policy (knockback-aware)
 
 ```python
@@ -178,6 +190,25 @@ keeps working; `StuckWatchdog` is available as a goal wrapper.
 - Entities, positions, swings, damage, time, health, experience — all decoded
   and emitted as events (`bot.events.on("entity_motion", …)`, `"time"`,
   `"swing_animation"`, …).
+- **A tick as a value.**  `bot.physics.step(state, controls, world)` runs one
+  tick without touching the state it was given and returns a `StepResult`
+  (next state + whether it collided).  `bot.physics.tick(...)` still writes in
+  place — that is the cheap path for the live bot — but anything that asks
+  "what would happen if" (a jump edge, a probe, a test) uses `step`.
+  `protobot.physics.Recorder` keeps a transcript of those steps and
+  `recorder.replay(engine, world)` re-runs it and reports the first frame that
+  disagrees, comparing both position and velocity:
+
+  ```python
+  from protobot.physics import PhysicsEngine, Recorder
+
+  recorder = Recorder()
+  state = bot.physics_state
+  for controls in [MovementInput(forward=1.0)] * 20:
+      state = recorder.record(bot.physics, state, controls, bot.world).state
+
+  print(recorder.replay(PhysicsEngine(), bot.world))   # [] means exact
+  ```
 
 ## 7. The anti-cheat rules the library follows
 
@@ -196,8 +227,29 @@ each was found by measuring a real client (see [anti-cheat.md](anti-cheat.md)):
    control back.
 7. **Pongs are flushed before anything that waits on a transaction** (teleport
    confirmations).
+8. **Cardinal headings aim with exact zeros.**  Vanilla's sine table samples
+   `pi` as `1.2246e-16`, not 0, so a walk straight along an axis gains a sideways
+   component every tick; `heading_sin_cos()` snaps quarter turns to exact zeros
+   the way the reference implementation does.
 
-## 8. What it does not do (yet)
+## 8. Navigation thresholds
+
+These are the numbers a walk finishes on, taken from a working reference
+implementation (MovementSync 1.12 `PathMovement`) rather than tuned by feel:
+
+| What | Value | Why |
+| --- | --- | --- |
+| Last waypoint radius | **0.3** blocks | the goal is judged tighter than the route |
+| Intermediate waypoint | **0.35** blocks | a corner does not need a stop |
+| Vertical arrival | **0.5** blocks | one step of slop |
+| Settled before finishing | **0.025** blocks/tick, max 8 ticks | a walker that drops its input on the boundary still slides |
+| Stuck | **< 0.05 blocks** of displacement for **40 ticks** | one fast tick is not progress |
+
+`navigate_to()` also keeps a `sprint=True` default and reports
+`NavigationTimeout` with the remaining distance, so a caller can tell "walked
+most of the way" from "did not move".
+
+## 9. What it does not do (yet)
 
 - Only 26.3 is verified end to end; other releases have tables and tests, not
   live proof.
@@ -208,7 +260,7 @@ each was found by measuring a real client (see [anti-cheat.md](anti-cheat.md)):
 - Recipe knowledge is a hand-written table (a dozen recipes), not the full
   recipe registry.
 
-## 9. The honest scope of "zero alerts"
+## 10. The honest scope of "zero alerts"
 
 The acceptance suite reports `no anti-cheat alerts` **when nothing interferes
 with the bot**.  When a player punches the bot in the middle of an action or a
@@ -222,7 +274,7 @@ line as "unaffected by players fighting it".  Concretely measured:
 | Full suite, nobody interfering | none |
 | Full suite while a player keeps punching the bot | ~1 per mixed case (#23, #25, #30 in the last run) |
 
-## 10. Where to start reading code
+## 11. Where to start reading code
 
 | You want to change… | Go to |
 | --- | --- |

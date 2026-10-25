@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Awaitable, Callable
 
 from ..constants import (
@@ -127,6 +127,40 @@ def _continuous_yaw(previous: float, yaw: float) -> float:
 _BLOCK_ACTIONS = frozenset(
     {"dig", "dig_start", "dig_stop", "dig_abort", "dig_change_direction"}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class PlacementFrame:
+    """Where the eyes were and where they pointed for one click.
+
+    The server judges a ``use_item_on`` against the pose carried by the movement
+    packet in the same tick.  Holding that pose in one value keeps the ray, the
+    rotation and the packet about the same instant instead of three adjacent ones.
+    """
+
+    position: Vec3
+    yaw: float
+    pitch: float
+    eye_height: float
+
+    @property
+    def eye(self) -> Vec3:
+        return Vec3(
+            self.position.x,
+            self.position.y + self.eye_height,
+            self.position.z,
+        )
+
+    def describe(self) -> dict[str, object]:
+        eye = self.eye
+        return {
+            "x": round(self.position.x, 4),
+            "y": round(self.position.y, 4),
+            "z": round(self.position.z, 4),
+            "eye_y": round(eye.y, 4),
+            "yaw": round(self.yaw, 3),
+            "pitch": round(self.pitch, 3),
+        }
 
 
 class Actions:
@@ -289,19 +323,32 @@ class Actions:
         await self.client.events.emit("action", result)
         return result
 
+    def frame(self) -> PlacementFrame:
+        """The exact pose the next click will be measured in.
+
+        A click is judged against the position and rotation of the movement packet
+        that carries it, so the ray a client casts has to describe *those*
+        numbers.  Reading them once, before the aim and the click, is how the two
+        stay in step -- a frame recomputed halfway through is how a click ends up
+        pointing at where the player was rather than where it says it is.
+        """
+
+        state = self.client.physics_state
+        return PlacementFrame(
+            position=state.position,
+            yaw=state.yaw,
+            pitch=state.pitch,
+            eye_height=state.eye_height,
+        )
+
     def eye_position(self) -> Vec3:
         """The player's eye, which is where every ray and every aim starts."""
 
-        state = self.client.physics_state
-        return Vec3(
-            state.position.x,
-            state.position.y + state.eye_height,
-            state.position.z,
-        )
+        return self.frame().eye
 
     def look_direction(self) -> Vec3:
-        state = self.client.physics_state
-        return direction_from_angles(state.yaw, state.pitch)
+        frame = self.frame()
+        return direction_from_angles(frame.yaw, frame.pitch)
 
     async def look_at(self, point: Vec3) -> tuple[float, float]:
         """Turn the player towards ``point`` and send the rotation."""

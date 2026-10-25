@@ -149,6 +149,10 @@ class PlayPacketIds:
     #: Sleeping and ``/time set`` both show up here, so a caller can wait for the
     #: jump instead of sleeping for a guessed number of seconds.
     clientbound_update_time: int = 0
+    #: Explosion effects.  The packet carries an optional *player* knockback
+    #: vector, which the server adds on top of the player's own velocity; without
+    #: it we only learn where the server moved us from the teleport that follows.
+    clientbound_explode: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -483,6 +487,7 @@ _PLAY_772 = PlayPacketIds(
     clientbound_set_health=0x61,
     clientbound_entity_position_sync=0x1F,
     clientbound_update_time=0x6A,  # 106: update_time, 1.21.8 reports
+    clientbound_explode=0x20,  # 32: explode, 1.21.8 reports
     clientbound_set_experience=0x60,
     clientbound_player_combat_kill=0x3D,
     clientbound_player_info_update=0x3F,
@@ -630,6 +635,7 @@ _PLAY_774 = PlayPacketIds(
     clientbound_set_health=0x66,
     clientbound_entity_position_sync=0x23,
     clientbound_update_time=0x6F,  # 111: update_time, 1.21.11 reports
+    clientbound_explode=0x24,  # 36: explode, 1.21.11 reports
     clientbound_set_experience=0x65,
     clientbound_player_combat_kill=0x42,
     clientbound_player_info_update=0x44,
@@ -642,6 +648,7 @@ _PLAY_775_776 = PlayPacketIds(
     clientbound_set_health=0x68,  # 104: Float health, VarInt food, Float saturation
     clientbound_entity_position_sync=0x23,
     clientbound_update_time=0x71,  # 113: update_time, 26.1/26.2 reports
+    clientbound_explode=0x24,  # 36: explode, 26.1/26.2 reports
     clientbound_set_experience=0x67,
     clientbound_player_combat_kill=0x44,  # 68: VarInt entity id + death message
     serverbound_client_command=0x0C,  # 12: one VarInt, 0 = perform respawn
@@ -759,6 +766,7 @@ _PLAY_777 = PlayPacketIds(
     clientbound_add_transient_block=0x25,
     clientbound_entity_position_sync=0x23,
     clientbound_update_time=0x73,  # 115: update_time, 26.3 reports
+    clientbound_explode=0x24,  # 36: explode, 26.3 reports
     clientbound_set_health=0x6A,
     clientbound_set_experience=0x69,
     clientbound_player_combat_kill=0x45,

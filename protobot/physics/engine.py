@@ -2,17 +2,18 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from dataclasses import dataclass, field
 
 from .geometry import AABB, Vec3, collide_with_boxes
 from .math import (
     f32,
+    heading_sin_cos,
     look_vector_components,
     look_y_from_pitch,
     minecraft_sin,
     modified_friction,
-    yaw_sin_cos,
 )
 from .world import BlockProperties, CollisionWorld, fluid_flow, fluid_height
 
@@ -182,6 +183,24 @@ class PhysicsState:
             return f32(1.27)
         return f32(1.62)
 
+    def copy(self) -> PhysicsState:
+        """A detached copy, for asking "what would happen" without side effects."""
+
+        clone = copy.copy(self)
+        clone.status_effects = {
+            name: copy.copy(effect) for name, effect in self.status_effects.items()
+        }
+        clone.attribute_values = dict(self.attribute_values)
+        return clone
+
+
+@dataclass(frozen=True, slots=True)
+class StepResult:
+    """One tick of physics as a value: where it ends up and what it hit."""
+
+    state: PhysicsState
+    collided: bool
+
 
 class PhysicsEngine:
     """Advance vanilla-like player state by one 20 Hz game tick.
@@ -194,6 +213,25 @@ class PhysicsEngine:
 
     def __init__(self, attributes: PhysicsAttributes | None = None) -> None:
         self.attributes = attributes or PhysicsAttributes()
+
+    def step(
+        self,
+        state: PhysicsState,
+        controls: MovementInput,
+        world: CollisionWorld,
+    ) -> StepResult:
+        """Advance one tick and return it as a value instead of editing ``state``.
+
+        The bot owns the live state and ``tick`` writes it in place, which is the
+        cheap thing to do 20 times a second.  A planner deciding whether a jump
+        lands, a probe replaying a recorded run, or a test pinning a knockback arc
+        wants the same arithmetic without disturbing that state -- so it asks here
+        and gets the answer back.
+        """
+
+        working = state.copy()
+        self.tick(working, controls, world)
+        return StepResult(state=working, collided=working.horizontal_collision)
 
     def tick(
         self,
@@ -897,7 +935,7 @@ class PhysicsEngine:
             state.velocity.z,
         )
         if state.sprinting:
-            sin_yaw, cos_yaw = yaw_sin_cos(state.yaw)
+            sin_yaw, cos_yaw = heading_sin_cos(state.yaw)
             state.velocity = state.velocity + Vec3(-sin_yaw * 0.2, 0.0, cos_yaw * 0.2)
 
     def _friction_influenced_speed(self, state: PhysicsState, friction: float) -> float:
@@ -959,7 +997,9 @@ class PhysicsEngine:
         if length < 1.0e-7:
             return Vec3()
         movement = (input_vector.normalized() if length > 1.0 else input_vector).scale(speed)
-        sin_yaw, cos_yaw = yaw_sin_cos(yaw)
+        # Cardinal yaws snap to exact zeros: a walk along an axis must not gain a
+        # 1e-16 sideways component every tick (see heading_sin_cos).
+        sin_yaw, cos_yaw = heading_sin_cos(yaw)
         return Vec3(
             movement.x * cos_yaw - movement.z * sin_yaw,
             movement.y,

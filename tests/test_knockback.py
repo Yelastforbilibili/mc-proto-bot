@@ -249,5 +249,107 @@ class MidTickImpulseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.physics_state.velocity.z, 0.0)
 
 
+def _explode(
+    centre: tuple[float, float, float],
+    *,
+    radius: float = 4.0,
+    blocks: int = 12,
+    knockback: tuple[float, float, float] | None = None,
+    trailing: bytes = b"",
+) -> bytes:
+    writer = (
+        PacketWriter()
+        .write_double(centre[0])
+        .write_double(centre[1])
+        .write_double(centre[2])
+        .write_float(radius)
+        .write_varint(blocks)
+    )
+    if knockback is None:
+        writer = writer.write_bool(False)
+    else:
+        writer = (
+            writer.write_bool(True)
+            .write_double(knockback[0])
+            .write_double(knockback[1])
+            .write_double(knockback[2])
+        )
+    if trailing:
+        writer = writer.write_bytes(trailing)
+    return writer.to_bytes()
+
+
+class ExplodePacketTests(unittest.IsolatedAsyncioTestCase):
+    """An explosion *adds* to the velocity, where the motion packet replaces it."""
+
+    def _prepare(self, *, knockback: bool = True):
+        bot, _ = _make_bot(knockback=knockback)
+        bot.session.entity_id = 7
+        bot.player.loaded = True
+        bot.physics_state.velocity = Vec3(0.1, 0.0, 0.05)
+        bot.player.velocity_x = 0.1
+        bot.player.velocity_z = 0.05
+        seen: list[tuple] = []
+        bot.events.on("explosion", lambda *args: seen.append(args))
+        return bot, seen
+
+    async def test_knockback_is_added_and_marks_the_tick_stale(self) -> None:
+        bot, seen = self._prepare()
+
+        await bot._handle_explode(
+            _explode((3.0, -60.0, 4.0), knockback=(0.2, 0.3, -0.4))
+        )
+
+        velocity = bot.physics_state.velocity
+        self.assertAlmostEqual(velocity.x, 0.3, places=6)
+        self.assertAlmostEqual(velocity.y, 0.3, places=6)
+        self.assertAlmostEqual(velocity.z, -0.35, places=6)
+        self.assertEqual(bot.player.velocity_x, velocity.x)
+        self.assertEqual(bot.player.velocity_z, velocity.z)
+        self.assertEqual(bot._motion_epoch, 1)
+        self.assertEqual(len(seen), 1)
+        centre, radius, blocks, knockback = seen[0]
+        self.assertEqual(centre, Vec3(3.0, -60.0, 4.0))
+        self.assertEqual(radius, 4.0)
+        self.assertEqual(blocks, 12)
+        self.assertEqual(knockback, (0.2, 0.3, -0.4))
+
+    async def test_a_blast_without_a_push_leaves_the_velocity_alone(self) -> None:
+        bot, seen = self._prepare()
+
+        await bot._handle_explode(_explode((3.0, -60.0, 4.0)))
+
+        self.assertEqual(bot.physics_state.velocity, Vec3(0.1, 0.0, 0.05))
+        self.assertEqual(bot._motion_epoch, 0)
+        self.assertEqual(seen[0][3], None)
+
+    async def test_the_sound_and_particle_tail_is_not_decoded(self) -> None:
+        bot, _ = self._prepare()
+
+        # Particle id, sound id, a weighted particle list and the sound flag:
+        # none of it is needed, so a reader that stops at the knockback must not
+        # trip over it.
+        await bot._handle_explode(
+            _explode(
+                (0.0, 0.0, 0.0),
+                knockback=(0.0, 0.4, 0.0),
+                trailing=b"\x07\x01\x02\x03\xff",
+            )
+        )
+
+        self.assertAlmostEqual(bot.physics_state.velocity.y, 0.4, places=6)
+
+    async def test_the_switch_ignores_the_push(self) -> None:
+        bot, seen = self._prepare(knockback=False)
+
+        await bot._handle_explode(
+            _explode((3.0, -60.0, 4.0), knockback=(0.2, 0.3, -0.4))
+        )
+
+        self.assertEqual(bot.physics_state.velocity, Vec3(0.1, 0.0, 0.05))
+        self.assertEqual(bot._motion_epoch, 0)
+        self.assertEqual(seen[0][3], (0.2, 0.3, -0.4))
+
+
 if __name__ == "__main__":
     unittest.main()

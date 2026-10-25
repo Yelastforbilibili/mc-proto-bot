@@ -1306,3 +1306,18 @@ in no packet: it is a measured guess with an honest error bar, not an oracle.
 same entity, and keeps the crosshair on it while it stays within reach --
 re-aiming each tick, never leading. `lock_on(entity_id, ticks=2)` is the same
 tracking loop on its own.
+
+
+### Physics as a value
+
+`bot.physics.step(state, controls, world)` runs one tick without touching the
+state it was given and returns a `StepResult` (next state + collision flag);
+`tick()` still writes in place for the live bot.  `protobot.physics.Recorder`
+keeps a transcript of those steps and `replay()` re-runs it, reporting the
+first frame whose position or velocity disagrees -- the cheap way to compare the
+engine with a probe or with the server's own account of the same ticks.
+
+Also worth knowing: an explosion's player knockback is added to the velocity
+(`clientbound_explode`), a walk along a cardinal heading gets exact zeros
+instead of vanilla's 1.2e-16 residue, and `bot.actions.frame()` hands you the
+pose a click will be judged in.

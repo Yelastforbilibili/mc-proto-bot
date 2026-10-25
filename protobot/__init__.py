@@ -22,6 +22,7 @@ from .actions import (
     Actions,
     ActionStatus,
     EntityHit,
+    PlacementFrame,
     UnsupportedAction,
     raycast_entities,
 )
@@ -204,6 +205,7 @@ __all__ = [
     "PhysicsAttributes",
     "PhysicsEngine",
     "PhysicsState",
+    "PlacementFrame",
     "PlayerAbilities",
     "PlayerListEntry",
     "Plugin",

@@ -2989,9 +2989,15 @@ async def sprint_bit_needs_forward(s: Suite) -> None:
             assert s.bot.physics_state.sprinting, "起步之后没有进入疾跑"
             distance = await _swing_at(s, opponent)
             assert impulses, f"没有收到击退（距离 {distance:.2f}）"
-            for _ in range(3):
+            # The arc is only ~9 ticks long and the driver is already ticking the
+            # body, so "still airborne three case ticks later" depends on how many
+            # of those the pump got in between.  Catch the airborne tick instead
+            # of pinning the count.
+            airborne = False
+            for _ in range(6):
                 await s.bot.tick(MovementInput(forward=1.0, sprint=True))
-            assert not s.bot.physics_state.on_ground, "击退之后应该离地，否则测不到这条"
+                airborne = airborne or not s.bot.physics_state.on_ground
+            assert airborne, "击退之后没有出现离地的一刻，否则测不到这条"
             inputs.clear()
             for _ in range(3):
                 await s.bot.tick(MovementInput(forward=0.0, sprint=True))

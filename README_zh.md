@@ -1123,3 +1123,16 @@ if shot is not None and shot.confidence > 0.5:
 `bot.actions.attack_looked_at(lock=True)` 先看向实体、对**同一个**实体出手，
 并在它留在触及范围内时继续把准星压在它身上 —— 每 tick 重新瞄准，不做提前量。
 `lock_on(entity_id, ticks=2)` 就是这段跟踪循环本身。
+
+
+### 物理即值
+
+`bot.physics.step(state, controls, world)` 跑一 tick 但**不改**传入的 state，
+返回 `StepResult`（下一状态 + 是否碰撞）；`tick()` 仍然原地写，那是活体的省事路径。
+`protobot.physics.Recorder` 把每次 step 记成一份「逐 tick 记录」，`replay()`
+重放并报出第一帧位置或速度对不上的地方 —— 这是拿引擎和探针、和服务器自己的同一段 tick
+做对拍的省事办法。
+
+另外三件值得知道的事：爆炸的玩家击退是**叠加**进速度（`clientbound_explode`）；
+轴对齐行走用精确 0 而不是原版表里的 1.2e-16 残留；`bot.actions.frame()` 给出这一次点击
+将被服务端按哪个姿态来量。

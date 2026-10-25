@@ -39,6 +39,26 @@ def yaw_sin_cos(yaw: float) -> tuple[float, float]:
     return minecraft_sin(radians), minecraft_cos(radians)
 
 
+def heading_sin_cos(yaw: float) -> tuple[float, float]:
+    """Table trigonometry, with exact zeros on the cardinal headings.
+
+    ``yaw_sin_cos`` is faithful to vanilla, and vanilla's table is sampled with
+    ``Math.sin``, so ``cos(0)`` is ``1.2246e-16`` rather than zero.  Walking
+    straight along an axis then gains a microscopic sideways component every
+    tick: the position drifts off the line the server predicts and the extra
+    movement shows up as a correction.  Movement controllers snap those axes to
+    exact zeros for that reason; the same snap belongs on anything that turns
+    yaw into a push.
+    """
+
+    remainder = yaw % 360.0 % 180.0
+    sin_yaw, cos_yaw = yaw_sin_cos(yaw)
+    return (
+        0.0 if remainder == 0.0 else sin_yaw,
+        0.0 if remainder == 90.0 else cos_yaw,
+    )
+
+
 def look_y_from_pitch(pitch: float) -> float:
     """Return the Y component of Minecraft's view vector for a pitch angle."""
 

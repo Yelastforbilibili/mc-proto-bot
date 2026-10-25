@@ -127,6 +127,8 @@ class PlayRouterMixin:
             await self.send_raw(ids.serverbound_keep_alive, response)
         elif ids.clientbound_update_time and packet.packet_id == ids.clientbound_update_time:
             await self._handle_update_time(packet.payload)
+        elif ids.clientbound_explode and packet.packet_id == ids.clientbound_explode:
+            await self._handle_explode(packet.payload)
         elif packet.packet_id == ids.clientbound_login:
             self._handle_play_login(packet.payload)
             await self.events.emit("world", self.session)
@@ -1302,6 +1304,43 @@ class PlayRouterMixin:
                 self.player.velocity_x, self.player.velocity_y, self.player.velocity_z = velocity
                 self.physics_state.velocity = Vec3(*velocity)
         await self.events.emit("entity_motion", entity_id, velocity, entity)
+
+    async def _handle_explode(self, payload: bytes) -> None:
+        """An explosion: read the vector the server pushes *us* with, if any.
+
+        Vanilla's ``ClientboundExplodePacket`` carries the blast centre, radius,
+        affected block count, then ``Optional<Vec3> playerKnockback`` followed by
+        particle and sound data.  Only the knockback matters to us, and the rest
+        describes how the blast looks and sounds -- so the reader stops there
+        instead of decoding a weighted particle list just to throw it away.
+
+        The vector is *added* to the current velocity (``Entity.push``), unlike
+        the motion packet, which replaces it.  Without this the only thing a bot
+        learns about a creeper blast is the teleport that follows, so a local
+        prediction runs straight through the blast and the server has to correct
+        it -- which is exactly what a movement check reports.
+        """
+
+        reader = PacketReader(payload)
+        centre = Vec3(reader.read_double(), reader.read_double(), reader.read_double())
+        radius = reader.read_float()
+        block_count = reader.read_varint()
+        self._validate_finite((centre.x, centre.y, centre.z), "blast centre")
+        knockback: tuple[float, float, float] | None = None
+        if reader.read_bool():
+            knockback = (reader.read_double(), reader.read_double(), reader.read_double())
+            self._validate_finite(knockback, "explosion knockback")
+        if knockback is not None and self.knockback:
+            # Same epoch rule as the motion packet: a tick that already computed
+            # its step must recompute instead of claiming a position that
+            # ignores the push.
+            self._motion_epoch += 1
+            velocity = self.physics_state.velocity + Vec3(*knockback)
+            self.physics_state.velocity = velocity
+            self.player.velocity_x = velocity.x
+            self.player.velocity_y = velocity.y
+            self.player.velocity_z = velocity.z
+        await self.events.emit("explosion", centre, radius, block_count, knockback)
 
     async def _handle_swing_animation(self, payload: bytes) -> None:
         """Another player (or mob) moved its arm where we can see it.

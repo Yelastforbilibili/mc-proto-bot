@@ -24,6 +24,27 @@ from .physics import MovementInput, PhysicsState, Vec3
 from .support import _find_flight_path, _find_ground_path
 from .world import World
 
+# Arrival thresholds, taken from a working reference implementation (MovementSync
+# 1.12 `PathMovement`): the last waypoint is judged tighter than the ones on the
+# way, and reaching it is not enough while the body is still sliding -- a walker
+# that stops its input one tick early coasts past the point and the caller reads
+# that as a failed arrival.
+ARRIVAL_RADIUS = 0.3
+WAYPOINT_RADIUS = 0.35
+VERTICAL_ARRIVAL = 0.5
+SETTLED_SPEED = 0.025
+SETTLE_TICKS = 8
+
+# A tick that does not move the body 0.05 blocks is not progress.  The reference
+# uses the same window (squared, 40 ticks) because a single fast tick is not
+# evidence of anything -- sliding into a corner also moves for a tick or two.
+PROGRESS_DISTANCE_SQUARED = 0.0025
+PROGRESS_TICKS = 40
+
+
+def _horizontal_speed(state: PhysicsState) -> float:
+    return math.hypot(state.velocity.x, state.velocity.z)
+
 
 class NavigatorMixin:
     """Methods of :class:`protobot.Bot`, grouped by concern."""
@@ -588,12 +609,15 @@ class NavigatorMixin:
         tick_interval: float,
     ) -> bool:
         loop = asyncio.get_running_loop()
-        for waypoint in path:
+        last_index = len(path) - 1
+        for index, waypoint in enumerate(path):
             target = waypoint.position
             jumping = waypoint.operation == "jump"
+            is_last = index == last_index
+            radius = ARRIVAL_RADIUS if is_last else WAYPOINT_RADIUS
 
             def steer(
-                target=target, jumping=jumping
+                target=target, jumping=jumping, radius=radius
             ) -> None:
                 """Aim the tick that is about to be sent, from where it starts.
 
@@ -607,25 +631,36 @@ class NavigatorMixin:
                 ahead_x = target.x - current.position.x
                 ahead_z = target.z - current.position.z
                 ahead = math.hypot(ahead_x, ahead_z)
-                if ahead > tolerance:
+                if ahead > radius:
                     current.yaw = math.degrees(math.atan2(-ahead_x, ahead_z))
                 self.input = MovementInput(
-                    forward=1.0 if ahead > tolerance else 0.0,
+                    forward=1.0 if ahead > radius else 0.0,
                     jump=jumping and current.position.y < target.y - 0.05,
                     sprint=sprint,
                 )
 
             self.set_steer(steer)
-            best_distance = math.inf
-            stagnant_ticks = 0
+            progress_position = self.physics_state.position
+            progress_ticks = 0
+            settled_ticks = 0
             while True:
                 state = self.physics_state
                 dx = target.x - state.position.x
                 dz = target.z - state.position.z
                 horizontal = math.hypot(dx, dz)
                 vertical = abs(target.y - state.position.y)
-                if horizontal <= tolerance and vertical <= 0.55:
-                    break
+                if horizontal <= radius and vertical <= VERTICAL_ARRIVAL:
+                    if not is_last:
+                        break
+                    # Dropping the input is not arriving: a walker whose input
+                    # stops on the boundary still slides another half block on
+                    # ground friction, so the last waypoint waits for the body.
+                    if (
+                        _horizontal_speed(state) <= SETTLED_SPEED
+                        or settled_ticks >= SETTLE_TICKS
+                    ):
+                        break
+                    settled_ticks += 1
                 if loop.time() >= deadline:
                     self.clear_steer()
                     self.input = MovementInput()
@@ -638,13 +673,13 @@ class NavigatorMixin:
                 # from ``input``, and without one this tick must still walk.
                 await self.advance(self.input)
 
-                distance = horizontal + vertical
-                if distance < best_distance - 0.02:
-                    best_distance = distance
-                    stagnant_ticks = 0
+                shifted = self.physics_state.position - progress_position
+                if shifted.length_squared > PROGRESS_DISTANCE_SQUARED:
+                    progress_position = self.physics_state.position
+                    progress_ticks = 0
                 else:
-                    stagnant_ticks += 1
-                if stagnant_ticks >= 20:
+                    progress_ticks += 1
+                if progress_ticks >= PROGRESS_TICKS:
                     self.clear_steer()
                     self.input = MovementInput()
                     return False
