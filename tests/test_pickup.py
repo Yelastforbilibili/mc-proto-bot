@@ -23,7 +23,10 @@ class _Menu:
     def free(self) -> int | None:
         return self._free
 
-    def slots(self) -> dict[int, _Stack]:
+    @property
+    def items(self) -> dict[int, _Stack]:
+        """The decoded stacks, like the real ``Menu.items`` property."""
+
         return dict(enumerate(self._stacks))
 
     def count(self, name: str) -> int:

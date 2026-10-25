@@ -26,6 +26,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 ITEM_ENTITY = "minecraft:item"
 ITEM_METADATA_INDEX = 8
+
+CREDIT_GRACE_SECONDS = 0.6
 PICKUP_RANGE = 1.0
 POLL_SECONDS = 0.05
 
@@ -146,10 +148,17 @@ class PickupMixin:
         return identifier(entity.type_id)
 
     def _inventory_count(self: Bot, name: str) -> int:
-        menu = self.player_menu
+        """How many of ``name`` the player's own window currently holds.
+
+        Counted straight off the decoded stacks by identifier: the drop filter
+        upstream matches on ``ItemStack.identifier`` too, so both sides of the
+        bookkeeping agree on what "the same item" means.
+        """
+
+        stacks = self.player_menu.items.values()
         if name == "*":
-            return sum(stack.count for stack in menu.slots().values())
-        return menu.count(name)
+            return sum(stack.count for stack in stacks)
+        return sum(stack.count for stack in stacks if stack.identifier == name)
 
     def _has_room(self: Bot, stacks: int = 1) -> bool:
         return self.player_menu.free() is not None or stacks <= 0
@@ -169,7 +178,7 @@ class PickupMixin:
         if menu.free() is not None:
             return False
         matching = [
-            stack for stack in menu.slots().values() if stack.identifier == name
+            stack for stack in menu.items.values() if stack.identifier == name
         ]
         if not matching:
             return True
@@ -266,9 +275,20 @@ class PickupMixin:
             visited.add(entity_id)
             report.visited += 1
             # Wait for the server to delete the entity and credit the stack.
+            before = self._inventory_count(name)
             poll_until = min(deadline, time.monotonic() + 2.0)
             while time.monotonic() < poll_until:
                 if entity_id not in self.entities:
+                    break
+                await self.advance()
+                await asyncio.sleep(POLL_SECONDS)
+            # The entity leaves the world a tick or two before the slot update
+            # reaches our own window, so the credit gets its own short grace:
+            # booking the drop as lost the instant it vanishes would report a
+            # lost item for a pickup that is simply still in flight.
+            credit_until = min(deadline, time.monotonic() + CREDIT_GRACE_SECONDS)
+            while time.monotonic() < credit_until:
+                if self._inventory_count(name) > before:
                     break
                 await self.advance()
                 await asyncio.sleep(POLL_SECONDS)

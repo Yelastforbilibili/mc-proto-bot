@@ -3207,16 +3207,25 @@ async def case_drop_pickup(s: Suite) -> None:
     try:
         result = await s.bot.actions.drop_item()
         assert result.status is ActionStatus.SENT, result.evidence
-        await s.settle(1.0)
+        # 自己丢出来的那一堆就落在脚下，几 tick 之内会被自己吸回去，没法用它
+        # 证明「走过去捡」。所以另起一堆：在 4 格外的地上 summon 一个物品实体，
+        # 让它原地等（PickupDelay 0），拾取必须真的走过去才成立。
+        ground = s.spot(4, 0)
+        s.command(
+            f"summon minecraft:item {ground[0]+0.5} {ground[1]+1.0} {ground[2]+0.5}"
+            ' {Item:{id:"minecraft:oak_log",count:1},PickupDelay:0s}'
+        )
     finally:
         await s.bot.start_driver()
-    while_inventory = s.server_count("minecraft:oak_log")
-    assert while_inventory <= 2, f"丢出去之后背包里还有 {while_inventory} 个"
-    report = await s.bot.pick_up(items=["minecraft:oak_log"], count=1, radius=8.0)
+    await s.settle(0.6)
+    drops = s.bot.dropped_items(radius=10.0, items=["minecraft:oak_log"])
+    assert drops, "附近没有可拾取的掉落物实体"
+    await s.bot.navigate_to(drops[0][4], drops[0][6], tolerance=1.0, timeout=20.0)
+    report = await s.bot.pick_up(items=["minecraft:oak_log"], count=1, radius=6.0)
     assert report.ok, f"没捡回来：{report.describe()}"
-    picked = s.wait_count("minecraft:oak_log", 3, timeout=6.0)
-    assert picked >= 3, f"捡回来以后只有 {picked} 个"
-    await s.say(f"    丢弃 → 服务端 {while_inventory} 个 → 拾取 → {picked} 个")
+    picked = await s.wait_count("minecraft:oak_log", 1, timeout=6.0)
+    assert picked >= 1, f"捡回来以后背包里只有 {picked} 个"
+    await s.say(f"    丢出 → 走到 {drops[0][4]:.1f},{drops[0][6]:.1f} → 捡回 {picked} 个")
 
 
 @case(41, "库能力", "碰撞形状：台阶不是满方块，站上去的高度差半格", timeout=120.0)
