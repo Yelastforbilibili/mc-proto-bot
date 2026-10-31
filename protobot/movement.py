@@ -235,15 +235,29 @@ class MovementMixin:
                 if vehicle is not None:
                     await self._send_paddle_boat(vehicle)
             if send_position:
+                if self.version.protocol >= 777 and self._position_sent_this_tick:
+                    await self.end_tick()
+                await self._begin_tick_packet()
+                # A vanilla client sends, while riding, one rotation packet and
+                # one ``move_vehicle`` packet in the same tick, then a single
+                # ``client_tick_end`` (LocalPlayer.sendChanges).  Claiming the
+                # slot inside both sends split that tick in two: two end markers
+                # per tick, and the vehicle packet fell into the next slot, so
+                # the server saw the boat move on half the ticks that Grim
+                # predicted it on.
                 await self.send_look(
                     self.physics_state.yaw,
                     self.physics_state.pitch,
                     on_ground=self.physics_state.on_ground,
                     horizontal_collision=self.physics_state.horizontal_collision,
+                    claim=False,
                 )
                 if vehicle is not None:
-                    await self._send_vehicle_movement(vehicle)
-            await self.end_tick()
+                    await self._send_vehicle_movement(vehicle, claim=False)
+            if self.version.protocol >= 777:
+                await self.close_tick()
+            else:
+                await self.end_tick()
             return self.physics_state
         if (
             self.physics_state.spectator
@@ -1039,8 +1053,13 @@ class MovementMixin:
         *,
         on_ground: bool | None = None,
         horizontal_collision: bool | None = None,
+        claim: bool = True,
     ) -> None:
-        """Send a vanilla look-only movement packet and update local state."""
+        """Send a vanilla look-only movement packet and update local state.
+
+        ``claim=False`` is for callers that already own this tick's slot (the
+        riding branch sends a rotation and a ``move_vehicle`` in one tick).
+        """
 
         self._require_play()
         self._set_movement_flags(on_ground, horizontal_collision)
@@ -1076,7 +1095,8 @@ class MovementMixin:
             .write_unsigned_byte(self._movement_flags())
             .to_bytes()
         )
-        await self._begin_tick_packet()
+        if claim:
+            await self._begin_tick_packet()
         await self.send_raw(self.version.packets.serverbound_look, payload)
         self._last_sent_yaw, self._last_sent_pitch = yaw, pitch
 
@@ -1191,7 +1211,9 @@ class MovementMixin:
         self._next_anti_kick = 0.0
         self._anti_kick_last_packet_y = None
 
-    async def _send_vehicle_movement(self, vehicle: EntityState) -> None:
+    async def _send_vehicle_movement(
+        self, vehicle: EntityState, *, claim: bool = True
+    ) -> None:
         payload = (
             PacketWriter()
             .write_double(vehicle.x)
@@ -1202,7 +1224,8 @@ class MovementMixin:
             .write_bool(False if self._no_fall else vehicle.on_ground)
             .to_bytes()
         )
-        await self._begin_tick_packet()
+        if claim:
+            await self._begin_tick_packet()
         await self.send_raw(self.version.packets.serverbound_move_vehicle, payload)
 
     async def _send_paddle_boat(self, vehicle: EntityState) -> None:

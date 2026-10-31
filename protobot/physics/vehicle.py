@@ -180,7 +180,12 @@ class BoatPhysicsEngine:
             state.boat_old_status == "in_air"
             and state.boat_status not in ("in_air", "on_land")
         ):
-            state.boat_water_level = state.y + self.height
+            # ``AbstractBoat.floatBoat``: ``this.waterLevel = this.getY(1.0)``,
+            # i.e. the boat's y plus one whole block, not its bounding-box
+            # height.  Using the height here made the first splash-down tick
+            # buoyant by the wrong amount, and the resulting vertical offset is
+            # what a vehicle prediction check reports as Simulation.
+            state.boat_water_level = state.y + 1.0
             target_y = self._water_level_above(state, world) - self.height + 0.101
             moved = self.bounding_box(state).move(0.0, target_y - state.y, 0.0)
             if world.no_collision(moved):

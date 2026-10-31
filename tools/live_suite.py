@@ -235,6 +235,7 @@ ANTI_CHEAT = (
     "failed MultiActions",
     "failed Breaking",
     "failed Prediction",
+    "failed",
 )
 
 
@@ -3149,9 +3150,23 @@ async def case_physics(s: Suite) -> None:
 @case(39, "库能力", "载具：上船、船带着人走、再下船", timeout=180.0)
 async def case_vehicle(s: Suite) -> None:
     base = s.spot(0, 7)
-    s.setblock(base, "minecraft:stone")
+    # A boat is 1.375 blocks wide and ``BoatItem.use`` refuses a placement
+    # whose bounding box overlaps a block (``level.noCollision``), so a
+    # single-block puddle can never hold one.  Dig a channel that is three
+    # wide and nine long, walled on both sides and at the ends, one deep.
+    for dz in range(0, 9):
+        for dx in (-1, 0, 1):
+            s.setblock((base[0] + dx, base[1], base[2] + dz), "minecraft:stone")
+    for dz in range(0, 9):
+        for dy in (1, 2):
+            s.setblock((base[0] - 2, base[1] + dy, base[2] + dz), "minecraft:stone")
+            s.setblock((base[0] + 2, base[1] + dy, base[2] + dz), "minecraft:stone")
+    for dx in range(-2, 3):
+        for dy in (1, 2):
+            s.setblock((base[0] + dx, base[1] + dy, base[2] - 1), "minecraft:stone")
+            s.setblock((base[0] + dx, base[1] + dy, base[2] + 9), "minecraft:stone")
     s.command(
-        f"fill {base[0]-1} {base[1]+1} {base[2]-1} {base[0]+1} {base[1]+1} {base[2]+1} minecraft:water"
+        f"fill {base[0]-1} {base[1]+1} {base[2]} {base[0]+1} {base[1]+1} {base[2]+8} minecraft:water"
     )
     await s.teleport((base[0] + 0.5, base[1] + 1.0, base[2] + 0.5))
     await s.settle(0.5)
@@ -3165,29 +3180,50 @@ async def case_vehicle(s: Suite) -> None:
     s.give("minecraft:oak_boat", 1)
     await s.wait_count("minecraft:oak_boat", 1, timeout=6.0)
     await s.hold("minecraft:oak_boat")
-    # The server decides where the boat lands from the aim ray, so point at the
-    # water surface before using the item.
+    # The server decides where the boat lands from the aim ray, so point ahead
+    # at the water surface first: aiming straight down places the boat inside
+    # the player's own pillar, and 3 blocks ahead lands it at the edge of the
+    # 3 block interact range.  Two blocks ahead keeps it boardable.
     await s.bot.actions.turn_to(
-        (base[0] + 0.5, base[1] + 1.05, base[2] + 1.5), tick=True
+        (base[0] + 0.5, base[1] + 1.8889, base[2] + 1.5), tick=True
     )
     await s.bot.actions.use_item()
-    await s.settle(0.8)
-    boats = [
-        entity.entity_id
-        for entity in s.bot.entities.values()
-        if entity.type_id == boat_type and entity.entity_id not in before
-    ]
-    assert boats, "服务端没有生成船"
-    boat = boats[0]
+    boat = None
+    for _ in range(16):
+        await s.settle(0.25)
+        boats = [
+            entity.entity_id
+            for entity in s.bot.entities.values()
+            if entity.type_id == boat_type and entity.entity_id not in before
+        ]
+        if boats:
+            boat = boats[0]
+            break
+    assert boat is not None, "服务端没有生成船"
+    placed = s.bot.entities[boat]
+    await s.bot.actions.turn_to((placed.x, placed.y + 0.3, placed.z), tick=True)
     await s.bot.actions.interact(boat)
-    await s.settle(0.5)
+    for _ in range(8):
+        await s.settle(0.25)
+        if s.bot.player.vehicle_id == boat:
+            break
     assert s.bot.player.vehicle_id == boat, (
         f"没有上船：vehicle_id={s.bot.player.vehicle_id}，船={boat}"
     )
     start = s.server_position()
     assert start is not None
-    for _ in range(20):
+    for tick in range(20):
         await s.bot.tick(MovementInput(forward=1.0, strafe=0.4))
+        # The server ejects a rider whose vehicle movement it cannot predict
+        # (Grim answers a vehicle Simulation alert with a synthetic
+        # ClientboundSetPassengersPacket listing two non-existent passenger ids,
+        # which no client can bind).  Check every tick so the failure names the
+        # tick instead of blaming the distance later.
+        assert s.bot.player.vehicle_id == boat, (
+            "骑行第 {} tick 被服务器卸下（vehicle_id={}）".format(
+                tick, s.bot.player.vehicle_id
+            )
+        )
     await s.settle(0.3)
     moved = s.server_position()
     assert moved is not None
@@ -3284,19 +3320,39 @@ async def case_goal_sequence(s: Suite) -> None:
 async def case_entity_tracking(s: Suite) -> None:
     base = s.spot(0, -9)
     s.setblock(base, "minecraft:stone")
-    s.command(f"kill @e[type=minecraft:cow]")
-    s.command(f"summon minecraft:cow {base[0]+0.5} {base[1]+1} {base[2]+0.5}")
+    # Tag the summoned cow so the later tp cannot pick a leftover cow from an earlier run:
+    # the plain "limit=1, sort=nearest" selector did exactly that and the test blamed the client
+    # for a removal the server really did send.
+    s.command("kill @e[type=minecraft:cow]")
+    s.command(
+        f'summon minecraft:cow {base[0]+0.5} {base[1]+1} {base[2]+0.5} {{Tags:["suite43"]}}'
+    )
     await s.settle(0.6)
     cow_type = s.bot.version.entities.by_name["minecraft:cow"]["id"]
+    summoned = (base[0] + 0.5, base[1] + 1.0, base[2] + 0.5)
     cows = [
         entity for entity in s.bot.entities.values() if entity.type_id == cow_type
     ]
     assert cows, "服务端有牛，客户端却没跟踪到"
-    cow = cows[0]
+    cow = min(
+        cows,
+        key=lambda entity: math.dist((entity.x, entity.y, entity.z), summoned),
+    )
     destination = (base[0] + 4.5, base[1] + 1, base[2] + 3.5)
-    s.command(f"tp @e[type=minecraft:cow,limit=1] {destination[0]} {destination[1]} {destination[2]}")
-    await s.settle(0.8)
+    s.command(
+        f"tp @e[tag=suite43,limit=1] {destination[0]} {destination[1]} {destination[2]}"
+    )
     tracked = s.bot.entities.get(cow.entity_id)
+    for _ in range(8):
+        if tracked is not None:
+            offset = math.dist(
+                (tracked.x, tracked.y, tracked.z),
+                (destination[0], destination[1], destination[2]),
+            )
+            if offset <= 1.0:
+                break
+        await s.settle(0.25)
+        tracked = s.bot.entities.get(cow.entity_id)
     assert tracked is not None, "牛被传送之后客户端丢了它"
     offset = math.dist(
         (tracked.x, tracked.y, tracked.z),
