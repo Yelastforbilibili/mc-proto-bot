@@ -85,10 +85,13 @@ tests, and at least one scenario in the in-game suite proves the *server* did it
 
 - The referee is **GrimAC v2.3.74 on Paper 26.3**, and every green line in this
   README was measured with nobody interacting with the bot.
-- **It is not an immunity.** If a player keeps knocking the bot around while it
-  walks or performs an action, GrimAC can still flag `AntiKB`, `GroundSpoof`,
-  `Simulation` or `Post`: the library cannot put an impulse into a tick it has
-  already claimed (measured: roughly one alert per mixed scenario).
+- **It is not an immunity.** A player who keeps knocking the bot around can still
+  produce alerts, so the library answers pings immediately (the pong is the
+  transaction the next impulse is measured against) and only holds them in the
+  80 ms between an action and its own tick's movement packet.  The two-bot scene
+  that used to cost one `AntiKB` + `Simulation` + `GroundSpoof` now shows none of
+  the three; `Timer` can still appear when actions push ticks faster than the
+  50 ms grid.  See [docs/anti-cheat.md](docs/anti-cheat.md).
 - **Cheat emulation is off by default and stays a bypass attempt.** `vclip`,
   `anti_kick` and the `no_fall` plugin all tell the server something that did not
   happen. They are documented so you know they exist, not because a strict
@@ -1267,15 +1270,21 @@ copyright and permission notices stay attached.
 ## The honest scope of "zero alerts"
 
 The suite's green line means **no anti-cheat alert with nobody touching the
-bot**.  A player who keeps punching a bot in the middle of an action or a walk
-can still get it flagged (`AntiKB`, `GroundSpoof`, `Simulation`, occasionally
-`Post`): the impulse arrives while the action owns the tick, and the claim that
-follows does not always carry it.  Measured on Paper 26.3 with GrimAC v2.3.74:
+bot**.  Being fought is a separate case, and the answer changed with the pong
+fix described in [docs/anti-cheat.md](docs/anti-cheat.md#7-answer-a-ping-at-once-except-between-an-action-and-its-own-tick):
 
-| Situation | Alerts over the 43 scenarios |
+| Situation | Alerts |
 | --- | --- |
 | Full suite, nobody interfering | none |
-| Full suite while a player punches the bot | about one per mixed scenario (#23, #25, #30) |
+| Two bots, one punching the other while it keeps aiming and swinging (30 s, before the pong fix) | `AntiKB .320240`, `Simulation .538253`, `GroundSpoof claimed false` |
+| Same scene after the fix | none of those three; only `Timer`, which every run shows, the old policy included |
+| Full suite while a player punches the bot | about one per mixed scenario (#23, #25, #30) — measured under the old policy; re-run pending |
+
+Why the old policy failed: the pong is the transaction the knockback is measured
+against, and holding it back made the next movement packet look like it ignored
+an impulse the server had already delivered.  A pong now goes out the moment the
+ping arrives, except in the 80 ms between an action's packet and its own tick's
+movement packet (where `Post` needs the order to stay "movement, then answer").
 
 Read the green line as "the packets are shaped like a vanilla client's", not as
 "immune to being fought".  Three of the newer cases (#38 jumping and water,

@@ -149,23 +149,7 @@ class PlayRouterMixin:
             reader = PacketReader(packet.payload)
             value = reader.read_int()
             reader.expect_end()
-            # A pong is the transaction an anti-cheat judges the packets queued
-            # before it at, and only a movement packet clears that queue.  An
-            # action sits in the gap between the last movement packet and its own
-            # tick's movement packet for a moment (swing now, move next), so a
-            # pong answered there makes the swing look out of order.  Hold the
-            # answer until that tick has gone out -- and keep the answers in the
-            # order the pings arrived, because jumping that queue is a check of
-            # its own.
-            holding = bool(self._pong_pending) or time.monotonic() < getattr(
-                self, "_action_busy_until", 0.0
-            )
-            if holding:
-                self._pong_pending.append(value)
-            else:
-                await self.send_raw(
-                    ids.serverbound_pong, PacketWriter().write_int(value).to_bytes()
-                )
+            await self._handle_ping(value)
         elif packet.packet_id == ids.clientbound_player_chat:
             await self._handle_player_chat(packet.payload)
         elif packet.packet_id == ids.clientbound_profileless_chat:
@@ -242,6 +226,35 @@ class PlayRouterMixin:
             await self._handle_update_attributes(packet.payload)
         elif packet.packet_id == ids.clientbound_update_mob_effect:
             await self._handle_update_mob_effect(packet.payload)
+
+    async def _handle_ping(self, value: int) -> None:
+        """Answer the server's transaction, the way a vanilla client does.
+
+        The answer tells the anti-cheat how much of the packet stream the
+        client has certainly seen.  A knockback is measured against exactly
+        that: the server wraps the velocity packet in two transactions, and
+        only the movement packets that follow the second one are required to
+        carry the impulse.  Holding the answer back therefore makes the next
+        movement packet look like it ignored a knockback that had already been
+        delivered, which is an ``AntiKB`` flag and a setback.
+
+        The one place an answer must wait is the gap an action opens between
+        its own packet and the movement packet of the same tick: a transaction
+        landing there makes Grim's ``Post`` check report the action out of
+        order.  That window is bounded by the action itself, see
+        ``Actions._send`` and ``Bot._release_pong_hold``.
+        """
+
+        holding = bool(self._pong_pending) or time.monotonic() < getattr(
+            self, "_pong_hold_until", 0.0
+        )
+        if holding:
+            self._pong_pending.append(value)
+            return
+        await self.send_raw(
+            self.version.packets.serverbound_pong,
+            PacketWriter().write_int(value).to_bytes(),
+        )
 
     async def _handle_login(self, packet: RawPacket) -> None:
         if packet.packet_id == 0x00:

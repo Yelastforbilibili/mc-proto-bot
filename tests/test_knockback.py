@@ -10,6 +10,7 @@ tests pin down the recompute that avoids it.
 
 from __future__ import annotations
 
+import time
 import unittest
 
 from protobot.client import Bot
@@ -247,6 +248,169 @@ class MidTickImpulseTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(claimed), 1)
         self.assertEqual(bot.physics_state.velocity.z, 0.0)
+
+
+class LookTickWindowTests(unittest.IsolatedAsyncioTestCase):
+    """The window that only opens on a tick that already sent a look packet.
+
+    Closing a tick is not free: ``end_tick`` sends ``client_tick_end`` and then
+    flushes the pongs an action window held back.  That close used to happen
+    inside the packet write, i.e. after the physics step and after the knockback
+    epoch check, so an impulse that landed inside it reached the local velocity
+    and the epoch but not the packet that was about to leave -- while the flushed
+    pong had already told the anti-cheat that the very next movement must carry
+    it.  A look packet claiming the tick first is the only way to reach that
+    branch, which is why only aiming ticks used to lose the knockback.
+    """
+
+    async def _run_look_tick(
+        self, *, impulse: tuple[float, float, float] | None
+    ) -> tuple[list[tuple[float, float, float]], int]:
+        bot, _ = _make_bot()
+        bot.session.entity_id = 21
+        bot.player.loaded = True
+        # A look packet already claimed this tick, so the movement packet goes
+        # through the "close the previous tick" branch.
+        bot._position_sent_this_tick = True
+        claimed: list[tuple[float, float, float]] = []
+        original_send = bot.send_position
+
+        async def capture_position(
+            x: float,
+            y: float,
+            z: float,
+            *,
+            on_ground: bool | None = None,
+            horizontal_collision: bool | None = None,
+        ) -> None:
+            claimed.append((x, y, z))
+            await original_send(
+                x,
+                y,
+                z,
+                on_ground=on_ground,
+                horizontal_collision=horizontal_collision,
+            )
+
+        bot.send_position = capture_position  # type: ignore[method-assign]
+
+        steps: list[int] = []
+        engine_tick = bot.physics.tick
+
+        def counting_tick(state, controls, world) -> None:
+            steps.append(1)
+            engine_tick(state, controls, world)
+
+        bot.physics.tick = counting_tick  # type: ignore[method-assign]
+
+        original_end_tick = bot.end_tick
+        injected: list[int] = []
+
+        async def end_tick() -> None:
+            await original_end_tick()
+            # This is where the reader task can run: the previous tick is closed
+            # and its pongs are out, but this tick's packet has not been built.
+            if impulse is not None and not injected:
+                injected.append(1)
+                x, y, z = impulse
+                await bot._handle_set_entity_motion(_motion(21, x, y, z))
+
+        bot.end_tick = end_tick  # type: ignore[method-assign]
+
+        await bot._tick_once()
+        return claimed, len(steps)
+
+    async def test_impulse_while_closing_the_previous_tick_is_claimed(self) -> None:
+        control_claims, control_steps = await self._run_look_tick(impulse=None)
+        hit_claims, hit_steps = await self._run_look_tick(impulse=(0.0, 0.0, 0.4))
+
+        # The impulse landed before the snapshot, so it is part of this step and
+        # there is nothing to replay.
+        self.assertEqual(control_steps, 1)
+        self.assertEqual(hit_steps, 1)
+        self.assertEqual(len(control_claims), 1)
+        self.assertEqual(len(hit_claims), 1)
+        self.assertGreater(hit_claims[0][2], control_claims[0][2] + 0.1)
+
+    async def test_the_previous_tick_is_closed_before_the_physics_step(self) -> None:
+        bot, sent = _make_bot()
+        bot.session.entity_id = 21
+        bot.player.loaded = True
+        bot._position_sent_this_tick = True
+        tick_end_id = bot.version.packets.serverbound_tick_end
+        closed_at_physics: list[int] = []
+        engine_tick = bot.physics.tick
+
+        def counting_tick(state, controls, world) -> None:
+            closed_at_physics.append(
+                sum(1 for packet_id, _ in sent if packet_id == tick_end_id)
+            )
+            engine_tick(state, controls, world)
+
+        bot.physics.tick = counting_tick  # type: ignore[method-assign]
+
+        await bot._tick_once()
+
+        # One ``client_tick_end`` belongs to the tick a look packet already
+        # claimed; it has to be on the wire before this tick computes anything,
+        # otherwise an impulse can be published into a tick that was closed.
+        self.assertEqual(closed_at_physics, [1])
+
+
+class PongOrderTests(unittest.IsolatedAsyncioTestCase):
+    """The pong is the transaction the impulse is measured against.
+
+    The server wraps a knockback in two transactions and Grim only demands the
+    impulse from the movement packets that follow the second one.  Holding the
+    answer back makes the movement packet that follows look like it ignored a
+    knockback that had already arrived -- ``AntiKB`` with one whole impulse as
+    the offset, then a setback that undoes it.
+    """
+
+    async def test_a_ping_is_answered_at_once(self) -> None:
+        bot, sent = _make_bot()
+
+        await bot._handle_ping(7)
+
+        self.assertEqual(bot._pong_pending, [])
+        self.assertEqual(
+            [packet_id for packet_id, _ in sent],
+            [bot.version.packets.serverbound_pong],
+        )
+
+    async def test_a_ping_between_an_action_and_its_tick_waits(self) -> None:
+        bot, sent = _make_bot()
+        bot._pong_hold_until = time.monotonic() + 0.08
+
+        await bot._handle_ping(7)
+
+        # A transaction landing there makes Grim's ``Post`` check report the
+        # action out of order, so this one answer is the exception.
+        self.assertEqual(bot._pong_pending, [7])
+        self.assertEqual(sent, [])
+
+    async def test_the_movement_packet_releases_the_held_answer(self) -> None:
+        bot, sent = _make_bot()
+        bot._pong_hold_until = time.monotonic() + 0.08
+        await bot._handle_ping(7)
+
+        async def begin_tick() -> None:
+            return None
+
+        bot._begin_tick_packet = begin_tick  # type: ignore[method-assign]
+        await bot._send_position_packet(bot.version.packets.serverbound_position, b"")
+
+        # The movement packet goes first: only it clears the action queue the
+        # answer would otherwise report the action from.
+        self.assertEqual(
+            [packet_id for packet_id, _ in sent],
+            [
+                bot.version.packets.serverbound_position,
+                bot.version.packets.serverbound_pong,
+            ],
+        )
+        self.assertEqual(bot._pong_pending, [])
+        self.assertEqual(bot._pong_hold_until, 0.0)
 
 
 def _explode(

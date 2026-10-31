@@ -225,8 +225,10 @@ each was found by measuring a real client (see [anti-cheat.md](anti-cheat.md)):
 6. **Sleeping says nothing**: while the server holds the body, no movement
    packets are sent, one `client_tick_end` per tick, and `leave_bed()` hands
    control back.
-7. **Pongs are flushed before anything that waits on a transaction** (teleport
-   confirmations).
+7. **Pings are answered at once, except between an action and its own tick.**
+   The pong is the transaction the next knockback is measured against, so it
+   cannot wait for `end_tick()`; only the 80 ms between an action's packet and
+   its movement packet holds it, and the movement packet releases it.
 8. **Cardinal headings aim with exact zeros.**  Vanilla's sine table samples
    `pi` as `1.2246e-16`, not 0, so a walk straight along an axis gains a sideways
    component every tick; `heading_sin_cos()` snaps quarter turns to exact zeros

@@ -121,16 +121,44 @@ call to the bridge -- is a hole in the record, and the next movement claim then
 disagrees with the prediction by most of a step.  That is the `Simulation` offset
 this suite used to see (`.034980 /gl …`, then a halving tail as the lenience
 decays) at the start of a walk that came right after a burst of `/setblock`
-calls.  `Suite.keep_ticking()` fills those gaps: it ticks whenever the last
-movement packet is more than 75 ms old, exactly like a client that is not doing
-anything else.
+calls.  The acceptance suite now runs every bot on `bot.driving()` (one 20 Hz
+pump from `start_driver()` to `stop_driver()`), so those holes cannot open in
+the first place; `Suite.keep_ticking()` is only a compatibility shim for older
+scripts that drove the bot themselves.
 
-## 7. Answer pings where the tick allows, and in order
+## 7. Answer a ping at once, except between an action and its own tick
 
-A pong is the transaction an anti-cheat judges the packets queued before it at.
-Grim's `GrimProcessor.isTransaction` counts exactly two packets --
-`ServerboundPongPacket` and `ServerboundWindowConfirmationPacket` -- and `Post`
-clears its per-tick queue only on a movement packet:
+A pong is not just an echo.  It is the transaction an anti-cheat judges the
+packets queued before it at, and it is also how the server learns which part of
+the packet stream the client has certainly seen:
+
+```
+server: transaction A (a ping)
+server: set_entity_motion          <- the knockback
+server: transaction B (another ping)
+```
+
+Grim records the knockback against transaction A, and it only treats it as
+"known to be in the present" once the client's answer to B has arrived
+(`likelyKB`).  From then on the next movement claim has to carry the whole
+impulse; the first claim that does not is `AntiKB`, and the offset is the
+impulse itself:
+
+```
+Grim » KbLook 触发了 AntiKB (x1) o: .320240        # .538672 - .2184
+Grim » KbLook 触发了 Simulation (x2) .320240 /gl 11
+Grim » KbLook 触发了 GroundSpoof (x1) claimed false
+```
+
+So a pong goes out the moment the ping arrives.  Holding it back -- which this
+client used to do for the whole `_action_busy_until` window -- makes the claim
+that follows look like it ignored a knockback that had already been delivered:
+`Simulation .538253` against the full impulse, plus `GroundSpoof claimed false`
+when a later claim claims to be off the ground.  Both numbers were measured on
+Paper 26.3 + GrimAC v2.3.74 with the two-bot punching scene in
+`artifacts/kb_look_window.py`.
+
+The one exception is `Post`:
 
 ```
 movement  -> post.clear(); sentFlying = true
@@ -138,18 +166,22 @@ pong      -> if (sentFlying && !post.isEmpty()) flag(post.getFirst())
 action    -> queued, but only while sentFlying
 ```
 
-So the safe order inside a tick is animation, movement, and *then* anything else;
-a pong that arrives in the moment between an action's swing and that tick's
-movement packet makes the swing look like it arrived out of order:
+An action packet must be followed by its own tick's movement packet with no
+transaction in between, and an action closes its tick and then waits for the
+next tick slot before sending.  `Actions._send` therefore arms
+`Bot._pong_hold_until` for one action tick (80 ms), and
+`Bot._release_pong_hold()` -- called right after the movement packet has been
+written -- answers whatever arrived in that gap.  The answers leave in the order
+the pings arrived: answering a newer ping first is `TransactionOrder`
+("skipped=1"), a check of its own.
 
-```
-Grim » SuiteBot 触发了 Post (x8) punch v26.3
-```
+Measured on that scene, 30 s per run:
 
-`Bot._pong_pending` holds the answer while an action owns the tick
-(`_action_busy_until`) and `end_tick()` flushes it once the movement packet has
-gone out.  The answers leave in the order the pings arrived: answering a newer
-ping first is `TransactionOrder` ("skipped=1"), a check of its own.
+| answer policy | alerts |
+| --- | --- |
+| held for the whole action window (old) | `AntiKB .320240` + `Simulation .538253` + `GroundSpoof claimed false` |
+| immediate everywhere | 2 x `Post (x2) attack v26.3` |
+| immediate, held for one action tick | none of the above (`Timer` was present in every run, including the old policy) |
 
 ## What this document is not about
 

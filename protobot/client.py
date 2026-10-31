@@ -319,6 +319,13 @@ class Bot(
         # packet of the same tick; they go out once that tick is closed, because
         # a pong is the moment an anti-cheat judges the packets queued before it.
         self._pong_pending: list[int] = []
+        # An action packet must be followed by the movement packet of its own
+        # tick before a transaction can land between them, so pings are held
+        # from the action until this deadline.  It is deliberately one tick
+        # long: everywhere else a pong goes out immediately, because the
+        # transaction pair the server wraps around a knockback is how an
+        # anti-cheat decides whether the impulse could have arrived.
+        self._pong_hold_until = 0.0
         # The tick driver (protobot/driver.py).  `input` is what the driver
         # holds down every tick; a caller that awaits something slow sets it and
         # lets the pump keep the stream at 20 Hz instead of freezing the client.

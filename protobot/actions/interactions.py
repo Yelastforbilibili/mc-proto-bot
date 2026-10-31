@@ -88,6 +88,12 @@ INTERACT_AT = 2
 
 _HANDS = {"main_hand": 0, "main": 0, "off_hand": 1, "off": 1}
 
+#: How long an action may hold the ping answers back: the gap it opens is the
+#: wait for its own tick's movement packet, which the action layer bounds by the
+#: same number (``_action_busy_until``).  One tick plus a little slack; past
+#: that a held transaction would delay the knockback sandwich instead.
+_ACTION_HOLD_SECONDS = 0.08
+
 #: Sentinel for "the caller did not say which tool", so ``tool=None`` can mean
 #: "a bare hand" instead of "use whatever is held".
 _UNSET = object()
@@ -297,7 +303,7 @@ class Actions:
         # because the action would then be queued inside that tick and reported
         # by the next transaction as a misordered packet.
         try:
-            self.client._action_busy_until = time.monotonic() + 0.08
+            self.client._action_busy_until = time.monotonic() + _ACTION_HOLD_SECONDS
         except AttributeError:
             pass
         if close is not None:
@@ -315,8 +321,15 @@ class Actions:
         """
 
         packet_id = self._packet_id(field, action)
+        # The action is not judged by itself: it is judged against the movement
+        # packet of its own tick, so a transaction landing between the two makes
+        # Grim's ``Post`` check report it out of order.  Hold the ping answers
+        # for one tick; everywhere else they go out as soon as they arrive.
+        try:
+            self.client._pong_hold_until = time.monotonic() + _ACTION_HOLD_SECONDS
+        except AttributeError:
+            pass
         await self.client.send_raw(packet_id, payload)
-        return packet_id
         return packet_id
 
     async def _emit(self, result: ActionResult) -> ActionResult:

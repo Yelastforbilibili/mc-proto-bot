@@ -266,6 +266,24 @@ class MovementMixin:
             # between two transactions and expects the very next movement to
             # carry it, so that gap reads as "did not take the knockback".
             await self.wait_tick_budget()
+            if send_position and self.version.protocol >= 777:
+                # Close the previous tick here, before the snapshot, and not
+                # from inside the packet write.  ``end_tick`` sends
+                # ``client_tick_end`` and then flushes the pongs that were held
+                # while an action owned the tick: both are awaits, so a
+                # knockback could land inside them, i.e. after the pre-tick
+                # snapshot was taken but before the packet describing that step
+                # reached the wire.  The packet then left without the impulse
+                # while the flushed pong had already told the anti-cheat that
+                # the very next movement must carry it -- which is the exact
+                # pattern ``AntiKB`` reports as an offset of one whole impulse
+                # (0.538672 = |(0.4, 0.3608)|).  An aim that ships a bare look
+                # packet (``look_at``, ``turn_to(tick=False)``) leaves the slot
+                # claimed, so the driver's next tick is the one that takes this
+                # branch: the window is not on a fixed schedule, which is why
+                # only some ticks lost the knockback.
+                if self._position_sent_this_tick:
+                    await self.end_tick()
         position_serial = self._position_update_serial
         motion_epoch = self._motion_epoch
         state_before = self._snapshot_physics_state()
@@ -290,7 +308,7 @@ class MovementMixin:
             await self._sync_input(**input_values)
             await self._sync_sprinting(self.physics_state.sprinting)
         if send_position:
-            if self._motion_epoch != motion_epoch:
+            while self._motion_epoch != motion_epoch:
                 # The server decided this player's velocity after the step
                 # above -- a knockback.  Recompute the tick from the pre-tick
                 # state so the packet below carries the impulse, which is what a
@@ -298,15 +316,10 @@ class MovementMixin:
                 # then moves.  Without this the packet describes a step that
                 # ignored an impulse the server had already sent, and a
                 # prediction check measures the difference as a displacement it
-                # cannot explain.
-                impulse = self.physics_state.velocity
-                self._restore_physics_state(state_before)
-                # The impulse is new information that arrived after the snapshot;
-                # it belongs to the replayed tick, not to the one being undone.
-                self.physics_state.velocity = impulse
-                await self._advance_physics(
-                    controls, was_flying, announce_flying=False
-                )
+                # cannot explain.  The loop consumes one epoch per replay, so the
+                # tripwire further down can run the same helper.
+                motion_epoch = self._motion_epoch
+                await self._replay_with_impulse(controls, was_flying, state_before)
             state = self.physics_state
             if self._position_update_serial != position_serial:
                 # An authoritative teleport landed while this tick was being
@@ -321,7 +334,12 @@ class MovementMixin:
                         " (teleport race)"
                     )
                 self._trace_position(controls)
-                await self.end_tick()
+                # The tick that was supposed to send this packet is closed at the
+                # start of every tick now, so there is normally nothing left to
+                # close here; only a packet sent earlier in this same tick (a
+                # look from an action) still needs its end marker.
+                if self._position_sent_this_tick:
+                    await self.end_tick()
                 return self.physics_state
             if self._force_flight_active:
                 # Forced flight is local-only.  Do not let the predictor's
@@ -329,6 +347,14 @@ class MovementMixin:
                 # not advertise an on-ground movement packet while flying.
                 state.on_ground = False
                 state.vertical_collision = False
+            if self._motion_epoch != motion_epoch:
+                # Tripwire.  Nothing between the epoch check above and this line
+                # awaits, so this cannot fire today; it exists so that an await
+                # added here later cannot silently ship a packet that ignores a
+                # knockback -- exactly the bug the ordering above is built to
+                # prevent.  Replaying is cheap and idempotent for one tick.
+                motion_epoch = self._motion_epoch
+                await self._replay_with_impulse(controls, was_flying, state_before)
             # A vanilla client sends exactly one movement packet per tick, and
             # the rotation rides in it when the view changed.  A separate Look
             # packet would be a second movement packet in the same tick: the
@@ -405,6 +431,26 @@ class MovementMixin:
             # flag below; keep the predictor in that same state as well.
             self._set_physics_flying(True)
             self.physics_state.on_ground = False
+
+    async def _replay_with_impulse(
+        self,
+        controls: MovementInput,
+        was_flying: bool,
+        state_before: PhysicsState,
+    ) -> None:
+        """Recompute the step with an impulse that arrived after it.
+
+        The snapshot is the state from before this tick ran, and the impulse is
+        new information that arrived after the snapshot was taken, so it belongs
+        to the replayed tick, not to the one being undone.  Both callers run this
+        with no other await in flight, so the packet that follows describes the
+        replay rather than the step it replaced.
+        """
+
+        impulse = self.physics_state.velocity
+        self._restore_physics_state(state_before)
+        self.physics_state.velocity = impulse
+        await self._advance_physics(controls, was_flying, announce_flying=False)
 
     def _snapshot_physics_state(self) -> PhysicsState:
         """Copy the physics state so one step can be undone and replayed."""
@@ -558,6 +604,22 @@ class MovementMixin:
                 f" vy={state.velocity.y:.4f}"
             )
         await self.send_raw(packet_id, payload)
+        await self._release_pong_hold()
+
+    async def _release_pong_hold(self) -> None:
+        """Let the answers an action held back go now that its tick has moved.
+
+        See the docstring in :meth:`Bot.tick` and Grim's ``Post`` check: the
+        transaction an action waits for is the movement packet of its own tick.
+        Once that packet is on the wire the queue it opens is cleared, so the
+        answers can follow it instead of landing inside it.
+        """
+
+        if not self._pong_hold_until:
+            return
+        self._pong_hold_until = 0.0
+        if self._pong_pending:
+            await self._flush_pongs()
 
     async def send_vehicle_position_and_rotation(
         self,
