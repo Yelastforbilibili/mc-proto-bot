@@ -1021,10 +1021,17 @@ class PlayRouterMixin:
         self._validate_finite((*position, yaw, pitch), "entity position sync")
 
         entity = self.entities.get(entity_id)
-        if entity is not None:
+        vehicle = self._controlled_root_vehicle()
+        if entity is not None and (vehicle is None or vehicle.entity_id != entity_id):
             entity.x, entity.y, entity.z = position
             entity.yaw, entity.pitch = yaw, pitch
             entity.on_ground = on_ground
+        # ``ClientPacketListener.handleEntityPositionSync`` only moves an entity
+        # when ``!entity.isLocalInstanceAuthoritative()``.  The boat we drive is
+        # authoritative on this side, so the packets that echo its position back
+        # are a tick of delayed news, not a correction: applying them yanked the
+        # boat backwards every few ticks, which is what a vehicle prediction
+        # check reports as Simulation right before it dismounts the rider.
         await self.events.emit("entity_move", entity_id, entity)
 
     async def _handle_move_entity(

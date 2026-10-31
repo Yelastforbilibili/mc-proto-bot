@@ -3213,12 +3213,13 @@ async def case_vehicle(s: Suite) -> None:
     start = s.server_position()
     assert start is not None
     for tick in range(20):
-        await s.bot.tick(MovementInput(forward=1.0, strafe=0.4))
-        # The server ejects a rider whose vehicle movement it cannot predict
-        # (Grim answers a vehicle Simulation alert with a synthetic
-        # ClientboundSetPassengersPacket listing two non-existent passenger ids,
-        # which no client can bind).  Check every tick so the failure names the
-        # tick instead of blaming the distance later.
+        # While riding, the boat is authoritative on our side, so one tick must
+        # produce exactly one ``move_vehicle`` packet.  A bare ``tick()`` here
+        # would let the 20 Hz pump take the other half of the slot and the boat
+        # would move twice per tick, which Grim reports as Simulation and then
+        # answers by dismounting the rider with a synthetic passengers list of
+        # two nonexistent ids.  ``advance()`` is the driver-aware way to move.
+        await s.bot.advance(MovementInput(forward=1.0, strafe=0.4), ticks=1)
         assert s.bot.player.vehicle_id == boat, (
             "骑行第 {} tick 被服务器卸下（vehicle_id={}）".format(
                 tick, s.bot.player.vehicle_id
@@ -3230,7 +3231,7 @@ async def case_vehicle(s: Suite) -> None:
     distance = math.dist(start, moved)
     assert distance >= 0.5, f"在船上却没有移动：{distance:.2f} 格"
     for _ in range(8):
-        await s.bot.tick(MovementInput(sneak=True))
+        await s.bot.advance(MovementInput(sneak=True), ticks=1)
     await s.settle(0.4)
     assert s.bot.player.vehicle_id is None, "下不了船"
     await s.say(f"    上船 → 随船走 {distance:.2f} 格 → 下船")
